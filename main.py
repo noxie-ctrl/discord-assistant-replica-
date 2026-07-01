@@ -8,15 +8,21 @@ from utils import database as db
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
-DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!")
+TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
+DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!").strip()
+OWNER_ID = (os.getenv("OWNER_ID") or "").strip()
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix=DEFAULT_PREFIX, intents=intents, help_command=None)
+bot = commands.Bot(
+    command_prefix=DEFAULT_PREFIX,
+    intents=intents,
+    help_command=None,
+    owner_id=int(OWNER_ID) if OWNER_ID.isdigit() else None,
+)
 
 COGS = ["cogs.moderation", "cogs.utility", "cogs.personality", "cogs.ai_chat"]
 
