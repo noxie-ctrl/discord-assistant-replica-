@@ -62,3 +62,4 @@ Run these once, in Discord:
 ## Adding more later
 This is a clean foundation — economy/games, leveling, reaction roles, and auto-mod filters can all
 be added as new cogs in `cogs/` without touching existing code.
+# discord-assistant-replica-
