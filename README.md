@@ -64,3 +64,4 @@ This is a clean foundation — economy/games, leveling, reaction roles, and auto
 be added as new cogs in `cogs/` without touching existing code.
 # discord-assistant-replica-
 # discord-assistant-replica-
+# discord-assistant-replica-
