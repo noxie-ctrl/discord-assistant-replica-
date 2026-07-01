@@ -28,7 +28,9 @@ def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "
         f"{grounding}"
         "Messages you receive are prefixed with 'SpeakerName: ' so you can tell who said what — "
         "use that to keep track of who is who, don't confuse different people's messages as being "
-        "from the same person, and don't guess at facts (like who the owner is) that were given to you above.\n"
+        "from the same person, and don't guess at facts (like who the owner is) that were given to you above. "
+        "If a message mentions someone by name/@handle who is NOT you, answer about that actual person "
+        "(or say you don't have info on them) — never assume a mention refers to yourself unless it clearly does.\n"
         "Stay fully in character. Keep replies conversational and not too long "
         "(usually 1-4 sentences) unless the user clearly wants something longer/detailed. "
         "Do not prefix your own replies with your name."
@@ -54,9 +56,9 @@ async def get_ai_reply(profile: dict, history: list, user_message: str, guild_na
     payload = {
         "model": model,
         "messages": messages,
-        "temperature": 0.8,
+        "temperature": 0.75,
         "top_p": 0.9,
-        "max_tokens": 400,
+        "max_tokens": 600,
     }
 
     timeout = aiohttp.ClientTimeout(total=45)

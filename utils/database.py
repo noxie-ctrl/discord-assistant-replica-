@@ -131,7 +131,7 @@ async def get_warnings(guild_id: int, user_id: int) -> list:
         return [dict(r) for r in rows]
 
 
-async def add_chat_memory(guild_id: int, channel_id: int, role: str, content: str, keep_last: int = 12):
+async def add_chat_memory(guild_id: int, channel_id: int, role: str, content: str, keep_last: int = 24):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT INTO chat_memory (guild_id, channel_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",

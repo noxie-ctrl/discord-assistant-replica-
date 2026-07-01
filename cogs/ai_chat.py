@@ -43,8 +43,13 @@ class AIChat(commands.Cog):
             return
 
         content = message.content
+        bot_id = self.bot.user.id
         for mention in message.mentions:
-            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+            if mention.id == bot_id:
+                content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+            else:
+                content = content.replace(f"<@{mention.id}>", f"@{mention.display_name}")
+                content = content.replace(f"<@!{mention.id}>", f"@{mention.display_name}")
         content = content.strip()
         if not content:
             content = "Hey!"
