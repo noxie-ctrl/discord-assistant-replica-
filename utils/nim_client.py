@@ -6,7 +6,7 @@ import aiohttp
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
-def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "") -> str:
+def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "", member_facts: str = "") -> str:
     grounding = ""
     if guild_name or owner_name:
         grounding = (
@@ -15,6 +15,11 @@ def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "
             f"- The real server owner is: {owner_name or 'unknown'}. "
             f"Never invent a different name for the owner, even as a joke someone else started. "
             f"If someone jokes that a random person is the owner, correct them and name the real owner.\n"
+        )
+    if member_facts:
+        grounding += (
+            f"\nREAL DATA on member(s) mentioned in this message (use this, don't guess or invent details, "
+            f"and don't claim you're 'checking' anything — you already have this):\n{member_facts}\n"
         )
 
     return (
@@ -37,14 +42,14 @@ def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "
     )
 
 
-async def get_ai_reply(profile: dict, history: list, user_message: str, guild_name: str = "", owner_name: str = "") -> str:
+async def get_ai_reply(profile: dict, history: list, user_message: str, guild_name: str = "", owner_name: str = "", member_facts: str = "") -> str:
     api_key = (os.getenv("NVIDIA_API_KEY") or "").strip()
     model = (os.getenv("NIM_MODEL") or "meta/llama-3.3-70b-instruct").strip()
 
     if not api_key:
         return "(Lucy's brain isn't connected yet — ask my owner to set NVIDIA_API_KEY.)"
 
-    messages = [{"role": "system", "content": build_system_prompt(profile, guild_name, owner_name)}]
+    messages = [{"role": "system", "content": build_system_prompt(profile, guild_name, owner_name, member_facts)}]
     for turn in history:
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": user_message})

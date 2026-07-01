@@ -65,12 +65,29 @@ class AIChat(commands.Cog):
                 owner = None
         owner_name = owner.display_name if owner else "unknown"
 
+        member_facts_lines = []
+        for mention in message.mentions:
+            if mention.id == self.bot.user.id:
+                continue
+            if mention.bot:
+                member_facts_lines.append(f"- {mention.display_name} is a BOT/APP, not a human member.")
+                continue
+            joined = mention.joined_at.strftime("%Y-%m-%d") if mention.joined_at else "unknown"
+            created = mention.created_at.strftime("%Y-%m-%d")
+            roles = ", ".join(r.name for r in mention.roles if r.name != "@everyone") or "no roles"
+            member_facts_lines.append(
+                f"- {mention.display_name} (username: {mention.name}): joined this server on {joined}, "
+                f"Discord account created {created}, roles: {roles}."
+            )
+        member_facts = "\n".join(member_facts_lines)
+
         async with message.channel.typing():
             profile = await db.get_personality(message.guild.id)
             history = await db.get_chat_memory(message.guild.id, message.channel.id)
             reply = await get_ai_reply(
                 profile, history, tagged_content,
                 guild_name=message.guild.name, owner_name=owner_name,
+                member_facts=member_facts,
             )
 
             await db.add_chat_memory(message.guild.id, message.channel.id, "user", tagged_content)
