@@ -19,8 +19,8 @@ def build_system_prompt(profile: dict) -> str:
 
 
 async def get_ai_reply(profile: dict, history: list, user_message: str) -> str:
-    api_key = os.getenv("NVIDIA_API_KEY")
-    model = os.getenv("NIM_MODEL", "meta/llama-3.3-70b-instruct")
+    api_key = (os.getenv("NVIDIA_API_KEY") or "").strip()
+    model = (os.getenv("NIM_MODEL") or "meta/llama-3.3-70b-instruct").strip()
 
     if not api_key:
         return "(Lucy's brain isn't connected yet — ask my owner to set NVIDIA_API_KEY.)"
