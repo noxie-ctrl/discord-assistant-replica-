@@ -6,7 +6,17 @@ import aiohttp
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
 
-def build_system_prompt(profile: dict) -> str:
+def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "") -> str:
+    grounding = ""
+    if guild_name or owner_name:
+        grounding = (
+            f"\nFACTS YOU MUST NEVER CONTRADICT OR MAKE UP:\n"
+            f"- This server is called: {guild_name or 'unknown'}\n"
+            f"- The real server owner is: {owner_name or 'unknown'}. "
+            f"Never invent a different name for the owner, even as a joke someone else started. "
+            f"If someone jokes that a random person is the owner, correct them and name the real owner.\n"
+        )
+
     return (
         f"You are {profile.get('name', 'Lucy')}, a {profile.get('age', '21')}-year-old "
         f"({profile.get('pronouns', 'she/her')}) AI who lives in this Discord server as: "
@@ -15,19 +25,24 @@ def build_system_prompt(profile: dict) -> str:
         f"Backstory: {profile.get('backstory', '')}\n"
         f"Speaking style: {profile.get('speaking_style', '')}\n"
         f"Boundaries: {profile.get('boundaries', '')}\n"
+        f"{grounding}"
+        "Messages you receive are prefixed with 'SpeakerName: ' so you can tell who said what — "
+        "use that to keep track of who is who, don't confuse different people's messages as being "
+        "from the same person, and don't guess at facts (like who the owner is) that were given to you above.\n"
         "Stay fully in character. Keep replies conversational and not too long "
-        "(usually 1-4 sentences) unless the user clearly wants something longer/detailed."
+        "(usually 1-4 sentences) unless the user clearly wants something longer/detailed. "
+        "Do not prefix your own replies with your name."
     )
 
 
-async def get_ai_reply(profile: dict, history: list, user_message: str) -> str:
+async def get_ai_reply(profile: dict, history: list, user_message: str, guild_name: str = "", owner_name: str = "") -> str:
     api_key = (os.getenv("NVIDIA_API_KEY") or "").strip()
     model = (os.getenv("NIM_MODEL") or "meta/llama-3.3-70b-instruct").strip()
 
     if not api_key:
         return "(Lucy's brain isn't connected yet — ask my owner to set NVIDIA_API_KEY.)"
 
-    messages = [{"role": "system", "content": build_system_prompt(profile)}]
+    messages = [{"role": "system", "content": build_system_prompt(profile, guild_name, owner_name)}]
     for turn in history:
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": user_message})

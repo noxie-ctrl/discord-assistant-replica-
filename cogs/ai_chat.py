@@ -49,12 +49,26 @@ class AIChat(commands.Cog):
         if not content:
             content = "Hey!"
 
+        speaker_name = message.author.display_name
+        tagged_content = f"{speaker_name}: {content}"
+
+        owner = message.guild.owner
+        if owner is None and message.guild.owner_id:
+            try:
+                owner = await message.guild.fetch_member(message.guild.owner_id)
+            except discord.HTTPException:
+                owner = None
+        owner_name = owner.display_name if owner else "unknown"
+
         async with message.channel.typing():
             profile = await db.get_personality(message.guild.id)
             history = await db.get_chat_memory(message.guild.id, message.channel.id)
-            reply = await get_ai_reply(profile, history, content)
+            reply = await get_ai_reply(
+                profile, history, tagged_content,
+                guild_name=message.guild.name, owner_name=owner_name,
+            )
 
-            await db.add_chat_memory(message.guild.id, message.channel.id, "user", content)
+            await db.add_chat_memory(message.guild.id, message.channel.id, "user", tagged_content)
             await db.add_chat_memory(message.guild.id, message.channel.id, "assistant", reply)
 
         # Split long replies to respect Discord's 2000 char limit
