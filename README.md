@@ -65,3 +65,4 @@ be added as new cogs in `cogs/` without touching existing code.
 # discord-assistant-replica-
 # discord-assistant-replica-
 # discord-assistant-replica-
+# discord-assistant-replica-
