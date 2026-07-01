@@ -1,4 +1,5 @@
 import os
+import asyncio
 import aiohttp
 
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -42,13 +43,16 @@ async def get_ai_reply(profile: dict, history: list, user_message: str) -> str:
         "max_tokens": 400,
     }
 
+    timeout = aiohttp.ClientTimeout(total=60)
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(NIM_URL, headers=headers, json=payload, timeout=30) as resp:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(NIM_URL, headers=headers, json=payload) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    return f"(hmm, my brain hiccuped — {resp.status}: {text[:200]})"
+                    return f"(hmm, my brain hiccuped — {resp.status}: {text[:300]})"
                 data = await resp.json()
                 return data["choices"][0]["message"]["content"].strip()
+    except asyncio.TimeoutError:
+        return "(my brain took too long to respond — the NIM API might be slow or the model name might be wrong. Check NIM_MODEL.)"
     except Exception as e:
-        return f"(something went wrong talking to my AI brain: {e})"
+        return f"(something went wrong talking to my AI brain: {type(e).__name__}: {e})"
