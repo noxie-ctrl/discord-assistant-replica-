@@ -2,23 +2,15 @@
 utils/database.py
 
 Postgres-backed persistence layer for Lucy, using Railway's Postgres plugin.
-Replaces the old aiosqlite layer. All public function names/signatures are
-kept close to what the cogs already call, so moderation.py / personality.py /
-utility.py should keep working unchanged. New in this version:
 
-  - user_profiles: per-user, per-guild long-term memory (notes, message
-    counts, relationship_score) used to make Lucy's chat feel personalized.
-  - game_stats: win/loss/draw tracking for the mini-games cog.
-
-Set the Railway Postgres connection string in the DATABASE_URL env var
-(Railway injects this automatically once you attach a Postgres service and
-reference it, e.g. ${{Postgres.DATABASE_URL}} in your worker service's
-variables).
+v2 fix: the personality/guild_settings schema now matches the field names
+your actual cogs/personality.py and cogs/utility.py use (pronouns, role,
+speaking_style, boundaries / chat_trigger_mode) — the first version guessed
+wrong names and would have broken /setpersonality and /setchattrigger.
 """
 
 import os
 import logging
-from datetime import datetime, timezone
 
 import asyncpg
 
@@ -26,12 +18,18 @@ logger = logging.getLogger("lucy.database")
 
 _pool: asyncpg.Pool | None = None
 
+# personality.py does: with open(db.DEFAULT_PERSONALITY_PATH) as f: json.load(f)
+DEFAULT_PERSONALITY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "personality_default.json",
+)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id BIGINT PRIMARY KEY,
     log_channel_id BIGINT,
-    chat_trigger TEXT DEFAULT 'mention',
+    chat_trigger_mode TEXT DEFAULT 'mention',
     chat_channel_id BIGINT,
     welcome_channel_id BIGINT,
     welcome_message TEXT
@@ -41,12 +39,12 @@ CREATE TABLE IF NOT EXISTS personality (
     guild_id BIGINT PRIMARY KEY,
     name TEXT DEFAULT 'Lucy',
     age TEXT DEFAULT '21',
+    pronouns TEXT DEFAULT 'she/her',
+    role TEXT DEFAULT 'Server admin assistant & friend to everyone here',
     traits TEXT DEFAULT '',
     backstory TEXT DEFAULT '',
-    speech_style TEXT DEFAULT '',
-    likes TEXT DEFAULT '',
-    dislikes TEXT DEFAULT '',
-    extra TEXT DEFAULT ''
+    speaking_style TEXT DEFAULT '',
+    boundaries TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS warnings (
@@ -106,7 +104,6 @@ async def init_pool():
             "to your Postgres service (e.g. ${{Postgres.DATABASE_URL}}) on "
             "the worker service."
         )
-    # Railway/Heroku-style URLs sometimes use postgres:// — asyncpg wants postgresql://
     if dsn.startswith("postgres://"):
         dsn = dsn.replace("postgres://", "postgresql://", 1)
 
@@ -153,7 +150,7 @@ async def get_guild_settings(guild_id: int) -> dict:
 
 
 async def update_guild_setting(guild_id: int, **kwargs):
-    """update_guild_setting(guild_id, chat_trigger='mention', chat_channel_id=123)"""
+    """update_guild_setting(guild_id, chat_trigger_mode='mention', chat_channel_id=123)"""
     if not kwargs:
         return
     await get_guild_settings(guild_id)  # ensure row exists
@@ -166,19 +163,6 @@ async def update_guild_setting(guild_id: int, **kwargs):
             f"UPDATE guild_settings SET {set_clause} WHERE guild_id = $1",
             guild_id, *values,
         )
-
-
-# Convenience wrappers matching the slash commands you already have
-async def set_log_channel(guild_id: int, channel_id: int):
-    await update_guild_setting(guild_id, log_channel_id=channel_id)
-
-
-async def set_chat_trigger(guild_id: int, trigger: str):
-    await update_guild_setting(guild_id, chat_trigger=trigger)
-
-
-async def set_chat_channel(guild_id: int, channel_id: int):
-    await update_guild_setting(guild_id, chat_channel_id=channel_id)
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +188,7 @@ async def get_personality(guild_id: int) -> dict:
 
 
 VALID_PERSONALITY_FIELDS = {
-    "name", "age", "traits", "backstory", "speech_style", "likes", "dislikes", "extra"
+    "name", "age", "pronouns", "role", "traits", "backstory", "speaking_style", "boundaries"
 }
 
 
@@ -274,7 +258,6 @@ async def add_chat_message(guild_id: int, channel_id: int, speaker_id: int | Non
             "VALUES ($1, $2, $3, $4, $5, $6)",
             guild_id, channel_id, speaker_id, speaker_name, role, content,
         )
-        # Trim to last 24 messages per channel to keep prompts small
         await conn.execute(
             """
             DELETE FROM chat_memory

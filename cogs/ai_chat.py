@@ -75,7 +75,7 @@ class AIChat(commands.Cog):
             return False
 
         settings = await db.get_guild_settings(message.guild.id)
-        trigger = settings.get("chat_trigger") or "mention"
+        trigger = settings.get("chat_trigger_mode") or "mention"
 
         if trigger == "all":
             return True
