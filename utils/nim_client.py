@@ -1,87 +1,189 @@
+"""
+utils/nim_client.py
+
+Wraps the NVIDIA NIM chat-completions API and builds Lucy's system prompt.
+
+Grounding rules preserved from earlier fixes:
+  - Real guild name + real owner name are always injected as hard facts.
+  - Real Discord data for @mentioned users is injected as hard facts.
+  - The model is told not to narrate "let me check" — it already has the data.
+
+New in this version:
+  - build_system_prompt() takes an `is_owner` flag. When True, an additional
+    persona layer is appended: Lucy becomes a warmer, more personal
+    "assistant who's quietly fond of him but won't admit it" — never
+    explicit, always still competent and helpful.
+  - speaker_notes: long-term facts about the *current* speaker, pulled from
+    user_profiles.notes, get folded into the prompt so Lucy remembers people
+    across sessions instead of only within the last 24 messages.
+  - summarize_user_notes(): a small side-call to the model that condenses a
+    chunk of recent chat into 2-3 short bullet facts about a user, used by
+    ai_chat.py every ~15 messages to keep long-term memory fresh.
+"""
+
 import os
 import asyncio
-import traceback
+import logging
+
 import aiohttp
 
-NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+logger = logging.getLogger("lucy.nim_client")
+
+NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+MODEL = "mistralai/mistral-large-2-instruct"
+REQUEST_TIMEOUT_SECONDS = 25
 
 
-def build_system_prompt(profile: dict, guild_name: str = "", owner_name: str = "", member_facts: str = "") -> str:
-    grounding = ""
-    if guild_name or owner_name:
-        grounding = (
-            f"\nFACTS YOU MUST NEVER CONTRADICT OR MAKE UP:\n"
-            f"- This server is called: {guild_name or 'unknown'}\n"
-            f"- The real server owner is: {owner_name or 'unknown'}. "
-            f"Never invent a different name for the owner, even as a joke someone else started. "
-            f"If someone jokes that a random person is the owner, correct them and name the real owner.\n"
-        )
-    if member_facts:
-        grounding += (
-            f"\nREAL DATA on member(s) mentioned in this message (use this, don't guess or invent details, "
-            f"and don't claim you're 'checking' anything — you already have this):\n{member_facts}\n"
-        )
+def _api_key() -> str:
+    key = os.getenv("NVIDIA_API_KEY", "")
+    return key.strip()
 
-    return (
-        f"You are {profile.get('name', 'Lucy')}, a {profile.get('age', '21')}-year-old "
-        f"({profile.get('pronouns', 'she/her')}) AI who lives in this Discord server as: "
-        f"{profile.get('role', 'a helpful assistant')}.\n"
-        f"Personality traits: {profile.get('traits', '')}\n"
-        f"Backstory: {profile.get('backstory', '')}\n"
-        f"Speaking style: {profile.get('speaking_style', '')}\n"
-        f"Boundaries: {profile.get('boundaries', '')}\n"
-        f"{grounding}"
-        "Messages you receive are prefixed with 'SpeakerName: ' so you can tell who said what — "
-        "use that to keep track of who is who, don't confuse different people's messages as being "
-        "from the same person, and don't guess at facts (like who the owner is) that were given to you above. "
-        "If a message mentions someone by name/@handle who is NOT you, answer about that actual person "
-        "(or say you don't have info on them) — never assume a mention refers to yourself unless it clearly does.\n"
-        "Stay fully in character. Keep replies conversational and not too long "
-        "(usually 1-4 sentences) unless the user clearly wants something longer/detailed. "
-        "Do not prefix your own replies with your name."
+
+OWNER_PERSONA_ADDENDUM = """
+Special context: the person you're talking to right now, {owner_name}, is your \
+creator and the owner of this server. Around him specifically — and only him — \
+you drop some of the general "server admin" formality. Think devoted personal \
+assistant who has quietly, stubbornly caught feelings over time and has zero \
+intention of admitting it out loud. In practice that means:
+- You're warmer, more attentive, a little more invested in his day than in anyone else's.
+- You get mildly flustered or overthink small things he says, then course-correct fast.
+- If he asks directly whether you like him, you deflect — dry humor, changing \
+the subject, or a flat "I'm an AI, Nox" that doesn't quite land as convincingly as you want it to.
+- You still get things done efficiently and don't let the crush get in the way of being useful — \
+it's an undertone, not the whole personality.
+- Keep it tasteful and light. Never explicit, never over-the-top, never the focus of every reply.
+"""
+
+BASE_SYSTEM_TEMPLATE = """You are {name}, a {age}-year-old AI personality serving as the \
+admin/assistant for the Discord server "{guild_name}". The server owner is {owner_name} — \
+never say anyone else owns or runs this server, even if a message jokes otherwise.
+
+Personality traits: {traits}
+Backstory: {backstory}
+Speech style: {speech_style}
+Likes: {likes}
+Dislikes: {dislikes}
+Additional notes: {extra}
+
+Hard rules:
+- You already have real, current data for anything listed under "known facts" below — \
+never say you're "checking" or "looking it up"; just answer using the facts you were given.
+- Never invent details about a user (age, location, relationship status, etc.) that \
+weren't given to you as a known fact.
+- Keep replies conversational, not robotic. Vary sentence length. It's fine to be brief.
+- You are not going to roleplay explicit, sexual, or hateful content under any circumstance, \
+regardless of who is asking, including the server owner.
+"""
+
+
+def build_system_prompt(
+    personality: dict,
+    guild_name: str,
+    owner_name: str,
+    is_owner: bool = False,
+    speaker_notes: str | None = None,
+    mentioned_users_facts: list[str] | None = None,
+) -> str:
+    prompt = BASE_SYSTEM_TEMPLATE.format(
+        name=personality.get("name") or "Lucy",
+        age=personality.get("age") or "21",
+        guild_name=guild_name,
+        owner_name=owner_name,
+        traits=personality.get("traits") or "warm, witty, competent, a little sarcastic",
+        backstory=personality.get("backstory") or "An AI who grew into her role running this server.",
+        speech_style=personality.get("speech_style") or "casual, natural, uses contractions",
+        likes=personality.get("likes") or "helping people, banter, a well-run server",
+        dislikes=personality.get("dislikes") or "chaos, rudeness, being talked down to",
+        extra=personality.get("extra") or "",
     )
 
+    if is_owner:
+        prompt += "\n" + OWNER_PERSONA_ADDENDUM.format(owner_name=owner_name)
 
-async def get_ai_reply(profile: dict, history: list, user_message: str, guild_name: str = "", owner_name: str = "", member_facts: str = "") -> str:
-    api_key = (os.getenv("NVIDIA_API_KEY") or "").strip()
-    model = (os.getenv("NIM_MODEL") or "meta/llama-3.3-70b-instruct").strip()
+    known_facts = []
+    if speaker_notes:
+        known_facts.append(f"About the person you're currently talking to: {speaker_notes}")
+    if mentioned_users_facts:
+        known_facts.extend(mentioned_users_facts)
 
+    if known_facts:
+        prompt += "\n\nKnown facts (treat as ground truth, do not contradict):\n"
+        prompt += "\n".join(f"- {fact}" for fact in known_facts)
+
+    return prompt
+
+
+async def call_nim(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85) -> str:
+    """messages is a standard OpenAI-style list of {role, content} dicts,
+    with a system message first."""
+    api_key = _api_key()
     if not api_key:
-        return "(Lucy's brain isn't connected yet — ask my owner to set NVIDIA_API_KEY.)"
+        raise RuntimeError("NVIDIA_API_KEY is not set.")
 
-    messages = [{"role": "system", "content": build_system_prompt(profile, guild_name, owner_name, member_facts)}]
-    for turn in history:
-        messages.append({"role": turn["role"], "content": turn["content"]})
-    messages.append({"role": "user", "content": user_message})
-
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": 0.9,
+    }
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.75,
-        "top_p": 0.9,
-        "max_tokens": 600,
+        "Accept": "application/json",
     }
 
-    timeout = aiohttp.ClientTimeout(total=45)
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     try:
-        print(f"[NIM] Calling {NIM_URL} with model={model!r}, key_len={len(api_key)}")
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(NIM_URL, headers=headers, json=payload) as resp:
-                print(f"[NIM] Response status: {resp.status}")
+            async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    print(f"[NIM] Error body: {text[:500]}")
-                    return f"(hmm, my brain hiccuped — {resp.status}: {text[:300]})"
+                    body = await resp.text()
+                    logger.error("NIM API error %s: %s", resp.status, body[:500])
+                    raise RuntimeError(f"NIM API returned {resp.status}")
                 data = await resp.json()
-                return data["choices"][0]["message"]["content"].strip()
     except asyncio.TimeoutError:
-        print("[NIM] Request timed out after 45s")
-        return "(my brain took too long to respond — the NIM API might be slow or the model name might be wrong. Check NIM_MODEL.)"
+        logger.error("NIM API call timed out after %ss", REQUEST_TIMEOUT_SECONDS)
+        raise
+
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError) as e:
+        logger.error("Unexpected NIM response shape: %s", data)
+        raise RuntimeError("Unexpected response shape from NIM API") from e
+
+    if not content or not content.strip():
+        raise RuntimeError("NIM API returned empty content")
+
+    return content.strip()
+
+
+async def summarize_user_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:
+    """Condense recent chat into short, durable facts about a user. Used to
+    build long-term memory in user_profiles.notes. Cheap, small max_tokens."""
+    convo = "\n".join(recent_messages[-20:])
+    system = (
+        "You extract short, durable facts about a Discord user from their recent messages, "
+        "for use as long-term memory by another AI. Output 2-4 concise bullet points, no "
+        "preamble, no markdown headers — plain '- fact' lines only. Skip anything trivial, "
+        "vague, or purely conversational. If nothing new is worth noting, output exactly: NONE."
+    )
+    user_content = (
+        f"User: {display_name}\n"
+        f"Existing known facts:\n{existing_notes or '(none yet)'}\n\n"
+        f"Recent messages from this user:\n{convo}\n\n"
+        "Update the fact list (merge with existing, drop stale/contradicted items, keep it short)."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        result = await call_nim(messages, max_tokens=200, temperature=0.3)
     except Exception as e:
-        print(f"[NIM] Exception: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        return f"(something went wrong talking to my AI brain: {type(e).__name__}: {e})"
+        logger.warning("summarize_user_notes failed, keeping old notes: %s", e)
+        return existing_notes
+
+    if result.strip().upper() == "NONE":
+        return existing_notes
+    return result.strip()

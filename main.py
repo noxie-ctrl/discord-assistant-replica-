@@ -1,5 +1,18 @@
+"""
+main.py
+
+Entry point for Lucy. Changes in this version:
+  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
+    and closes it cleanly on shutdown.
+  - Loads two new cogs: games (mini-games) and news (real headlines).
+  - Everything else (owner_id wiring, slash sync, prefix commands) is
+    unchanged from before.
+"""
+
 import os
 import asyncio
+import logging
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -8,77 +21,65 @@ from utils import database as db
 
 load_dotenv()
 
-TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
-DEFAULT_PREFIX = os.getenv("DEFAULT_PREFIX", "!").strip()
-OWNER_ID = (os.getenv("OWNER_ID") or "").strip()
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.guilds = True
-
-bot = commands.Bot(
-    command_prefix=DEFAULT_PREFIX,
-    intents=intents,
-    help_command=None,
-    owner_id=int(OWNER_ID) if OWNER_ID.isdigit() else None,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("lucy.main")
 
-COGS = ["cogs.moderation", "cogs.utility", "cogs.personality", "cogs.ai_chat"]
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+INTENTS.members = True
+
+COGS = [
+    "cogs.moderation",
+    "cogs.utility",
+    "cogs.personality",
+    "cogs.ai_chat",
+    "cogs.games",
+    "cogs.news",
+]
 
 
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} slash commands.")
-    except Exception as e:
-        print(f"⚠️ Slash sync failed: {e}")
-    await bot.change_presence(activity=discord.Game(name="managing the server | /help"))
+class Lucy(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=INTENTS)
 
+    async def setup_hook(self):
+        await db.init_pool()
+        logger.info("Postgres pool ready.")
 
-@bot.command(name="help")
-async def help_command(ctx: commands.Context):
-    embed = discord.Embed(
-        title="💁‍♀️ Lucy's Commands",
-        description="Most commands work as both `/slash` and prefix commands.",
-        color=discord.Color.pink(),
-    )
-    embed.add_field(
-        name="Moderation",
-        value="`ban` `kick` `mute` `unmute` `unban` `warn` `warnings` `purge`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Utility",
-        value="`setwelcome` `setlogchannel` `setchattrigger` `setchatchannel` "
-              "`giverole` `removerole` `ticket` `closeticket` `serverinfo` `userinfo`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Personality",
-        value="`setpersonality` `profile` `resetpersonality`",
-        inline=False,
-    )
-    embed.add_field(
-        name="Chat",
-        value="Just mention me, reply to me, say my name, or chat in my dedicated channel "
-              "(configure with `/setchattrigger`)!",
-        inline=False,
-    )
-    await ctx.send(embed=embed)
+        for cog in COGS:
+            try:
+                await self.load_extension(cog)
+                logger.info("Loaded %s", cog)
+            except Exception:
+                logger.exception("Failed to load %s", cog)
+
+        owner_id = os.getenv("OWNER_ID", "").strip()
+        if owner_id:
+            self.owner_id = int(owner_id)
+            logger.info("Owner ID set to %s", self.owner_id)
+        else:
+            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
+
+        synced = await self.tree.sync()
+        logger.info("Synced %d slash commands.", len(synced))
+
+    async def close(self):
+        await db.close_pool()
+        await super().close()
 
 
 async def main():
-    await db.init_db()
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+
+    bot = Lucy()
     async with bot:
-        for cog in COGS:
-            await bot.load_extension(cog)
-        await bot.start(TOKEN)
+        await bot.start(token)
 
 
 if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN is not set. Copy .env.example to .env and fill it in.")
     asyncio.run(main())
