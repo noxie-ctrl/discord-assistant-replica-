@@ -27,7 +27,17 @@ import aiohttp
 logger = logging.getLogger("lucy.nim_client")
 
 NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "mistralai/mistral-large-2-instruct"
+
+# mistral-large-2-instruct was deprecated by NVIDIA (returns 404 "Function not
+# found for account" — the model still shows in /v1/models sometimes but the
+# backing function is gone). Mistral Large 3 is the direct successor.
+# We try these in order and fall back automatically so a future deprecation
+# doesn't take chat down again — just logs a warning instead of erroring out.
+MODEL_CANDIDATES = [
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "mistralai/mistral-nemotron",
+    "meta/llama-3.3-70b-instruct",
+]
 REQUEST_TIMEOUT_SECONDS = 25
 
 
