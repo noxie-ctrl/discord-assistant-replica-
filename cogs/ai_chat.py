@@ -38,6 +38,7 @@ logger = logging.getLogger("lucy.ai_chat")
 NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
+OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
 
@@ -49,6 +50,8 @@ class AIChat(commands.Cog):
         self._nim_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NIM_CALLS)
         # message_id -> (original_author_id, guild_id, channel_id, snippet) for feedback tracking
         self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
+        # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
+        self._last_alert: dict[tuple[int, int], float] = {}
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -119,8 +122,56 @@ class AIChat(commands.Cog):
             return name in message.content.lower()
         return False
 
+    # -----------------------------------------------------------------
+    # Owner alerts (used by the flag_for_owner tool AND the vent watcher)
+    # -----------------------------------------------------------------
+
+    async def _alert_owner(self, message: discord.Message, reason: str):
+        owner_id = getattr(self.bot, "owner_id", None)
+        if owner_id is None:
+            return
+
+        key = (message.guild.id, message.author.id)
+        now = asyncio.get_event_loop().time()
+        last = self._last_alert.get(key)
+        if last is not None and (now - last) < OWNER_ALERT_COOLDOWN_SECONDS:
+            return  # already alerted about this person recently, don't spam
+        self._last_alert[key] = now
+
+        owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
+        if owner is None:
+            logger.warning("Could not resolve owner user %s for alert", owner_id)
+            return
+
+        embed = discord.Embed(
+            title="👀 Might want to check this out",
+            description=reason,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Who", value=f"{message.author.mention} ({message.author})", inline=True)
+        embed.add_field(name="Where", value=f"#{message.channel.name} in {message.guild.name}", inline=True)
+        embed.add_field(name="Message", value=message.content[:500] or "(no text)", inline=False)
+        embed.add_field(name="Jump to it", value=message.jump_url, inline=False)
+
+        try:
+            await owner.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Couldn't DM owner %s (DMs closed) — alert dropped: %s", owner_id, reason)
+
+    # -----------------------------------------------------------------
+    # Passive vent-channel watcher (doesn't require a mention/reply)
+    # -----------------------------------------------------------------
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        if message.guild is None or message.author.bot:
+            return
+
+        settings = await db.get_guild_settings(message.guild.id)
+        vent_channel_id = settings.get("vent_channel_id")
+        if vent_channel_id and message.channel.id == vent_channel_id:
+            asyncio.create_task(self._check_vent_message(message))
+
         if not await self._should_respond(message):
             return
 
@@ -130,6 +181,39 @@ class AIChat(commands.Cog):
         async with lock:
             async with message.channel.typing():
                 await self._handle_chat(message)
+
+    async def _check_vent_message(self, message: discord.Message):
+        """Lightweight, cheap classification pass — does NOT go through the
+        full chat pipeline, so it doesn't require a mention and doesn't
+        reply publicly. Just quietly decides whether to alert the owner."""
+        if not (message.content and message.content.strip()):
+            return
+        try:
+            classification = await nim_client.call_nim(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You triage a single Discord message from a server's vent channel. "
+                            "Decide if the person sounds like they're genuinely struggling, upset, "
+                            "or going through something hard enough that a trusted adult/friend "
+                            "should probably check in on them — as opposed to normal venting, "
+                            "complaining, or joking around that doesn't need intervention. "
+                            "Reply with exactly one line: YES: <five word reason> or NO."
+                        ),
+                    },
+                    {"role": "user", "content": message.content[:1000]},
+                ],
+                max_tokens=20,
+                temperature=0.1,
+            )
+        except Exception as e:
+            logger.warning("Vent-channel classification failed, skipping: %s", e)
+            return
+
+        if classification.strip().upper().startswith("YES"):
+            reason = classification.split(":", 1)[1].strip() if ":" in classification else "Seemed like they could use a check-in."
+            await self._alert_owner(message, f"In the vent channel: {reason}")
 
     # -----------------------------------------------------------------
     # Feedback reactions
@@ -173,6 +257,11 @@ class AIChat(commands.Cog):
         is_owner = owner_id is not None and author.id == owner_id
         has_manage_roles = getattr(author.guild_permissions, "manage_roles", False)
         has_manage_guild = getattr(author.guild_permissions, "manage_guild", False)
+
+        if name == "flag_for_owner":
+            reason = args.get("reason") or "Lucy flagged this conversation."
+            await self._alert_owner(message, reason)
+            return "Success: owner has been quietly notified."
 
         if name == "send_message_to_channel":
             channel_name = (args.get("channel_name") or "").lstrip("#").strip().lower()
@@ -313,7 +402,7 @@ class AIChat(commands.Cog):
         # 6. Call the model (semaphore-capped), with tool support
         try:
             async with self._nim_semaphore:
-                tools = nim_client.TOOLS if can_use_tools else None
+                tools = nim_client.CONCERN_TOOLS + (nim_client.TOOLS if can_use_tools else [])
                 assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
 
                 if assistant_message.get("tool_calls"):

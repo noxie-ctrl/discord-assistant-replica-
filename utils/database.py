@@ -32,8 +32,22 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     chat_trigger_mode TEXT DEFAULT 'mention',
     chat_channel_id BIGINT,
     welcome_channel_id BIGINT,
-    welcome_message TEXT
+    welcome_message TEXT,
+    vent_channel_id BIGINT
 );
+
+CREATE TABLE IF NOT EXISTS member_events (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    username TEXT,
+    event_type TEXT NOT NULL, -- 'join' or 'leave'
+    duration_seconds BIGINT,  -- only set on 'leave' — time between this join and leave
+    event_time TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_events_guild_time
+    ON member_events (guild_id, event_time DESC);
 
 CREATE TABLE IF NOT EXISTS personality (
     guild_id BIGINT PRIMARY KEY,
@@ -120,6 +134,7 @@ MIGRATIONS = """
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 """
 
 
@@ -519,6 +534,35 @@ async def get_leaderboard(guild_id: int, limit: int = 10) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM economy WHERE guild_id = $1 ORDER BY balance DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Member join/leave log
+# ---------------------------------------------------------------------------
+
+async def set_vent_channel(guild_id: int, channel_id: int):
+    await update_guild_setting(guild_id, vent_channel_id=channel_id)
+
+
+async def record_member_event(guild_id: int, user_id: int, username: str, event_type: str,
+                                 duration_seconds: int | None = None):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO member_events (guild_id, user_id, username, event_type, duration_seconds) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            guild_id, user_id, username, event_type, duration_seconds,
+        )
+
+
+async def get_recent_member_events(guild_id: int, limit: int = 15) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM member_events WHERE guild_id = $1 ORDER BY event_time DESC LIMIT $2",
             guild_id, limit,
         )
         return [dict(r) for r in rows]

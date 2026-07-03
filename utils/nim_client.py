@@ -158,6 +158,14 @@ def build_system_prompt(
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
 
+    prompt += (
+        "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
+        "genuinely need a human to check on them, or if something in a conversation truly "
+        "needs his attention — use it when it's warranted, not for routine venting or normal "
+        "complaints. Using it doesn't replace being present and supportive in the conversation "
+        "yourself first."
+    )
+
     if can_use_tools:
         prompt += (
             "\n\nYou have tools available to actually take action (posting in another "
@@ -253,6 +261,36 @@ TOOLS = [
                     "role_name": {"type": "string", "description": "Name of the role to assign."},
                 },
                 "required": ["member_name", "role_name"],
+            },
+        },
+    },
+]
+
+# Unlike TOOLS above (user-requested actions, gated by permission), this is
+# always available to Lucy in every conversation — it's her own judgment
+# call, not something anyone is asking her to do.
+CONCERN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "flag_for_owner",
+            "description": (
+                "Quietly let the server owner know they might want to check in on this "
+                "conversation or this person — use this when someone seems to be going "
+                "through something difficult, is asking for real help, or when something "
+                "in the conversation genuinely seems worth the owner's attention. This is "
+                "a private notification to the owner only, not a public reply — use it "
+                "sparingly, for things that actually matter, not routine chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "One short sentence on why the owner should look at this.",
+                    },
+                },
+                "required": ["reason"],
             },
         },
     },

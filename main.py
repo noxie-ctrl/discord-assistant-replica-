@@ -39,6 +39,7 @@ COGS = [
     "cogs.games",
     "cogs.news",
     "cogs.preferences",
+    "cogs.serverlog",
 ]
 
 

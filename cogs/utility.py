@@ -60,6 +60,15 @@ class Utility(commands.Cog):
         await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
         await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
 
+    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
+    @is_admin_or_mod()
+    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.set_vent_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(
+            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
+            "like they need a check-in. She won't reply publicly there unless mentioned."
+        )
+
     # ---------- ROLE ASSIGN ----------
     @app_commands.command(name="giverole", description="Give a role to a member")
     @is_admin_or_mod()
