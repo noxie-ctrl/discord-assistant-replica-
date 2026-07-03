@@ -182,7 +182,10 @@ class AIChat(commands.Cog):
             perms = target.permissions_for(guild.me)
             if not perms.send_messages:
                 return f"Error: I don't have permission to send messages in #{target.name}."
-            await target.send(content)
+            await target.send(
+                content,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+            )
             return f"Success: posted to #{target.name}."
 
         if name == "create_role":
@@ -337,7 +340,10 @@ class AIChat(commands.Cog):
 
         sent_message = None
         for chunk_start in range(0, len(reply), 2000):
-            sent_message = await message.channel.send(reply[chunk_start:chunk_start + 2000])
+            sent_message = await message.channel.send(
+                reply[chunk_start:chunk_start + 2000],
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+            )
 
         if sent_message:
             self._recent_replies[sent_message.id] = (author.id, guild.id, message.channel.id, reply[:200])
