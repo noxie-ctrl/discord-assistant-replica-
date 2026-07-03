@@ -39,7 +39,10 @@ MODEL_CANDIDATES = [
     "mistralai/mistral-nemotron",
     "meta/llama-3.3-70b-instruct",
 ]
-REQUEST_TIMEOUT_SECONDS = 25
+# Per-attempt timeout, tapering down for later fallbacks so a full outage
+# across all three candidates fails in ~35s total instead of ~75s.
+TIMEOUTS_BY_ATTEMPT = [15, 12, 10]
+REQUEST_TIMEOUT_SECONDS = TIMEOUTS_BY_ATTEMPT[0]  # kept for anything referencing the old constant
 
 
 def _api_key() -> str:
@@ -298,7 +301,7 @@ CONCERN_TOOLS = [
 
 
 async def _call_one_model(model: str, messages: list[dict], max_tokens: int, temperature: float,
-                            api_key: str, tools: list[dict] | None = None) -> dict:
+                            api_key: str, tools: list[dict] | None = None, timeout_seconds: int = 15) -> dict:
     """Returns the raw assistant message dict (content + optional tool_calls),
     not just text — callers that need tool_calls use this directly."""
     payload = {
@@ -317,7 +320,7 @@ async def _call_one_model(model: str, messages: list[dict], max_tokens: int, tem
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
             if resp.status != 200:
@@ -360,13 +363,17 @@ async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, tempe
     last_error: Exception | None = None
     for i, model in enumerate(MODEL_CANDIDATES):
         model_tools = tools if i < 2 else None  # drop tools for the non-Mistral fallback
+        attempt_timeout = TIMEOUTS_BY_ATTEMPT[min(i, len(TIMEOUTS_BY_ATTEMPT) - 1)]
         try:
-            message = await _call_one_model(model, messages, max_tokens, temperature, api_key, tools=model_tools)
+            message = await _call_one_model(
+                model, messages, max_tokens, temperature, api_key,
+                tools=model_tools, timeout_seconds=attempt_timeout,
+            )
             if model != MODEL_CANDIDATES[0]:
                 logger.warning("Primary model unavailable, served from fallback: %s", model)
             return message
         except asyncio.TimeoutError:
-            logger.warning("%s timed out after %ss, trying next candidate", model, REQUEST_TIMEOUT_SECONDS)
+            logger.warning("%s timed out after %ss, trying next candidate", model, attempt_timeout)
             last_error = TimeoutError(f"{model} timed out")
         except Exception as e:
             logger.warning("%s failed (%s), trying next candidate", model, e)

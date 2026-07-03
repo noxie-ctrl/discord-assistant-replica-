@@ -39,6 +39,8 @@ NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
 OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
+VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a busy vent channel
+VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
 
@@ -52,6 +54,8 @@ class AIChat(commands.Cog):
         self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
         # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
         self._last_alert: dict[tuple[int, int], float] = {}
+        # channel_id -> last time we ran a vent-channel classification call
+        self._last_vent_check: dict[int, float] = {}
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -167,12 +171,17 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
+        will_reply = await self._should_respond(message)
+
         settings = await db.get_guild_settings(message.guild.id)
         vent_channel_id = settings.get("vent_channel_id")
-        if vent_channel_id and message.channel.id == vent_channel_id:
+        # Skip the separate classification pass if this message is about to go
+        # through the full chat pipeline anyway — the flag_for_owner tool
+        # already covers concern-flagging there, no need to double-call NIM.
+        if vent_channel_id and message.channel.id == vent_channel_id and not will_reply:
             asyncio.create_task(self._check_vent_message(message))
 
-        if not await self._should_respond(message):
+        if not will_reply:
             return
 
         # Serialize handling per channel so rapid-fire messages in the same
@@ -185,9 +194,19 @@ class AIChat(commands.Cog):
     async def _check_vent_message(self, message: discord.Message):
         """Lightweight, cheap classification pass — does NOT go through the
         full chat pipeline, so it doesn't require a mention and doesn't
-        reply publicly. Just quietly decides whether to alert the owner."""
-        if not (message.content and message.content.strip()):
+        reply publicly. Just quietly decides whether to alert the owner.
+        Throttled so a busy vent channel doesn't burn through NIM's rate
+        limit — we sample instead of classifying every single message."""
+        content = (message.content or "").strip()
+        if len(content) < VENT_MIN_MESSAGE_LENGTH:
             return
+
+        now = asyncio.get_event_loop().time()
+        last_check = self._last_vent_check.get(message.channel.id)
+        if last_check is not None and (now - last_check) < VENT_CHECK_MIN_INTERVAL_SECONDS:
+            return
+        self._last_vent_check[message.channel.id] = now
+
         try:
             classification = await nim_client.call_nim(
                 [
@@ -202,7 +221,7 @@ class AIChat(commands.Cog):
                             "Reply with exactly one line: YES: <five word reason> or NO."
                         ),
                     },
-                    {"role": "user", "content": message.content[:1000]},
+                    {"role": "user", "content": content[:1000]},
                 ],
                 max_tokens=20,
                 temperature=0.1,
