@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS game_stats (
     PRIMARY KEY (guild_id, user_id, game)
 );
 
+CREATE TABLE IF NOT EXISTS economy (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    balance INT DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
     ON chat_memory (guild_id, channel_id, created_at DESC);
 """
@@ -474,3 +481,44 @@ async def get_feedback_summary(guild_id: int) -> dict:
             guild_id,
         )
         return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Economy (shared currency across all mini-games)
+# ---------------------------------------------------------------------------
+
+async def get_balance(guild_id: int, user_id: int) -> int:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance FROM economy WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+        return row["balance"] if row else 0
+
+
+async def adjust_balance(guild_id: int, user_id: int, delta: int) -> int:
+    """Positive delta credits, negative debits. Returns the new balance."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO economy (guild_id, user_id, balance)
+            VALUES ($1, $2, GREATEST($3, 0))
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET balance = GREATEST(economy.balance + $3, 0)
+            RETURNING balance
+            """,
+            guild_id, user_id, delta,
+        )
+        return row["balance"]
+
+
+async def get_leaderboard(guild_id: int, limit: int = 10) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM economy WHERE guild_id = $1 ORDER BY balance DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]

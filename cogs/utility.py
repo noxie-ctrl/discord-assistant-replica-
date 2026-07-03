@@ -46,6 +46,7 @@ class Utility(commands.Cog):
     @app_commands.choices(mode=[
         app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
         app_commands.Choice(name="Dedicated channel only", value="channel"),
+        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
         app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
         app_commands.Choice(name="All of the above", value="all"),
     ])

@@ -109,6 +109,10 @@ class AIChat(commands.Cog):
             return self.bot.user in message.mentions
         if trigger == "channel":
             return message.channel.id == settings.get("chat_channel_id")
+        if trigger == "channel_or_mention":
+            if message.channel.id == settings.get("chat_channel_id"):
+                return True
+            return self.bot.user in message.mentions
         if trigger == "name":
             personality = await db.get_personality(message.guild.id)
             name = (personality.get("name") or "lucy").lower()
