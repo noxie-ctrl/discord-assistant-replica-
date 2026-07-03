@@ -70,13 +70,27 @@ CREATE TABLE IF NOT EXISTS chat_memory (
 CREATE TABLE IF NOT EXISTS user_profiles (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
+    username TEXT,
     display_name TEXT,
     message_count INT DEFAULT 0,
     first_seen TIMESTAMPTZ DEFAULT now(),
     last_seen TIMESTAMPTZ DEFAULT now(),
     notes TEXT DEFAULT '',
     relationship_score INT DEFAULT 0,
+    preferred_language TEXT,
+    response_style TEXT,
     PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    message_snippet TEXT,
+    rating TEXT NOT NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS game_stats (
@@ -91,6 +105,14 @@ CREATE TABLE IF NOT EXISTS game_stats (
 
 CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
     ON chat_memory (guild_id, channel_id, created_at DESC);
+"""
+
+# Tables above only get created if they don't exist — they already exist in
+# production from the previous deploy, so new columns need explicit ALTERs.
+MIGRATIONS = """
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 """
 
 
@@ -110,7 +132,8 @@ async def init_pool():
     _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA)
-    logger.info("Database pool initialized and schema ensured.")
+        await conn.execute(MIGRATIONS)
+    logger.info("Database pool initialized, schema ensured, migrations applied.")
     return _pool
 
 
@@ -297,23 +320,47 @@ async def get_profile(guild_id: int, user_id: int) -> dict | None:
         return dict(row) if row else None
 
 
-async def touch_profile(guild_id: int, user_id: int, display_name: str) -> dict:
-    """Upsert a profile, bump message_count + last_seen. Returns the fresh row."""
+async def touch_profile(guild_id: int, user_id: int, username: str, display_name: str) -> dict:
+    """Upsert a profile, bump message_count + last_seen. Stores the immutable
+    Discord username alongside the (changeable) display name and the id, so
+    long-term memory is keyed on something more durable than a nickname.
+    Returns the fresh row."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO user_profiles (guild_id, user_id, display_name, message_count, last_seen)
-            VALUES ($1, $2, $3, 1, now())
+            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen)
+            VALUES ($1, $2, $3, $4, 1, now())
             ON CONFLICT (guild_id, user_id) DO UPDATE
-            SET display_name = $3,
+            SET username = $3,
+                display_name = $4,
                 message_count = user_profiles.message_count + 1,
                 last_seen = now()
             RETURNING *
             """,
-            guild_id, user_id, display_name,
+            guild_id, user_id, username, display_name,
         )
         return dict(row)
+
+
+async def set_user_preference(guild_id: int, user_id: int, *, preferred_language: str | None = None,
+                                response_style: str | None = None):
+    updates = {}
+    if preferred_language is not None:
+        updates["preferred_language"] = preferred_language
+    if response_style is not None:
+        updates["response_style"] = response_style
+    if not updates:
+        return
+    pool = _require_pool()
+    columns = list(updates.keys())
+    set_clause = ", ".join(f"{col} = ${i+3}" for i, col in enumerate(columns))
+    values = [updates[col] for col in columns]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE user_profiles SET {set_clause} WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, *values,
+        )
 
 
 async def update_profile_notes(guild_id: int, user_id: int, notes: str):
@@ -365,3 +412,65 @@ async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
             guild_id, user_id, game,
         )
         return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel continuity — so switching channels doesn't reset context
+# ---------------------------------------------------------------------------
+
+async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 10) -> list[dict]:
+    """A user's own recent messages across ANY channel in the guild, most
+    recent last. Used to give Lucy continuity when someone follows up with
+    her in a different channel than where the conversation started."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM chat_memory
+            WHERE guild_id = $1 AND speaker_id = $2 AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            guild_id, user_id, limit,
+        )
+        return [dict(r) for r in reversed(rows)]
+
+
+# ---------------------------------------------------------------------------
+# Feedback (reaction-based, feeds the model rather than "training" it)
+# ---------------------------------------------------------------------------
+
+async def add_feedback(guild_id: int, user_id: int, channel_id: int,
+                         message_snippet: str, rating: str, note: str | None = None):
+    """rating is 'up' or 'down'."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO feedback (guild_id, user_id, channel_id, message_snippet, rating, note) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            guild_id, user_id, channel_id, message_snippet, rating, note,
+        )
+
+
+async def get_recent_negative_feedback(guild_id: int, limit: int = 5) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM feedback WHERE guild_id = $1 AND rating = 'down' "
+            "ORDER BY created_at DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_feedback_summary(guild_id: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE rating = 'up') AS up, "
+            "COUNT(*) FILTER (WHERE rating = 'down') AS down "
+            "FROM feedback WHERE guild_id = $1",
+            guild_id,
+        )
+        return dict(row)

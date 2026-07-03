@@ -38,6 +38,7 @@ COGS = [
     "cogs.ai_chat",
     "cogs.games",
     "cogs.news",
+    "cogs.preferences",
 ]
 
 

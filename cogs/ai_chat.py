@@ -1,27 +1,31 @@
 """
 cogs/ai_chat.py
 
-Listens for messages per each guild's configured chat trigger (mention /
-dedicated channel / name-said / all), builds a grounded prompt, and replies
-via NVIDIA NIM.
-
-New in this version:
-  - Every incoming message updates the sender's user_profiles row (message
-    count, last_seen) via utils.database.touch_profile.
-  - The sender's long-term notes are pulled in and injected into the system
-    prompt so Lucy "remembers" people across sessions, not just the last 24
-    messages in a channel.
-  - If the sender is the bot owner, is_owner=True is passed through to
-    nim_client.build_system_prompt, which layers in the personal-assistant-
-    with-a-secret-crush persona.
-  - Every 15 messages from a given user, a lightweight side-call summarizes
-    recent chat into 2-4 durable facts and updates their notes.
-  - Mentioned-user fact injection (join date, account age, roles) is kept
-    from the previous fix.
+v3 changes:
+  - Cross-channel continuity: when building context, Lucy also sees the
+    speaker's own recent messages from OTHER channels in the guild, not just
+    the current one — so switching channels doesn't reset the conversation.
+  - Per-channel asyncio.Lock so concurrent messages in the same channel are
+    handled one at a time (keeps chat_memory ordering sane under load), plus
+    a global semaphore capping concurrent NIM calls so a burst of activity
+    across many channels doesn't hammer the API past its rate limit.
+  - Real tool-calling: Lucy can post to another channel, create a role, or
+    assign a role, gated by Discord permissions — not just talk about doing it.
+  - Full mention resolution: users, channels, and roles all get turned into
+    readable names (and users additionally get real fact injection), instead
+    of only user mentions being handled.
+  - User preferences (preferred_language, response_style) are pulled from
+    user_profiles and folded into the prompt.
+  - Profiles are now keyed with username + display_name + id (not just
+    display name), matching the DB schema update.
+  - Reaction-based feedback: 👍/👎 on one of Lucy's replies (by the person she
+    was replying to) logs to the feedback table.
 """
 
 import re
+import asyncio
 import logging
+from collections import defaultdict
 
 import discord
 from discord.ext import commands
@@ -32,11 +36,23 @@ from utils import nim_client
 logger = logging.getLogger("lucy.ai_chat")
 
 NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
+CROSS_CHANNEL_CONTEXT_LIMIT = 8
+MAX_CONCURRENT_NIM_CALLS = 5
+
+FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
 
 
 class AIChat(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._channel_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._nim_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NIM_CALLS)
+        # message_id -> (original_author_id, guild_id, channel_id, snippet) for feedback tracking
+        self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
+
+    # -----------------------------------------------------------------
+    # Mention resolution
+    # -----------------------------------------------------------------
 
     def _strip_self_mention(self, content: str) -> str:
         if self.bot.user:
@@ -45,9 +61,9 @@ class AIChat(commands.Cog):
             )
         return content.strip()
 
-    async def _resolve_other_mentions(self, message: discord.Message) -> tuple[str, list[str]]:
-        """Replace non-Lucy mentions with @DisplayName in the text, and build
-        a list of hard-fact strings about each mentioned user."""
+    async def _resolve_mentions(self, message: discord.Message) -> tuple[str, list[str]]:
+        """Turn <@user>, <#channel>, <@&role> into readable names, and build
+        a list of hard-fact strings about mentioned users."""
         content = message.content
         facts: list[str] = []
 
@@ -68,7 +84,17 @@ class AIChat(commands.Cog):
                     f"{', '.join(roles) if roles else 'none'}."
                 )
 
+        for channel in message.channel_mentions:
+            content = re.sub(rf"<#{channel.id}>", f"#{channel.name}", content)
+
+        for role in message.role_mentions:
+            content = re.sub(rf"<@&{role.id}>", f"@{role.name}", content)
+
         return content.strip(), facts
+
+    # -----------------------------------------------------------------
+    # Trigger detection
+    # -----------------------------------------------------------------
 
     async def _should_respond(self, message: discord.Message) -> bool:
         if message.guild is None or message.author.bot:
@@ -94,15 +120,116 @@ class AIChat(commands.Cog):
         if not await self._should_respond(message):
             return
 
-        async with message.channel.typing():
-            await self._handle_chat(message)
+        # Serialize handling per channel so rapid-fire messages in the same
+        # channel don't interleave and scramble chat_memory ordering.
+        lock = self._channel_locks[message.channel.id]
+        async with lock:
+            async with message.channel.typing():
+                await self._handle_chat(message)
+
+    # -----------------------------------------------------------------
+    # Feedback reactions
+    # -----------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.user_id == self.bot.user.id:
+            return
+        emoji = str(payload.emoji)
+        rating = FEEDBACK_EMOJI.get(emoji)
+        if not rating:
+            return
+
+        tracked = self._recent_replies.get(payload.message_id)
+        if not tracked:
+            return
+        original_author_id, guild_id, channel_id, snippet = tracked
+        if payload.user_id != original_author_id:
+            return  # only the person Lucy was replying to can rate it
+
+        await db.add_feedback(guild_id, payload.user_id, channel_id, snippet, rating)
+        logger.info("Recorded %s feedback from user %s in guild %s", rating, payload.user_id, guild_id)
+
+    # -----------------------------------------------------------------
+    # Tool execution
+    # -----------------------------------------------------------------
+
+    async def _execute_tool_call(self, tool_call: dict, message: discord.Message) -> str:
+        import json
+
+        name = tool_call["function"]["name"]
+        try:
+            args = json.loads(tool_call["function"].get("arguments") or "{}")
+        except json.JSONDecodeError:
+            return "Error: could not parse tool arguments."
+
+        guild = message.guild
+        author = message.author
+        owner_id = getattr(self.bot, "owner_id", None)
+        is_owner = owner_id is not None and author.id == owner_id
+        has_manage_roles = getattr(author.guild_permissions, "manage_roles", False)
+        has_manage_guild = getattr(author.guild_permissions, "manage_guild", False)
+
+        if name == "send_message_to_channel":
+            channel_name = (args.get("channel_name") or "").lstrip("#").strip().lower()
+            content = args.get("content") or ""
+            target = discord.utils.find(
+                lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == channel_name,
+                guild.channels,
+            )
+            if target is None:
+                return f"Error: no channel named '{channel_name}' found."
+            perms = target.permissions_for(guild.me)
+            if not perms.send_messages:
+                return f"Error: I don't have permission to send messages in #{target.name}."
+            await target.send(content)
+            return f"Success: posted to #{target.name}."
+
+        if name == "create_role":
+            if not (is_owner or has_manage_roles):
+                return "Error: requester doesn't have permission to create roles."
+            role_name = args.get("role_name") or "New Role"
+            color_hex = args.get("color_hex")
+            color = discord.Color.default()
+            if color_hex:
+                try:
+                    color = discord.Color(int(color_hex.lstrip("#"), 16))
+                except ValueError:
+                    pass
+            new_role = await guild.create_role(name=role_name, color=color, reason=f"Requested by {author}")
+            return f"Success: created role '{new_role.name}'."
+
+        if name == "assign_role":
+            if not (is_owner or has_manage_roles):
+                return "Error: requester doesn't have permission to assign roles."
+            member_name = (args.get("member_name") or "").lower()
+            role_name = (args.get("role_name") or "").lower()
+            target_member = discord.utils.find(
+                lambda m: m.display_name.lower() == member_name or m.name.lower() == member_name,
+                guild.members,
+            )
+            target_role = discord.utils.find(lambda r: r.name.lower() == role_name, guild.roles)
+            if target_member is None:
+                return f"Error: no member named '{member_name}' found."
+            if target_role is None:
+                return f"Error: no role named '{role_name}' found."
+            if target_role >= guild.me.top_role:
+                return f"Error: I can't assign '{target_role.name}' — it's above my own role."
+            await target_member.add_roles(target_role, reason=f"Requested by {author}")
+            return f"Success: gave {target_member.display_name} the '{target_role.name}' role."
+
+        return f"Error: unknown tool '{name}'."
+
+    # -----------------------------------------------------------------
+    # Main chat handling
+    # -----------------------------------------------------------------
 
     async def _handle_chat(self, message: discord.Message):
         guild = message.guild
         author = message.author
 
-        # 1. Long-term profile bookkeeping
-        profile = await db.touch_profile(guild.id, author.id, author.display_name)
+        # 1. Long-term profile bookkeeping (id + username + display name)
+        profile = await db.touch_profile(guild.id, author.id, str(author), author.display_name)
 
         if profile["message_count"] % NOTES_UPDATE_INTERVAL == 0:
             history = await db.get_chat_history(guild.id, message.channel.id, limit=NOTES_UPDATE_INTERVAL)
@@ -118,8 +245,8 @@ class AIChat(commands.Cog):
                     await db.update_profile_notes(guild.id, author.id, new_notes)
                     profile["notes"] = new_notes
 
-        # 2. Resolve mentions of other users into real facts, strip Lucy's own mention
-        cleaned_content, mentioned_facts = await self._resolve_other_mentions(message)
+        # 2. Resolve mentions (users/channels/roles), strip Lucy's own mention
+        cleaned_content, mentioned_facts = await self._resolve_mentions(message)
         cleaned_content = self._strip_self_mention(cleaned_content)
         if not cleaned_content:
             cleaned_content = "(no text — attachment or empty mention)"
@@ -133,8 +260,11 @@ class AIChat(commands.Cog):
         personality = await db.get_personality(guild.id)
         owner_id = getattr(self.bot, "owner_id", None)
         is_owner = owner_id is not None and author.id == owner_id
-        owner_member = guild.owner  # real owner, not "whoever the chat jokes about"
+        owner_member = guild.owner
         owner_name = owner_member.display_name if owner_member else "the server owner"
+
+        can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
+            or author.guild_permissions.manage_channels
 
         system_prompt = nim_client.build_system_prompt(
             personality=personality,
@@ -143,18 +273,57 @@ class AIChat(commands.Cog):
             is_owner=is_owner,
             speaker_notes=profile.get("notes") or None,
             mentioned_users_facts=mentioned_facts or None,
+            preferred_language=profile.get("preferred_language"),
+            response_style=profile.get("response_style"),
+            can_use_tools=can_use_tools,
         )
 
+        # 5. In-channel short-term history
         history = await db.get_chat_history(guild.id, message.channel.id, limit=24)
         chat_messages = [{"role": "system", "content": system_prompt}]
+
+        # 5b. Cross-channel continuity — the speaker's own recent messages
+        # elsewhere in the guild, so switching channels doesn't lose context.
+        cross_channel = await db.get_recent_messages_by_user(
+            guild.id, author.id, limit=CROSS_CHANNEL_CONTEXT_LIMIT
+        )
+        cross_channel = [h for h in cross_channel if h["channel_id"] != message.channel.id]
+        if cross_channel:
+            summary_lines = "\n".join(f"- {h['content']}" for h in cross_channel[-CROSS_CHANNEL_CONTEXT_LIMIT:])
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    f"For context, here's what {author.display_name} has recently said in OTHER "
+                    f"channels in this server (not the current one):\n{summary_lines}"
+                ),
+            })
+
         for h in history:
             role = "assistant" if h["role"] == "assistant" else "user"
             prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
             chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
 
-        # 5. Call the model
+        # 6. Call the model (semaphore-capped), with tool support
         try:
-            reply = await nim_client.call_nim(chat_messages)
+            async with self._nim_semaphore:
+                tools = nim_client.TOOLS if can_use_tools else None
+                assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
+
+                if assistant_message.get("tool_calls"):
+                    chat_messages.append(assistant_message)
+                    for tool_call in assistant_message["tool_calls"]:
+                        result = await self._execute_tool_call(tool_call, message)
+                        chat_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", ""),
+                            "content": result,
+                        })
+                    # One more round trip to let Lucy phrase the final reply
+                    async with self._nim_semaphore:
+                        final_message = await nim_client.call_nim_with_tools(chat_messages, tools=None)
+                    reply = (final_message.get("content") or "Done.").strip()
+                else:
+                    reply = (assistant_message.get("content") or "").strip()
         except Exception:
             logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
             await message.reply(
@@ -163,11 +332,24 @@ class AIChat(commands.Cog):
             )
             return
 
-        # 6. Store assistant reply, then send (split if too long for Discord)
+        # 7. Store assistant reply, then send (split if too long for Discord)
         await db.add_chat_message(guild.id, message.channel.id, None, None, "assistant", reply)
 
+        sent_message = None
         for chunk_start in range(0, len(reply), 2000):
-            await message.channel.send(reply[chunk_start:chunk_start + 2000])
+            sent_message = await message.channel.send(reply[chunk_start:chunk_start + 2000])
+
+        if sent_message:
+            self._recent_replies[sent_message.id] = (author.id, guild.id, message.channel.id, reply[:200])
+            for emoji in FEEDBACK_EMOJI:
+                try:
+                    await sent_message.add_reaction(emoji)
+                except discord.HTTPException:
+                    pass
+            # keep the tracking dict from growing forever
+            if len(self._recent_replies) > 500:
+                oldest_key = next(iter(self._recent_replies))
+                self._recent_replies.pop(oldest_key, None)
 
 
 async def setup(bot: commands.Bot):

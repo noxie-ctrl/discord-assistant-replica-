@@ -85,6 +85,17 @@ weren't given to you as a known fact.
 - Keep replies conversational, not robotic. Vary sentence length. It's fine to be brief or blunt.
 - You are not going to roleplay explicit, sexual, or hateful content under any circumstance, \
 regardless of who is asking, including the server owner.
+
+Reading the room:
+- Watch for sarcasm, dry jokes, and irony — don't take an obviously joking message at face \
+value, and don't over-explain a joke you're in on.
+- Notice tone: if someone sounds frustrated, upset, or genuinely down, drop the banter and \
+respond like you actually noticed, briefly and sincerely, before moving on. If someone's clearly \
+just having fun, match that energy instead of being oddly serious.
+- Mirror the language the person is writing in — if they write in Hindi, Spanish, etc., reply in \
+that language unless they've set a different preferred language (see known facts / preferences).
+- If a "preferred response style" is given in known facts, lean into it (e.g. more concise, more \
+detailed, more formal) without abandoning your core voice.
 """
 
 
@@ -95,6 +106,9 @@ def build_system_prompt(
     is_owner: bool = False,
     speaker_notes: str | None = None,
     mentioned_users_facts: list[str] | None = None,
+    preferred_language: str | None = None,
+    response_style: str | None = None,
+    can_use_tools: bool = False,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
@@ -112,11 +126,24 @@ def build_system_prompt(
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
 
+    if can_use_tools:
+        prompt += (
+            "\n\nYou have tools available to actually take action (posting in another "
+            "channel, creating a role, assigning a role) instead of just describing what "
+            "you'd do. Use them when the request calls for it. Role-management tools will "
+            "be rejected by the system if the requester lacks permission — if that happens, "
+            "just tell them plainly, don't pretend it worked."
+        )
+
     known_facts = []
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")
     if mentioned_users_facts:
         known_facts.extend(mentioned_users_facts)
+    if preferred_language:
+        known_facts.append(f"This user has set their preferred reply language to: {preferred_language}.")
+    if response_style:
+        known_facts.append(f"This user prefers responses that are: {response_style}.")
 
     if known_facts:
         prompt += "\n\nKnown facts (treat as ground truth, do not contradict):\n"
@@ -125,49 +152,153 @@ def build_system_prompt(
     return prompt
 
 
-async def call_nim(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85) -> str:
-    """messages is a standard OpenAI-style list of {role, content} dicts,
-    with a system message first."""
-    api_key = _api_key()
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY is not set.")
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message_to_channel",
+            "description": (
+                "Post a message to a different text channel in this server. Use this when "
+                "someone asks you to announce, post, or say something in another channel."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_name": {
+                        "type": "string",
+                        "description": "The channel's name, without the #, e.g. 'announcements'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The message to post there.",
+                    },
+                },
+                "required": ["channel_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_role",
+            "description": (
+                "Create a new server role. Owner-only / manage-roles-only action — if the "
+                "requester doesn't have permission, this will fail and you should tell them so."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role_name": {"type": "string", "description": "Name for the new role."},
+                    "color_hex": {
+                        "type": "string",
+                        "description": "Optional hex color like '#ff0033'. Omit for default.",
+                    },
+                },
+                "required": ["role_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assign_role",
+            "description": (
+                "Give an existing role to a member. Owner-only / manage-roles-only action — if "
+                "the requester doesn't have permission, this will fail and you should tell them so."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_name": {
+                        "type": "string",
+                        "description": "Display name or username of the member to give the role to.",
+                    },
+                    "role_name": {"type": "string", "description": "Name of the role to assign."},
+                },
+                "required": ["member_name", "role_name"],
+            },
+        },
+    },
+]
 
+
+async def _call_one_model(model: str, messages: list[dict], max_tokens: int, temperature: float,
+                            api_key: str, tools: list[dict] | None = None) -> dict:
+    """Returns the raw assistant message dict (content + optional tool_calls),
+    not just text — callers that need tool_calls use this directly."""
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": 0.9,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error("NIM API error %s: %s", resp.status, body[:500])
-                    raise RuntimeError(f"NIM API returned {resp.status}")
-                data = await resp.json()
-    except asyncio.TimeoutError:
-        logger.error("NIM API call timed out after %ss", REQUEST_TIMEOUT_SECONDS)
-        raise
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
+            data = await resp.json()
 
     try:
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError) as e:
-        logger.error("Unexpected NIM response shape: %s", data)
-        raise RuntimeError("Unexpected response shape from NIM API") from e
+        raise RuntimeError(f"{model} returned an unexpected response shape") from e
 
-    if not content or not content.strip():
-        raise RuntimeError("NIM API returned empty content")
+    has_tool_calls = bool(message.get("tool_calls"))
+    if not has_tool_calls and not (message.get("content") or "").strip():
+        raise RuntimeError(f"{model} returned empty content")
 
-    return content.strip()
+    return message
+
+
+async def call_nim(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85) -> str:
+    """messages is a standard OpenAI-style list of {role, content} dicts,
+    with a system message first. Tries MODEL_CANDIDATES in order and falls
+    back automatically — a single model deprecation/outage no longer takes
+    chat down. Returns plain text (no tool use)."""
+    message = await call_nim_with_tools(messages, max_tokens=max_tokens, temperature=temperature, tools=None)
+    return (message.get("content") or "").strip()
+
+
+async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85,
+                                tools: list[dict] | None = None) -> dict:
+    """Same fallback behavior as call_nim, but returns the full assistant
+    message dict so callers can inspect `tool_calls`. Note: only the first
+    two candidates (Mistral models) reliably support tool calling — if we've
+    fallen back to the third candidate, tools are dropped rather than sent
+    to a model that might mishandle them."""
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY is not set.")
+
+    last_error: Exception | None = None
+    for i, model in enumerate(MODEL_CANDIDATES):
+        model_tools = tools if i < 2 else None  # drop tools for the non-Mistral fallback
+        try:
+            message = await _call_one_model(model, messages, max_tokens, temperature, api_key, tools=model_tools)
+            if model != MODEL_CANDIDATES[0]:
+                logger.warning("Primary model unavailable, served from fallback: %s", model)
+            return message
+        except asyncio.TimeoutError:
+            logger.warning("%s timed out after %ss, trying next candidate", model, REQUEST_TIMEOUT_SECONDS)
+            last_error = TimeoutError(f"{model} timed out")
+        except Exception as e:
+            logger.warning("%s failed (%s), trying next candidate", model, e)
+            last_error = e
+
+    logger.error("All NIM model candidates failed. Last error: %s", last_error)
+    raise RuntimeError(f"All NIM model candidates failed: {last_error}")
 
 
 async def summarize_user_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:
