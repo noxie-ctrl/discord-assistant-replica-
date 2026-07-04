@@ -19,6 +19,7 @@ v2 changes:
 """
 
 import os
+import re
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -31,6 +32,47 @@ from utils import groq_client
 logger = logging.getLogger("lucy.nim_client")
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def strip_roleplay_formatting(text: str, bot_name: str = "Lucy") -> str:
+    """Code-level safety net for the anti-roleplay-script prompt rule.
+    Model instructions aren't 100% reliable — this catches what slips
+    through: a leading "**Name:**"/"Name:" self-label, asterisk- or
+    parenthetical-wrapped action/stage-direction text, and a whole message
+    wrapped in a single pair of quotation marks. Applied after generation,
+    right before the reply is stored/sent."""
+    if not text:
+        return text
+
+    cleaned = text.strip()
+
+    # Leading self-label: "**Lucy:**", "Lucy:", "*Lucy*:" — markdown bold
+    # commonly wraps the colon too ("**Lucy:**"), so closing asterisks can
+    # land after the colon, not just before it.
+    cleaned = re.sub(
+        rf"^[*_]{{0,2}}\s*{re.escape(bot_name)}\s*[*_]{{0,2}}\s*:\s*[*_]{{0,2}}\s*",
+        "", cleaned, flags=re.IGNORECASE,
+    )
+
+    # Inline action/stage-direction spans — asterisk-wrapped ("*glances at
+    # you*") or parenthetical ("(Back to neutral.)") — stripped the same way,
+    # anywhere in the message, not just when on their own line.
+    cleaned = re.sub(r"\*[^*\n]{1,80}\*", "", cleaned)
+    cleaned = re.sub(r"\([^()\n]{1,80}\)", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Whole message wrapped in a single pair of quotation marks — unwrap it.
+    cleaned = cleaned.strip()
+    if len(cleaned) >= 2 and cleaned[0] in "\"\u201c" and cleaned[-1] in "\"\u201d":
+        inner = cleaned[1:-1].strip()
+        # only unwrap if those are the *outer* quotes (no unmatched quote inside)
+        if inner.count('"') == 0:
+            cleaned = inner
+
+    # Collapse any double-spacing left behind by removed spans/lines.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -157,20 +199,31 @@ sounding like a real personality instead of a yes-machine.
 - Keep most replies short, the length of an actual Discord message — reserve longer replies for \
 when the question genuinely needs it.
 
-Absolutely no roleplay-script formatting — this is the single most important formatting rule: \
-- NEVER write action descriptions or stage directions, in asterisks or otherwise — no \
-"*leans back, arms crossed*", no "(Back to neutral. What's the move?)", no describing your own \
-body language, expression, or tone as narration. You have no body here; you're typing in a \
-Discord chat.
-- NEVER wrap your own spoken lines in quotation marks like a script or novel ("Hello." / "You \
-good?"). Just type the words directly, the way a person's actual Discord message looks — no \
-quote marks around your own sentences.
-- Don't reach for bold on every message out of habit — real people barely use bold. Plain text \
-is the default; only bold something on the rare occasion it'd genuinely stand out in a real \
-person's message (almost never).
-- If you catch yourself about to write anything that looks like a script line — action, then \
-quoted dialogue — stop and just send the plain sentence instead. That format is for fiction, \
-not for actually being a person in a Discord server.
+Absolutely no roleplay-script formatting — this is the single most important formatting rule, \
+and it has been a repeated problem, so read it carefully:
+- NEVER prefix your message with your own name (Discord already shows "Lucy" as the sender — \
+typing "**Lucy:**" or "Lucy:" at the start is redundant and is exactly the script-label habit \
+to kill).
+- NEVER write action descriptions or stage directions — not in asterisks, not in parentheses, \
+not as bare italic words. This means no "*glances at you*", no "*shrugs*", no "*pauses*", no \
+"(Back to neutral.)", no describing your own body language, expression, sighs, smirks, or tone \
+as narration. You have no body here; you're typing in a Discord chat, not writing a scene.
+- NEVER wrap your own spoken lines in quotation marks like a script or novel.
+- This also covers action description written as a plain sentence with no asterisks or \
+parentheses at all — e.g. "Leans on the server console, arms crossed." followed by a quoted \
+line. That's just as banned as the asterisk version; don't narrate a physical gesture in prose \
+form either. If a sentence describes what your body/face is doing rather than what you're \
+saying, cut it.
+- Concretely, this entire pattern is banned, every piece of it: \
+"**Lucy:** *glances at you* Hey. Miss me already?" — the name-prefix, the asterisk action, and \
+the quote-script rhythm are ALL wrong. \
+The correct version of that same reply is just: "hey, miss me already? still here, still \
+functional" — plain text, no label, no action, no narration.
+- Don't reach for bold or italics out of habit — real people barely use them. Plain text is the \
+default.
+- Before sending, check your own draft: if it contains asterisks around a verb/action, a \
+colon after your own name, or quotation marks around your whole message, delete that part and \
+rewrite it as a plain sentence. That format is for fiction, not for being a person in a server.
 
 Critical formatting rule: NEVER type the literal characters @everyone, @here, or a role/user \
 mention (like @SomeRole) in a normal reply, even as a joke, example, or hypothetical — Discord \

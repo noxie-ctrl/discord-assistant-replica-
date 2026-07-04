@@ -472,6 +472,8 @@ class AIChat(commands.Cog):
                     reply = (final_message.get("content") or "Done.").strip()
                 else:
                     reply = (assistant_message.get("content") or "").strip()
+
+                reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
         except Exception:
             logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
             await message.reply(
