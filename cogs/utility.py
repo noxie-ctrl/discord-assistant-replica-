@@ -69,6 +69,30 @@ class Utility(commands.Cog):
             "like they need a check-in. She won't reply publicly there unless mentioned."
         )
 
+    @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
+    @is_admin_or_mod()
+    async def disableventchannel(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        if not settings.get("vent_channel_id"):
+            await interaction.response.send_message("There's no vent channel set right now — nothing to disable.", ephemeral=True)
+            return
+        await db.update_guild_setting(interaction.guild.id, vent_channel_id=None)
+        await interaction.response.send_message(
+            "✅ Vent-channel watching is off. Use `/setventchannel` any time to turn it back on."
+        )
+
+    @app_commands.command(name="ventstatus", description="Check whether Lucy's vent-channel watcher is on")
+    @is_admin_or_mod()
+    async def ventstatus(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        channel_id = settings.get("vent_channel_id")
+        if not channel_id:
+            await interaction.response.send_message("Vent-channel watching is currently **off**.", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(channel_id)
+        name = channel.mention if channel else f"channel {channel_id} (not found — may have been deleted)"
+        await interaction.response.send_message(f"Vent-channel watching is currently **on**, watching {name}.", ephemeral=True)
+
     # ---------- ROLE ASSIGN ----------
     @app_commands.command(name="giverole", description="Give a role to a member")
     @is_admin_or_mod()

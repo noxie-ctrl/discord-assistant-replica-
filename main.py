@@ -68,6 +68,13 @@ class Lucy(commands.Bot):
         synced = await self.tree.sync()
         logger.info("Synced %d slash commands.", len(synced))
 
+    async def on_ready(self):
+        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
+        # gets called with her own user id in that case, and this tells the
+        # database layer to skip the (meaningless) relationship-score bump for it.
+        db.set_bot_user_id(self.user.id)
+        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
+
     async def close(self):
         await db.close_pool()
         await super().close()

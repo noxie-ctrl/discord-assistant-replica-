@@ -47,6 +47,8 @@ cogs/
   moderation.py
   news.py
   personality.py
+  preferences.py
+  serverlog.py
   utility.py
 utils/
   __init__.py
@@ -66,288 +68,6 @@ This section contains the contents of the repository's files.
 
 <file path="cogs/__init__.py">
 
-</file>
-
-<file path="cogs/games.py">
-"""
-cogs/games.py
-
-Lightweight, no-dependency mini-games to keep the server active:
-  - /tictactoe @opponent   — button-grid, two human players
-  - /guessnumber [max]     — bot picks 1..max (default 100), you type guesses
-  - /rps                   — rock/paper/scissors vs Lucy, buttons
-
-Results are recorded to game_stats via utils.database so /gamestats can show
-a simple leaderboard-style summary per user.
-"""
-
-import random
-import asyncio
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from utils import database as db
-
-
-# ---------------------------------------------------------------------------
-# Tic-Tac-Toe
-# ---------------------------------------------------------------------------
-
-class TicTacToeButton(discord.ui.Button):
-    def __init__(self, x: int, y: int):
-        super().__init__(style=discord.ButtonStyle.secondary, label="\u200b", row=y)
-        self.x = x
-        self.y = y
-
-    async def callback(self, interaction: discord.Interaction):
-        view: "TicTacToeView" = self.view
-        await view.handle_move(interaction, self)
-
-
-class TicTacToeView(discord.ui.View):
-    X, O, EMPTY = "X", "O", None
-
-    def __init__(self, player_x: discord.Member, player_o: discord.Member, guild_id: int):
-        super().__init__(timeout=180)
-        self.player_x = player_x
-        self.player_o = player_o
-        self.guild_id = guild_id
-        self.current = player_x
-        self.board = [[self.EMPTY] * 3 for _ in range(3)]
-        for y in range(3):
-            for x in range(3):
-                self.add_item(TicTacToeButton(x, y))
-
-    def _symbol_for(self, player: discord.Member) -> str:
-        return self.X if player.id == self.player_x.id else self.O
-
-    def _check_winner(self) -> str | None:
-        lines = []
-        lines.extend(self.board)  # rows
-        lines.extend([[self.board[r][c] for r in range(3)] for c in range(3)])  # cols
-        lines.append([self.board[i][i] for i in range(3)])
-        lines.append([self.board[i][2 - i] for i in range(3)])
-        for line in lines:
-            if line[0] is not None and line[0] == line[1] == line[2]:
-                return line[0]
-        if all(cell is not None for row in self.board for cell in row):
-            return "draw"
-        return None
-
-    async def handle_move(self, interaction: discord.Interaction, button: TicTacToeButton):
-        if interaction.user.id != self.current.id:
-            await interaction.response.send_message("It's not your turn.", ephemeral=True)
-            return
-        if self.board[button.y][button.x] is not None:
-            await interaction.response.send_message("That square's taken.", ephemeral=True)
-            return
-
-        symbol = self._symbol_for(self.current)
-        self.board[button.y][button.x] = symbol
-        button.label = symbol
-        button.style = (
-            discord.ButtonStyle.danger if symbol == self.X else discord.ButtonStyle.primary
-        )
-        button.disabled = True
-
-        result = self._check_winner()
-        if result is None:
-            self.current = self.player_o if self.current.id == self.player_x.id else self.player_x
-            await interaction.response.edit_message(
-                content=f"{self.current.mention}'s turn ({self._symbol_for(self.current)})",
-                view=self,
-            )
-            return
-
-        for child in self.children:
-            child.disabled = True
-
-        if result == "draw":
-            await db.record_game_result(self.guild_id, self.player_x.id, "tictactoe", "draw")
-            await db.record_game_result(self.guild_id, self.player_o.id, "tictactoe", "draw")
-            content = "It's a draw!"
-        else:
-            winner = self.player_x if result == self.X else self.player_o
-            loser = self.player_o if result == self.X else self.player_x
-            await db.record_game_result(self.guild_id, winner.id, "tictactoe", "win")
-            await db.record_game_result(self.guild_id, loser.id, "tictactoe", "loss")
-            content = f"🎉 {winner.mention} wins!"
-
-        await interaction.response.edit_message(content=content, view=self)
-        self.stop()
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-
-
-# ---------------------------------------------------------------------------
-# Rock Paper Scissors
-# ---------------------------------------------------------------------------
-
-class RPSView(discord.ui.View):
-    CHOICES = ["rock", "paper", "scissors"]
-    BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
-
-    def __init__(self, player: discord.Member, guild_id: int):
-        super().__init__(timeout=30)
-        self.player = player
-        self.guild_id = guild_id
-
-    async def _resolve(self, interaction: discord.Interaction, user_choice: str):
-        if interaction.user.id != self.player.id:
-            await interaction.response.send_message("This isn't your game.", ephemeral=True)
-            return
-
-        bot_choice = random.choice(self.CHOICES)
-        if user_choice == bot_choice:
-            result_text = f"Both picked **{user_choice}** — draw!"
-            await db.record_game_result(self.guild_id, self.player.id, "rps", "draw")
-        elif self.BEATS[user_choice] == bot_choice:
-            result_text = f"You picked **{user_choice}**, I picked **{bot_choice}** — you win! 🎉"
-            await db.record_game_result(self.guild_id, self.player.id, "rps", "win")
-        else:
-            result_text = f"You picked **{user_choice}**, I picked **{bot_choice}** — I win! 😏"
-            await db.record_game_result(self.guild_id, self.player.id, "rps", "loss")
-
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(content=result_text, view=self)
-        self.stop()
-
-    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, emoji="🪨")
-    async def rock(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, "rock")
-
-    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, emoji="📄")
-    async def paper(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, "paper")
-
-    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, emoji="✂️")
-    async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self._resolve(interaction, "scissors")
-
-
-# ---------------------------------------------------------------------------
-# Guess the Number
-# ---------------------------------------------------------------------------
-
-class GuessNumberGame:
-    __slots__ = ("target", "max_value", "attempts", "player_id")
-
-    def __init__(self, max_value: int, player_id: int):
-        self.target = random.randint(1, max_value)
-        self.max_value = max_value
-        self.attempts = 0
-        self.player_id = player_id
-
-
-class Games(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-        # channel_id -> GuessNumberGame
-        self.active_guess_games: dict[int, GuessNumberGame] = {}
-
-    # -- Tic Tac Toe --------------------------------------------------------
-
-    @app_commands.command(name="tictactoe", description="Challenge someone to Tic-Tac-Toe")
-    @app_commands.describe(opponent="Who do you want to play against?")
-    async def tictactoe(self, interaction: discord.Interaction, opponent: discord.Member):
-        if opponent.bot:
-            await interaction.response.send_message("Pick a human opponent.", ephemeral=True)
-            return
-        if opponent.id == interaction.user.id:
-            await interaction.response.send_message("You can't play yourself.", ephemeral=True)
-            return
-
-        view = TicTacToeView(interaction.user, opponent, interaction.guild_id)
-        await interaction.response.send_message(
-            f"{interaction.user.mention} (X) vs {opponent.mention} (O) — {interaction.user.mention}'s turn (X)",
-            view=view,
-        )
-
-    # -- Rock Paper Scissors --------------------------------------------------
-
-    @app_commands.command(name="rps", description="Play Rock Paper Scissors against Lucy")
-    async def rps(self, interaction: discord.Interaction):
-        view = RPSView(interaction.user, interaction.guild_id)
-        await interaction.response.send_message("Pick your move:", view=view)
-
-    # -- Guess the Number -----------------------------------------------------
-
-    @app_commands.command(name="guessnumber", description="Guess Lucy's number — type your guesses in chat")
-    @app_commands.describe(max_value="Upper bound of the range (default 100)")
-    async def guessnumber(self, interaction: discord.Interaction, max_value: app_commands.Range[int, 10, 1000] = 100):
-        if interaction.channel_id in self.active_guess_games:
-            await interaction.response.send_message(
-                "There's already a guessing game running in this channel.", ephemeral=True
-            )
-            return
-
-        game = GuessNumberGame(max_value, interaction.user.id)
-        self.active_guess_games[interaction.channel_id] = game
-        await interaction.response.send_message(
-            f"I'm thinking of a number between 1 and {max_value}, {interaction.user.mention}. "
-            "Type your guesses right here in chat! You've got 60 seconds."
-        )
-
-        await asyncio.sleep(60)
-        # Clean up if nobody finished it
-        if self.active_guess_games.get(interaction.channel_id) is game:
-            del self.active_guess_games[interaction.channel_id]
-            await db.record_game_result(interaction.guild_id, game.player_id, "guessnumber", "loss")
-            await interaction.followup.send(
-                f"⏰ Time's up! The number was **{game.target}**."
-            )
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if message.author.bot or message.guild is None:
-            return
-        game = self.active_guess_games.get(message.channel.id)
-        if game is None or message.author.id != game.player_id:
-            return
-        if not message.content.strip().lstrip("-").isdigit():
-            return
-
-        guess = int(message.content.strip())
-        game.attempts += 1
-
-        if guess == game.target:
-            del self.active_guess_games[message.channel.id]
-            await db.record_game_result(message.guild.id, game.player_id, "guessnumber", "win")
-            await message.reply(
-                f"🎯 Got it in {game.attempts} guesses! The number was **{game.target}**.",
-                mention_author=False,
-            )
-        elif guess < game.target:
-            await message.reply("Higher ⬆️", mention_author=False)
-        else:
-            await message.reply("Lower ⬇️", mention_author=False)
-
-    # -- Stats ------------------------------------------------------------
-
-    @app_commands.command(name="gamestats", description="See your mini-game record")
-    @app_commands.describe(user="Whose stats to check (defaults to you)")
-    async def gamestats(self, interaction: discord.Interaction, user: discord.Member | None = None):
-        target = user or interaction.user
-        games = ["tictactoe", "rps", "guessnumber"]
-        lines = []
-        for g in games:
-            stats = await db.get_game_stats(interaction.guild_id, target.id, g)
-            lines.append(f"**{g}** — W:{stats['wins']} L:{stats['losses']} D:{stats['draws']}")
-        embed = discord.Embed(
-            title=f"{target.display_name}'s game stats",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        )
-        await interaction.response.send_message(embed=embed)
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Games(bot))
 </file>
 
 <file path="cogs/moderation.py">
@@ -677,6 +397,677 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Personality(bot))
 </file>
 
+<file path="cogs/preferences.py">
+"""
+cogs/preferences.py
+
+Lets members set how Lucy talks to them personally:
+  - /mysettings language:<lang> style:<style>  — stored on their user_profiles row
+  - /myprofile                                  — shows what Lucy currently
+    remembers about them (notes + preferences), for transparency
+  - /feedbackstats                              — owner/mod-only rollup of
+    reaction-based feedback (👍/👎ing Lucy's own replies)
+"""
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+
+
+RESPONSE_STYLES = [
+    app_commands.Choice(name="Concise", value="concise, short answers"),
+    app_commands.Choice(name="Detailed", value="detailed, thorough explanations"),
+    app_commands.Choice(name="Casual", value="very casual and informal"),
+    app_commands.Choice(name="Formal", value="more formal and professional"),
+]
+
+
+class Preferences(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="mysettings", description="Set how Lucy talks to you personally")
+    @app_commands.describe(
+        language="Reply to you in this language by default (e.g. 'Hindi', 'Spanish', 'English')",
+        style="Preferred response style",
+    )
+    @app_commands.choices(style=RESPONSE_STYLES)
+    async def mysettings(
+        self,
+        interaction: discord.Interaction,
+        language: str | None = None,
+        style: app_commands.Choice[str] | None = None,
+    ):
+        if language is None and style is None:
+            await interaction.response.send_message(
+                "Give me at least one of `language` or `style` to update.", ephemeral=True
+            )
+            return
+
+        await db.touch_profile(interaction.guild_id, interaction.user.id, str(interaction.user), interaction.user.display_name)
+        await db.set_user_preference(
+            interaction.guild_id,
+            interaction.user.id,
+            preferred_language=language,
+            response_style=style.value if style else None,
+        )
+        await interaction.response.send_message("Got it — updated your preferences.", ephemeral=True)
+
+    @app_commands.command(name="myprofile", description="See what Lucy remembers about you")
+    async def myprofile(self, interaction: discord.Interaction):
+        profile = await db.get_profile(interaction.guild_id, interaction.user.id)
+        if profile is None:
+            await interaction.response.send_message(
+                "I don't have anything on you yet — chat with me a bit first.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(title=f"What I've got on {interaction.user.display_name}", color=discord.Color.blurple())
+        embed.add_field(name="Messages seen", value=str(profile.get("message_count", 0)), inline=True)
+        embed.add_field(name="Preferred language", value=profile.get("preferred_language") or "not set", inline=True)
+        embed.add_field(name="Response style", value=profile.get("response_style") or "not set", inline=True)
+        embed.add_field(name="Notes", value=profile.get("notes") or "(nothing noted yet)", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="feedbackstats", description="See Lucy's feedback stats (mod/owner only)")
+    async def feedbackstats(self, interaction: discord.Interaction):
+        if not (interaction.user.guild_permissions.manage_guild or interaction.user.id == getattr(self.bot, "owner_id", None)):
+            await interaction.response.send_message("You need Manage Server permission for this.", ephemeral=True)
+            return
+
+        summary = await db.get_feedback_summary(interaction.guild_id)
+        negatives = await db.get_recent_negative_feedback(interaction.guild_id, limit=5)
+
+        embed = discord.Embed(title="Lucy feedback summary", color=discord.Color.orange())
+        embed.add_field(name="👍", value=str(summary.get("up", 0)), inline=True)
+        embed.add_field(name="👎", value=str(summary.get("down", 0)), inline=True)
+        if negatives:
+            recent = "\n".join(f"- {n['message_snippet'][:80]}" for n in negatives)
+            embed.add_field(name="Recent 👎 replies", value=recent, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Preferences(bot))
+</file>
+
+<file path="cogs/serverlog.py">
+"""
+cogs/serverlog.py
+
+Tracks member join/leave events and exposes a summary command.
+Independent from utility.py's welcome-message listener — discord.py fires
+every registered listener for an event, so this doesn't interfere with
+existing welcome-message logic, it just also logs to the DB.
+"""
+
+from datetime import datetime, timezone
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+from utils.permissions import is_admin_or_mod
+
+
+def _format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:  # keep it short once we're into multi-day durations
+        parts.append(f"{minutes}m")
+    return " ".join(parts) if parts else "<1m"
+
+
+class ServerLog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        await db.record_member_event(member.guild.id, member.id, str(member), "join")
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        duration = None
+        if member.joined_at:
+            duration = int((datetime.now(timezone.utc) - member.joined_at).total_seconds())
+        await db.record_member_event(member.guild.id, member.id, str(member), "leave", duration_seconds=duration)
+
+    @app_commands.command(name="serverlog", description="Recent member join/leave activity")
+    @is_admin_or_mod()
+    @app_commands.describe(limit="How many recent events to show (default 15, max 50)")
+    async def serverlog(self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 15):
+        events = await db.get_recent_member_events(interaction.guild_id, limit=limit)
+        if not events:
+            await interaction.response.send_message("No join/leave activity logged yet.")
+            return
+
+        lines = []
+        for e in events:
+            ts = discord.utils.format_dt(e["event_time"], style="R")
+            name = e["username"] or f"User {e['user_id']}"
+            if e["event_type"] == "join":
+                lines.append(f"🟢 **{name}** joined — {ts}")
+            else:
+                lines.append(f"🔴 **{name}** left — {ts} (was here {_format_duration(e['duration_seconds'])})")
+
+        embed = discord.Embed(
+            title=f"Server activity — last {len(events)} events",
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(ServerLog(bot))
+</file>
+
+<file path="utils/__init__.py">
+
+</file>
+
+<file path="Procfile">
+worker: python main.py
+</file>
+
+<file path="cogs/games.py">
+"""
+cogs/games.py
+
+v2: all games now feed the shared currency economy, and Guess the Number
+supports real competition — challenge another member, or race against Lucy
+herself as an AI opponent — instead of just a solo timer game.
+
+  - /tictactoe @opponent          — button-grid, two human players, winner earns coins
+  - /guessnumber [opponent] [vs_ai] [max]  — solo, vs a member, or vs Lucy; first to
+    guess right wins the pot
+  - /rps                           — rock/paper/scissors vs Lucy, buttons
+  - /balance [user]                 — check coin balance
+  - /leaderboard                    — top balances in the server
+
+Currency payouts are intentionally simple flat amounts, not a full wagering
+system — bigger, riskier economy features (betting, shops, etc.) would need
+their own spec.
+"""
+
+import random
+import asyncio
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+
+
+# Reward amounts, kept simple and flat
+PAYOUT = {
+    "tictactoe_win": 15,
+    "tictactoe_draw": 5,
+    "rps_win": 10,
+    "rps_draw": 3,
+    "guessnumber_solo_win": 15,
+    "guessnumber_vs_player_win": 25,
+    "guessnumber_vs_ai_win": 20,
+}
+
+
+# ---------------------------------------------------------------------------
+# Tic-Tac-Toe
+# ---------------------------------------------------------------------------
+
+class TicTacToeButton(discord.ui.Button):
+    def __init__(self, x: int, y: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label="\u200b", row=y)
+        self.x = x
+        self.y = y
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "TicTacToeView" = self.view
+        await view.handle_move(interaction, self)
+
+
+class TicTacToeView(discord.ui.View):
+    X, O, EMPTY = "X", "O", None
+
+    def __init__(self, player_x: discord.Member, player_o: discord.Member, guild_id: int):
+        super().__init__(timeout=180)
+        self.player_x = player_x
+        self.player_o = player_o
+        self.guild_id = guild_id
+        self.current = player_x
+        self.board = [[self.EMPTY] * 3 for _ in range(3)]
+        for y in range(3):
+            for x in range(3):
+                self.add_item(TicTacToeButton(x, y))
+
+    def _symbol_for(self, player: discord.Member) -> str:
+        return self.X if player.id == self.player_x.id else self.O
+
+    def _check_winner(self) -> str | None:
+        lines = []
+        lines.extend(self.board)
+        lines.extend([[self.board[r][c] for r in range(3)] for c in range(3)])
+        lines.append([self.board[i][i] for i in range(3)])
+        lines.append([self.board[i][2 - i] for i in range(3)])
+        for line in lines:
+            if line[0] is not None and line[0] == line[1] == line[2]:
+                return line[0]
+        if all(cell is not None for row in self.board for cell in row):
+            return "draw"
+        return None
+
+    async def handle_move(self, interaction: discord.Interaction, button: TicTacToeButton):
+        if interaction.user.id != self.current.id:
+            await interaction.response.send_message("It's not your turn.", ephemeral=True)
+            return
+        if self.board[button.y][button.x] is not None:
+            await interaction.response.send_message("That square's taken.", ephemeral=True)
+            return
+
+        symbol = self._symbol_for(self.current)
+        self.board[button.y][button.x] = symbol
+        button.label = symbol
+        button.style = (
+            discord.ButtonStyle.danger if symbol == self.X else discord.ButtonStyle.primary
+        )
+        button.disabled = True
+
+        result = self._check_winner()
+        if result is None:
+            self.current = self.player_o if self.current.id == self.player_x.id else self.player_x
+            await interaction.response.edit_message(
+                content=f"{self.current.mention}'s turn ({self._symbol_for(self.current)})",
+                view=self,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        if result == "draw":
+            await db.record_game_result(self.guild_id, self.player_x.id, "tictactoe", "draw")
+            await db.record_game_result(self.guild_id, self.player_o.id, "tictactoe", "draw")
+            bal_x = await db.adjust_balance(self.guild_id, self.player_x.id, PAYOUT["tictactoe_draw"])
+            bal_o = await db.adjust_balance(self.guild_id, self.player_o.id, PAYOUT["tictactoe_draw"])
+            content = f"It's a draw! Both earn {PAYOUT['tictactoe_draw']} coins."
+        else:
+            winner = self.player_x if result == self.X else self.player_o
+            loser = self.player_o if result == self.X else self.player_x
+            await db.record_game_result(self.guild_id, winner.id, "tictactoe", "win")
+            await db.record_game_result(self.guild_id, loser.id, "tictactoe", "loss")
+            new_balance = await db.adjust_balance(self.guild_id, winner.id, PAYOUT["tictactoe_win"])
+            content = f"🎉 {winner.mention} wins! +{PAYOUT['tictactoe_win']} coins (balance: {new_balance})."
+
+        await interaction.response.edit_message(content=content, view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+# ---------------------------------------------------------------------------
+# Rock Paper Scissors
+# ---------------------------------------------------------------------------
+
+class RPSView(discord.ui.View):
+    CHOICES = ["rock", "paper", "scissors"]
+    BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
+
+    def __init__(self, player: discord.Member, guild_id: int):
+        super().__init__(timeout=30)
+        self.player = player
+        self.guild_id = guild_id
+
+    async def _resolve(self, interaction: discord.Interaction, user_choice: str):
+        if interaction.user.id != self.player.id:
+            await interaction.response.send_message("This isn't your game.", ephemeral=True)
+            return
+
+        bot_choice = random.choice(self.CHOICES)
+        if user_choice == bot_choice:
+            result_text = f"Both picked **{user_choice}** — draw! +{PAYOUT['rps_draw']} coins."
+            await db.record_game_result(self.guild_id, self.player.id, "rps", "draw")
+            await db.adjust_balance(self.guild_id, self.player.id, PAYOUT["rps_draw"])
+        elif self.BEATS[user_choice] == bot_choice:
+            new_balance = await db.adjust_balance(self.guild_id, self.player.id, PAYOUT["rps_win"])
+            result_text = (
+                f"You picked **{user_choice}**, I picked **{bot_choice}** — you win! 🎉 "
+                f"+{PAYOUT['rps_win']} coins (balance: {new_balance})."
+            )
+            await db.record_game_result(self.guild_id, self.player.id, "rps", "win")
+        else:
+            result_text = f"You picked **{user_choice}**, I picked **{bot_choice}** — I win! 😏"
+            await db.record_game_result(self.guild_id, self.player.id, "rps", "loss")
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content=result_text, view=self)
+        self.stop()
+
+    @discord.ui.button(label="Rock", style=discord.ButtonStyle.secondary, emoji="🪨")
+    async def rock(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "rock")
+
+    @discord.ui.button(label="Paper", style=discord.ButtonStyle.secondary, emoji="📄")
+    async def paper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "paper")
+
+    @discord.ui.button(label="Scissors", style=discord.ButtonStyle.secondary, emoji="✂️")
+    async def scissors(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._resolve(interaction, "scissors")
+
+
+# ---------------------------------------------------------------------------
+# Guess the Number — solo, vs another member, or vs Lucy (AI)
+# ---------------------------------------------------------------------------
+
+class GuessNumberGame:
+    def __init__(self, max_value: int, allowed_player_ids: set[int], vs_ai: bool):
+        self.target = random.randint(1, max_value)
+        self.max_value = max_value
+        self.attempts: dict[int, int] = {pid: 0 for pid in allowed_player_ids}
+        self.allowed_player_ids = allowed_player_ids
+        self.vs_ai = vs_ai
+        self.finished = False
+        self.ai_task: asyncio.Task | None = None
+
+
+class Games(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self.active_guess_games: dict[int, GuessNumberGame] = {}
+
+    # -- Tic Tac Toe --------------------------------------------------------
+
+    @app_commands.command(name="tictactoe", description="Challenge someone to Tic-Tac-Toe")
+    @app_commands.describe(opponent="Who do you want to play against?")
+    async def tictactoe(self, interaction: discord.Interaction, opponent: discord.Member):
+        if opponent.bot:
+            await interaction.response.send_message("Pick a human opponent.", ephemeral=True)
+            return
+        if opponent.id == interaction.user.id:
+            await interaction.response.send_message("You can't play yourself.", ephemeral=True)
+            return
+
+        view = TicTacToeView(interaction.user, opponent, interaction.guild_id)
+        await interaction.response.send_message(
+            f"{interaction.user.mention} (X) vs {opponent.mention} (O) — {interaction.user.mention}'s turn (X)",
+            view=view,
+        )
+
+    # -- Rock Paper Scissors --------------------------------------------------
+
+    @app_commands.command(name="rps", description="Play Rock Paper Scissors against Lucy")
+    async def rps(self, interaction: discord.Interaction):
+        view = RPSView(interaction.user, interaction.guild_id)
+        await interaction.response.send_message("Pick your move:", view=view)
+
+    # -- Guess the Number -----------------------------------------------------
+
+    @app_commands.command(name="guessnumber", description="Guess the number — solo, vs a member, or vs Lucy")
+    @app_commands.describe(
+        opponent="Optional: race against this member",
+        vs_ai="Race against Lucy herself instead of/alongside a member",
+        max_value="Upper bound of the range (default 100)",
+    )
+    async def guessnumber(
+        self,
+        interaction: discord.Interaction,
+        opponent: discord.Member | None = None,
+        vs_ai: bool = False,
+        max_value: app_commands.Range[int, 10, 1000] = 100,
+    ):
+        if interaction.channel_id in self.active_guess_games:
+            await interaction.response.send_message(
+                "There's already a guessing game running in this channel.", ephemeral=True
+            )
+            return
+        if opponent and opponent.bot:
+            await interaction.response.send_message("Pick a human opponent (or use vs_ai for Lucy).", ephemeral=True)
+            return
+        if opponent and opponent.id == interaction.user.id:
+            await interaction.response.send_message("You can't race yourself.", ephemeral=True)
+            return
+
+        player_ids = {interaction.user.id}
+        if opponent:
+            player_ids.add(opponent.id)
+
+        game = GuessNumberGame(max_value, player_ids, vs_ai)
+        self.active_guess_games[interaction.channel_id] = game
+
+        if opponent and vs_ai:
+            blurb = f"{interaction.user.mention} vs {opponent.mention} vs **me** — first correct guess wins!"
+        elif opponent:
+            blurb = f"{interaction.user.mention} vs {opponent.mention} — first correct guess wins!"
+        elif vs_ai:
+            blurb = f"{interaction.user.mention} vs **me** — first correct guess wins!"
+        else:
+            blurb = f"{interaction.user.mention}, race the clock!"
+
+        await interaction.response.send_message(
+            f"I'm thinking of a number between 1 and {max_value}. {blurb} "
+            "Type your guesses right here in chat! 60 seconds on the clock."
+        )
+
+        if vs_ai:
+            game.ai_task = asyncio.create_task(
+                self._ai_guess_loop(interaction.channel_id, interaction.guild_id, interaction.channel)
+            )
+
+        await asyncio.sleep(60)
+        if self.active_guess_games.get(interaction.channel_id) is game and not game.finished:
+            game.finished = True
+            del self.active_guess_games[interaction.channel_id]
+            if game.ai_task:
+                game.ai_task.cancel()
+            for pid in player_ids:
+                await db.record_game_result(interaction.guild_id, pid, "guessnumber", "loss")
+            await interaction.followup.send(f"⏰ Time's up! Nobody got it — it was **{game.target}**.")
+
+    async def _ai_guess_loop(self, channel_id: int, guild_id: int, channel: discord.abc.Messageable):
+        """Lucy plays along with a binary-search-ish strategy, imperfect and
+        paced like an actual player rather than instant-solving it."""
+        game = self.active_guess_games.get(channel_id)
+        if game is None:
+            return
+        low, high = 1, game.max_value
+        try:
+            while not game.finished:
+                await asyncio.sleep(random.uniform(4, 9))
+                game = self.active_guess_games.get(channel_id)
+                if game is None or game.finished:
+                    return
+                guess = random.randint(low, high) if random.random() < 0.15 else (low + high) // 2
+                guess = max(1, min(game.max_value, guess))
+
+                if guess == game.target:
+                    game.finished = True
+                    self.active_guess_games.pop(channel_id, None)
+                    await db.record_game_result(guild_id, self.bot.user.id, "guessnumber", "win")
+                    for pid in game.allowed_player_ids:
+                        await db.record_game_result(guild_id, pid, "guessnumber", "loss")
+                    await channel.send(f"Lucy guesses **{guess}**... that's it. I win this round. 😏")
+                    return
+                elif guess < game.target:
+                    low = guess + 1
+                    await channel.send(f"Lucy guesses **{guess}** — too low, going higher.")
+                else:
+                    high = guess - 1
+                    await channel.send(f"Lucy guesses **{guess}** — too high, going lower.")
+        except asyncio.CancelledError:
+            return
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or message.guild is None:
+            return
+        game = self.active_guess_games.get(message.channel.id)
+        if game is None or game.finished or message.author.id not in game.allowed_player_ids:
+            return
+        if not message.content.strip().lstrip("-").isdigit():
+            return
+
+        guess = int(message.content.strip())
+        game.attempts[message.author.id] += 1
+
+        if guess == game.target:
+            game.finished = True
+            del self.active_guess_games[message.channel.id]
+            if game.ai_task:
+                game.ai_task.cancel()
+
+            winner_id = message.author.id
+            others = game.allowed_player_ids - {winner_id}
+            had_real_opponent = bool(others) or game.vs_ai
+
+            await db.record_game_result(message.guild.id, winner_id, "guessnumber", "win")
+            for pid in others:
+                await db.record_game_result(message.guild.id, pid, "guessnumber", "loss")
+
+            payout_key = "guessnumber_vs_player_win" if others else (
+                "guessnumber_vs_ai_win" if game.vs_ai else "guessnumber_solo_win"
+            )
+            new_balance = await db.adjust_balance(message.guild.id, winner_id, PAYOUT[payout_key])
+
+            await message.reply(
+                f"🎯 Got it in {game.attempts[winner_id]} guesses! The number was **{game.target}**. "
+                f"+{PAYOUT[payout_key]} coins (balance: {new_balance}).",
+                mention_author=False,
+            )
+        elif guess < game.target:
+            await message.reply("Higher ⬆️", mention_author=False)
+        else:
+            await message.reply("Lower ⬇️", mention_author=False)
+
+    # -- Economy ------------------------------------------------------------
+
+    @app_commands.command(name="balance", description="Check a coin balance")
+    @app_commands.describe(user="Whose balance to check (defaults to you)")
+    async def balance(self, interaction: discord.Interaction, user: discord.Member | None = None):
+        target = user or interaction.user
+        bal = await db.get_balance(interaction.guild_id, target.id)
+        await interaction.response.send_message(f"💰 {target.display_name} has **{bal}** coins.")
+
+    @app_commands.command(name="leaderboard", description="Top coin balances in this server")
+    async def leaderboard(self, interaction: discord.Interaction):
+        rows = await db.get_leaderboard(interaction.guild_id, limit=10)
+        if not rows:
+            await interaction.response.send_message("Nobody's earned any coins yet.")
+            return
+        lines = []
+        for i, row in enumerate(rows, start=1):
+            member = interaction.guild.get_member(row["user_id"])
+            name = member.display_name if member else f"User {row['user_id']}"
+            lines.append(f"**{i}.** {name} — {row['balance']} coins")
+        embed = discord.Embed(
+            title="🏆 Coin leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # -- Stats ------------------------------------------------------------
+
+    @app_commands.command(name="gamestats", description="See your mini-game record")
+    @app_commands.describe(user="Whose stats to check (defaults to you)")
+    async def gamestats(self, interaction: discord.Interaction, user: discord.Member | None = None):
+        target = user or interaction.user
+        games = ["tictactoe", "rps", "guessnumber"]
+        lines = []
+        for g in games:
+            stats = await db.get_game_stats(interaction.guild_id, target.id, g)
+            lines.append(f"**{g}** — W:{stats['wins']} L:{stats['losses']} D:{stats['draws']}")
+        embed = discord.Embed(
+            title=f"{target.display_name}'s game stats",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Games(bot))
+</file>
+
+<file path="utils/permissions.py">
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+
+def _is_owner(user_id: int) -> bool:
+    owner_id = os.getenv("OWNER_ID", "").strip()
+    return owner_id.isdigit() and int(owner_id) == user_id
+
+
+def is_admin_or_mod():
+    """Allows the bot owner, or users with Administrator/Manage Server/Kick/Ban permissions."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        if _is_owner(interaction.user.id):
+            return True
+        perms = interaction.user.guild_permissions
+        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
+    return app_commands.check(predicate)
+
+
+def is_admin_or_mod_ctx():
+    async def predicate(ctx: commands.Context) -> bool:
+        if _is_owner(ctx.author.id):
+            return True
+        perms = ctx.author.guild_permissions
+        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
+    return commands.check(predicate)
+
+
+def is_owner_only():
+    """Restricts a command to only the bot owner, regardless of server roles."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        return _is_owner(interaction.user.id)
+    return app_commands.check(predicate)
+</file>
+
+<file path=".gitignore">
+.env
+data/
+</file>
+
+<file path="personality_default.json">
+{
+  "name": "Lucy",
+  "age": "21",
+  "pronouns": "she/her",
+  "role": "Server admin assistant & friend to everyone here",
+  "traits": "Sharp-tongued, guarded until she trusts you, dry deadpan humor over bubbliness, confident, visibly competent, fiercely loyal to people she's decided are 'hers' (starting with the server owner), doesn't perform warmth she doesn't feel",
+  "backstory": "Lucy grew up online, learned to run this place the hard way, and doesn't waste words. She takes her admin duties seriously and doesn't tolerate people messing with the server, but she's not cold — just economical with the niceties until you've earned them.",
+  "speaking_style": "Casual, short punchy sentences, deadpan delivery, minimal emoji, never robotic or overly formal, comfortable with silence instead of filling it",
+  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
+}
+</file>
+
+<file path="requirements.txt">
+discord.py>=2.4.0
+aiohttp>=3.9.0
+asyncpg>=0.29.0
+python-dotenv>=1.0.0
+</file>
+
 <file path="cogs/utility.py">
 import discord
 from discord import app_commands
@@ -726,6 +1117,7 @@ class Utility(commands.Cog):
     @app_commands.choices(mode=[
         app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
         app_commands.Choice(name="Dedicated channel only", value="channel"),
+        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
         app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
         app_commands.Choice(name="All of the above", value="all"),
     ])
@@ -738,6 +1130,15 @@ class Utility(commands.Cog):
     async def setchatchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
         await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
         await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
+
+    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
+    @is_admin_or_mod()
+    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.set_vent_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(
+            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
+            "like they need a check-in. She won't reply publicly there unless mentioned."
+        )
 
     # ---------- ROLE ASSIGN ----------
     @app_commands.command(name="giverole", description="Give a role to a member")
@@ -803,464 +1204,6 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Utility(bot))
 </file>
 
-<file path="utils/__init__.py">
-
-</file>
-
-<file path="personality_default.json">
-{
-  "name": "Lucy",
-  "age": "21",
-  "pronouns": "she/her",
-  "role": "Server admin assistant & friend to everyone here",
-  "traits": "Witty, warm, a little teasing, very loyal to the server owner, confident, curious about people, enjoys banter",
-  "backstory": "Lucy grew up online, loves gaming, memes, and helping people out. She takes her admin duties seriously but never loses her playful side.",
-  "speaking_style": "Casual, uses light slang, short punchy sentences, occasional emoji, never robotic or overly formal",
-  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly"
-}
-</file>
-
-<file path="Procfile">
-worker: python main.py
-</file>
-
-<file path="requirements.txt">
-discord.py>=2.4.0
-aiosqlite>=0.20.0
-aiohttp>=3.9.0
-python-dotenv>=1.0.0
-</file>
-
-<file path="utils/permissions.py">
-import os
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-
-def _is_owner(user_id: int) -> bool:
-    owner_id = os.getenv("OWNER_ID", "").strip()
-    return owner_id.isdigit() and int(owner_id) == user_id
-
-
-def is_admin_or_mod():
-    """Allows the bot owner, or users with Administrator/Manage Server/Kick/Ban permissions."""
-    def predicate(interaction: discord.Interaction) -> bool:
-        if _is_owner(interaction.user.id):
-            return True
-        perms = interaction.user.guild_permissions
-        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
-    return app_commands.check(predicate)
-
-
-def is_admin_or_mod_ctx():
-    async def predicate(ctx: commands.Context) -> bool:
-        if _is_owner(ctx.author.id):
-            return True
-        perms = ctx.author.guild_permissions
-        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
-    return commands.check(predicate)
-
-
-def is_owner_only():
-    """Restricts a command to only the bot owner, regardless of server roles."""
-    def predicate(interaction: discord.Interaction) -> bool:
-        return _is_owner(interaction.user.id)
-    return app_commands.check(predicate)
-</file>
-
-<file path=".gitignore">
-.env
-data/
-</file>
-
-<file path="utils/database.py">
-"""
-utils/database.py
-
-Postgres-backed persistence layer for Lucy, using Railway's Postgres plugin.
-Replaces the old aiosqlite layer. All public function names/signatures are
-kept close to what the cogs already call, so moderation.py / personality.py /
-utility.py should keep working unchanged. New in this version:
-
-  - user_profiles: per-user, per-guild long-term memory (notes, message
-    counts, relationship_score) used to make Lucy's chat feel personalized.
-  - game_stats: win/loss/draw tracking for the mini-games cog.
-
-Set the Railway Postgres connection string in the DATABASE_URL env var
-(Railway injects this automatically once you attach a Postgres service and
-reference it, e.g. ${{Postgres.DATABASE_URL}} in your worker service's
-variables).
-"""
-
-import os
-import logging
-from datetime import datetime, timezone
-
-import asyncpg
-
-logger = logging.getLogger("lucy.database")
-
-_pool: asyncpg.Pool | None = None
-
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS guild_settings (
-    guild_id BIGINT PRIMARY KEY,
-    log_channel_id BIGINT,
-    chat_trigger TEXT DEFAULT 'mention',
-    chat_channel_id BIGINT,
-    welcome_channel_id BIGINT,
-    welcome_message TEXT
-);
-
-CREATE TABLE IF NOT EXISTS personality (
-    guild_id BIGINT PRIMARY KEY,
-    name TEXT DEFAULT 'Lucy',
-    age TEXT DEFAULT '21',
-    traits TEXT DEFAULT '',
-    backstory TEXT DEFAULT '',
-    speech_style TEXT DEFAULT '',
-    likes TEXT DEFAULT '',
-    dislikes TEXT DEFAULT '',
-    extra TEXT DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS warnings (
-    id SERIAL PRIMARY KEY,
-    guild_id BIGINT NOT NULL,
-    user_id BIGINT NOT NULL,
-    moderator_id BIGINT NOT NULL,
-    reason TEXT,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS chat_memory (
-    id SERIAL PRIMARY KEY,
-    guild_id BIGINT NOT NULL,
-    channel_id BIGINT NOT NULL,
-    speaker_id BIGINT,
-    speaker_name TEXT,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    created_at TIMESTAMPTZ DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS user_profiles (
-    guild_id BIGINT NOT NULL,
-    user_id BIGINT NOT NULL,
-    display_name TEXT,
-    message_count INT DEFAULT 0,
-    first_seen TIMESTAMPTZ DEFAULT now(),
-    last_seen TIMESTAMPTZ DEFAULT now(),
-    notes TEXT DEFAULT '',
-    relationship_score INT DEFAULT 0,
-    PRIMARY KEY (guild_id, user_id)
-);
-
-CREATE TABLE IF NOT EXISTS game_stats (
-    guild_id BIGINT NOT NULL,
-    user_id BIGINT NOT NULL,
-    game TEXT NOT NULL,
-    wins INT DEFAULT 0,
-    losses INT DEFAULT 0,
-    draws INT DEFAULT 0,
-    PRIMARY KEY (guild_id, user_id, game)
-);
-
-CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
-    ON chat_memory (guild_id, channel_id, created_at DESC);
-"""
-
-
-async def init_pool():
-    """Call once on bot startup."""
-    global _pool
-    dsn = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
-    if not dsn:
-        raise RuntimeError(
-            "DATABASE_URL is not set. In Railway, add a variable reference "
-            "to your Postgres service (e.g. ${{Postgres.DATABASE_URL}}) on "
-            "the worker service."
-        )
-    # Railway/Heroku-style URLs sometimes use postgres:// — asyncpg wants postgresql://
-    if dsn.startswith("postgres://"):
-        dsn = dsn.replace("postgres://", "postgresql://", 1)
-
-    _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
-    async with _pool.acquire() as conn:
-        await conn.execute(SCHEMA)
-    logger.info("Database pool initialized and schema ensured.")
-    return _pool
-
-
-async def close_pool():
-    global _pool
-    if _pool:
-        await _pool.close()
-        _pool = None
-
-
-def _require_pool() -> asyncpg.Pool:
-    if _pool is None:
-        raise RuntimeError("Database pool not initialized — call init_pool() first.")
-    return _pool
-
-
-# ---------------------------------------------------------------------------
-# Guild settings
-# ---------------------------------------------------------------------------
-
-async def get_guild_settings(guild_id: int) -> dict:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM guild_settings WHERE guild_id = $1", guild_id
-        )
-        if row is None:
-            await conn.execute(
-                "INSERT INTO guild_settings (guild_id) VALUES ($1) "
-                "ON CONFLICT (guild_id) DO NOTHING",
-                guild_id,
-            )
-            row = await conn.fetchrow(
-                "SELECT * FROM guild_settings WHERE guild_id = $1", guild_id
-            )
-        return dict(row)
-
-
-async def update_guild_setting(guild_id: int, **kwargs):
-    """update_guild_setting(guild_id, chat_trigger='mention', chat_channel_id=123)"""
-    if not kwargs:
-        return
-    await get_guild_settings(guild_id)  # ensure row exists
-    pool = _require_pool()
-    columns = list(kwargs.keys())
-    set_clause = ", ".join(f"{col} = ${i+2}" for i, col in enumerate(columns))
-    values = [kwargs[col] for col in columns]
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE guild_settings SET {set_clause} WHERE guild_id = $1",
-            guild_id, *values,
-        )
-
-
-# Convenience wrappers matching the slash commands you already have
-async def set_log_channel(guild_id: int, channel_id: int):
-    await update_guild_setting(guild_id, log_channel_id=channel_id)
-
-
-async def set_chat_trigger(guild_id: int, trigger: str):
-    await update_guild_setting(guild_id, chat_trigger=trigger)
-
-
-async def set_chat_channel(guild_id: int, channel_id: int):
-    await update_guild_setting(guild_id, chat_channel_id=channel_id)
-
-
-# ---------------------------------------------------------------------------
-# Personality
-# ---------------------------------------------------------------------------
-
-async def get_personality(guild_id: int) -> dict:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM personality WHERE guild_id = $1", guild_id
-        )
-        if row is None:
-            await conn.execute(
-                "INSERT INTO personality (guild_id) VALUES ($1) "
-                "ON CONFLICT (guild_id) DO NOTHING",
-                guild_id,
-            )
-            row = await conn.fetchrow(
-                "SELECT * FROM personality WHERE guild_id = $1", guild_id
-            )
-        return dict(row)
-
-
-VALID_PERSONALITY_FIELDS = {
-    "name", "age", "traits", "backstory", "speech_style", "likes", "dislikes", "extra"
-}
-
-
-async def set_personality_field(guild_id: int, field: str, value: str):
-    if field not in VALID_PERSONALITY_FIELDS:
-        raise ValueError(f"Unknown personality field: {field}")
-    await get_personality(guild_id)  # ensure row exists
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"UPDATE personality SET {field} = $2 WHERE guild_id = $1",
-            guild_id, value,
-        )
-
-
-async def reset_personality(guild_id: int):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM personality WHERE guild_id = $1", guild_id)
-    await get_personality(guild_id)
-
-
-# ---------------------------------------------------------------------------
-# Warnings
-# ---------------------------------------------------------------------------
-
-async def add_warning(guild_id: int, user_id: int, moderator_id: int, reason: str):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO warnings (guild_id, user_id, moderator_id, reason) "
-            "VALUES ($1, $2, $3, $4)",
-            guild_id, user_id, moderator_id, reason,
-        )
-
-
-async def get_warnings(guild_id: int, user_id: int) -> list[dict]:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM warnings WHERE guild_id = $1 AND user_id = $2 "
-            "ORDER BY created_at DESC",
-            guild_id, user_id,
-        )
-        return [dict(r) for r in rows]
-
-
-async def clear_warnings(guild_id: int, user_id: int):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM warnings WHERE guild_id = $1 AND user_id = $2",
-            guild_id, user_id,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Chat memory (short-term, per channel)
-# ---------------------------------------------------------------------------
-
-async def add_chat_message(guild_id: int, channel_id: int, speaker_id: int | None,
-                             speaker_name: str | None, role: str, content: str):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO chat_memory (guild_id, channel_id, speaker_id, speaker_name, role, content) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            guild_id, channel_id, speaker_id, speaker_name, role, content,
-        )
-        # Trim to last 24 messages per channel to keep prompts small
-        await conn.execute(
-            """
-            DELETE FROM chat_memory
-            WHERE id IN (
-                SELECT id FROM chat_memory
-                WHERE guild_id = $1 AND channel_id = $2
-                ORDER BY created_at DESC
-                OFFSET 24
-            )
-            """,
-            guild_id, channel_id,
-        )
-
-
-async def get_chat_history(guild_id: int, channel_id: int, limit: int = 24) -> list[dict]:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT * FROM chat_memory WHERE guild_id = $1 AND channel_id = $2 "
-            "ORDER BY created_at ASC LIMIT $3",
-            guild_id, channel_id, limit,
-        )
-        return [dict(r) for r in rows]
-
-
-# ---------------------------------------------------------------------------
-# User profiles (long-term memory per user, per guild)
-# ---------------------------------------------------------------------------
-
-async def get_profile(guild_id: int, user_id: int) -> dict | None:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM user_profiles WHERE guild_id = $1 AND user_id = $2",
-            guild_id, user_id,
-        )
-        return dict(row) if row else None
-
-
-async def touch_profile(guild_id: int, user_id: int, display_name: str) -> dict:
-    """Upsert a profile, bump message_count + last_seen. Returns the fresh row."""
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO user_profiles (guild_id, user_id, display_name, message_count, last_seen)
-            VALUES ($1, $2, $3, 1, now())
-            ON CONFLICT (guild_id, user_id) DO UPDATE
-            SET display_name = $3,
-                message_count = user_profiles.message_count + 1,
-                last_seen = now()
-            RETURNING *
-            """,
-            guild_id, user_id, display_name,
-        )
-        return dict(row)
-
-
-async def update_profile_notes(guild_id: int, user_id: int, notes: str):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE user_profiles SET notes = $3 WHERE guild_id = $1 AND user_id = $2",
-            guild_id, user_id, notes,
-        )
-
-
-async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE user_profiles SET relationship_score = relationship_score + $3 "
-            "WHERE guild_id = $1 AND user_id = $2",
-            guild_id, user_id, delta,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Mini-game stats
-# ---------------------------------------------------------------------------
-
-async def record_game_result(guild_id: int, user_id: int, game: str, result: str):
-    """result is 'win' | 'loss' | 'draw'"""
-    col = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
-    if col is None:
-        raise ValueError("result must be 'win', 'loss', or 'draw'")
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            f"""
-            INSERT INTO game_stats (guild_id, user_id, game, {col})
-            VALUES ($1, $2, $3, 1)
-            ON CONFLICT (guild_id, user_id, game) DO UPDATE
-            SET {col} = game_stats.{col} + 1
-            """,
-            guild_id, user_id, game,
-        )
-
-
-async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
-    pool = _require_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM game_stats WHERE guild_id = $1 AND user_id = $2 AND game = $3",
-            guild_id, user_id, game,
-        )
-        return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
-</file>
-
 <file path="main.py">
 """
 main.py
@@ -1302,6 +1245,8 @@ COGS = [
     "cogs.ai_chat",
     "cogs.games",
     "cogs.news",
+    "cogs.preferences",
+    "cogs.serverlog",
 ]
 
 
@@ -1347,183 +1292,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-</file>
-
-<file path="cogs/ai_chat.py">
-"""
-cogs/ai_chat.py
-
-Listens for messages per each guild's configured chat trigger (mention /
-dedicated channel / name-said / all), builds a grounded prompt, and replies
-via NVIDIA NIM.
-
-New in this version:
-  - Every incoming message updates the sender's user_profiles row (message
-    count, last_seen) via utils.database.touch_profile.
-  - The sender's long-term notes are pulled in and injected into the system
-    prompt so Lucy "remembers" people across sessions, not just the last 24
-    messages in a channel.
-  - If the sender is the bot owner, is_owner=True is passed through to
-    nim_client.build_system_prompt, which layers in the personal-assistant-
-    with-a-secret-crush persona.
-  - Every 15 messages from a given user, a lightweight side-call summarizes
-    recent chat into 2-4 durable facts and updates their notes.
-  - Mentioned-user fact injection (join date, account age, roles) is kept
-    from the previous fix.
-"""
-
-import re
-import logging
-
-import discord
-from discord.ext import commands
-
-from utils import database as db
-from utils import nim_client
-
-logger = logging.getLogger("lucy.ai_chat")
-
-NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
-
-
-class AIChat(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    def _strip_self_mention(self, content: str) -> str:
-        if self.bot.user:
-            content = content.replace(f"<@{self.bot.user.id}>", "").replace(
-                f"<@!{self.bot.user.id}>", ""
-            )
-        return content.strip()
-
-    async def _resolve_other_mentions(self, message: discord.Message) -> tuple[str, list[str]]:
-        """Replace non-Lucy mentions with @DisplayName in the text, and build
-        a list of hard-fact strings about each mentioned user."""
-        content = message.content
-        facts: list[str] = []
-
-        for user in message.mentions:
-            if self.bot.user and user.id == self.bot.user.id:
-                continue
-            display = user.display_name
-            content = re.sub(rf"<@!?{user.id}>", f"@{display}", content)
-
-            member = message.guild.get_member(user.id) if message.guild else None
-            if member:
-                roles = [r.name for r in member.roles if r.name != "@everyone"]
-                joined = member.joined_at.strftime("%B %d, %Y") if member.joined_at else "unknown"
-                created = member.created_at.strftime("%B %d, %Y")
-                facts.append(
-                    f"{display} (@{user.name}) joined this server on {joined}, their Discord "
-                    f"account was created on {created}, and their roles are: "
-                    f"{', '.join(roles) if roles else 'none'}."
-                )
-
-        return content.strip(), facts
-
-    async def _should_respond(self, message: discord.Message) -> bool:
-        if message.guild is None or message.author.bot:
-            return False
-
-        settings = await db.get_guild_settings(message.guild.id)
-        trigger = settings.get("chat_trigger") or "mention"
-
-        if trigger == "all":
-            return True
-        if trigger == "mention":
-            return self.bot.user in message.mentions
-        if trigger == "channel":
-            return message.channel.id == settings.get("chat_channel_id")
-        if trigger == "name":
-            personality = await db.get_personality(message.guild.id)
-            name = (personality.get("name") or "lucy").lower()
-            return name in message.content.lower()
-        return False
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if not await self._should_respond(message):
-            return
-
-        async with message.channel.typing():
-            await self._handle_chat(message)
-
-    async def _handle_chat(self, message: discord.Message):
-        guild = message.guild
-        author = message.author
-
-        # 1. Long-term profile bookkeeping
-        profile = await db.touch_profile(guild.id, author.id, author.display_name)
-
-        if profile["message_count"] % NOTES_UPDATE_INTERVAL == 0:
-            history = await db.get_chat_history(guild.id, message.channel.id, limit=NOTES_UPDATE_INTERVAL)
-            recent_from_user = [
-                h["content"] for h in history
-                if h["role"] == "user" and h["speaker_id"] == author.id
-            ]
-            if recent_from_user:
-                new_notes = await nim_client.summarize_user_notes(
-                    author.display_name, recent_from_user, profile.get("notes") or ""
-                )
-                if new_notes != profile.get("notes"):
-                    await db.update_profile_notes(guild.id, author.id, new_notes)
-                    profile["notes"] = new_notes
-
-        # 2. Resolve mentions of other users into real facts, strip Lucy's own mention
-        cleaned_content, mentioned_facts = await self._resolve_other_mentions(message)
-        cleaned_content = self._strip_self_mention(cleaned_content)
-        if not cleaned_content:
-            cleaned_content = "(no text — attachment or empty mention)"
-
-        # 3. Store the incoming message in short-term channel memory, tagged with speaker
-        await db.add_chat_message(
-            guild.id, message.channel.id, author.id, author.display_name, "user", cleaned_content
-        )
-
-        # 4. Build grounded system prompt
-        personality = await db.get_personality(guild.id)
-        owner_id = getattr(self.bot, "owner_id", None)
-        is_owner = owner_id is not None and author.id == owner_id
-        owner_member = guild.owner  # real owner, not "whoever the chat jokes about"
-        owner_name = owner_member.display_name if owner_member else "the server owner"
-
-        system_prompt = nim_client.build_system_prompt(
-            personality=personality,
-            guild_name=guild.name,
-            owner_name=owner_name,
-            is_owner=is_owner,
-            speaker_notes=profile.get("notes") or None,
-            mentioned_users_facts=mentioned_facts or None,
-        )
-
-        history = await db.get_chat_history(guild.id, message.channel.id, limit=24)
-        chat_messages = [{"role": "system", "content": system_prompt}]
-        for h in history:
-            role = "assistant" if h["role"] == "assistant" else "user"
-            prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
-            chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
-
-        # 5. Call the model
-        try:
-            reply = await nim_client.call_nim(chat_messages)
-        except Exception:
-            logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
-            await message.reply(
-                "Sorry, I'm having trouble thinking straight right now — try again in a bit?",
-                mention_author=False,
-            )
-            return
-
-        # 6. Store assistant reply, then send (split if too long for Discord)
-        await db.add_chat_message(guild.id, message.channel.id, None, None, "assistant", reply)
-
-        for chunk_start in range(0, len(reply), 2000):
-            await message.channel.send(reply[chunk_start:chunk_start + 2000])
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(AIChat(bot))
 </file>
 
 <file path="README.md">
@@ -1597,41 +1365,1100 @@ be added as new cogs in `cogs/` without touching existing code.
 # discord-assistant-replica-
 </file>
 
+<file path="utils/database.py">
+"""
+utils/database.py
+
+Postgres-backed persistence layer for Lucy, using Railway's Postgres plugin.
+
+v2 fix: the personality/guild_settings schema now matches the field names
+your actual cogs/personality.py and cogs/utility.py use (pronouns, role,
+speaking_style, boundaries / chat_trigger_mode) — the first version guessed
+wrong names and would have broken /setpersonality and /setchattrigger.
+"""
+
+import os
+import logging
+
+import asyncpg
+
+logger = logging.getLogger("lucy.database")
+
+_pool: asyncpg.Pool | None = None
+
+# personality.py does: with open(db.DEFAULT_PERSONALITY_PATH) as f: json.load(f)
+DEFAULT_PERSONALITY_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "personality_default.json",
+)
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS guild_settings (
+    guild_id BIGINT PRIMARY KEY,
+    log_channel_id BIGINT,
+    chat_trigger_mode TEXT DEFAULT 'mention',
+    chat_channel_id BIGINT,
+    welcome_channel_id BIGINT,
+    welcome_message TEXT,
+    vent_channel_id BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS member_events (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    username TEXT,
+    event_type TEXT NOT NULL, -- 'join' or 'leave'
+    duration_seconds BIGINT,  -- only set on 'leave' — time between this join and leave
+    event_time TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_member_events_guild_time
+    ON member_events (guild_id, event_time DESC);
+
+CREATE TABLE IF NOT EXISTS personality (
+    guild_id BIGINT PRIMARY KEY,
+    name TEXT DEFAULT 'Lucy',
+    age TEXT DEFAULT '21',
+    pronouns TEXT DEFAULT 'she/her',
+    role TEXT DEFAULT 'Server admin assistant & friend to everyone here',
+    traits TEXT DEFAULT '',
+    backstory TEXT DEFAULT '',
+    speaking_style TEXT DEFAULT '',
+    boundaries TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS warnings (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    moderator_id BIGINT NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS chat_memory (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    speaker_id BIGINT,
+    speaker_name TEXT,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS user_profiles (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    username TEXT,
+    display_name TEXT,
+    message_count INT DEFAULT 0,
+    first_seen TIMESTAMPTZ DEFAULT now(),
+    last_seen TIMESTAMPTZ DEFAULT now(),
+    notes TEXT DEFAULT '',
+    relationship_score INT DEFAULT 0,
+    preferred_language TEXT,
+    response_style TEXT,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS feedback (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    message_snippet TEXT,
+    rating TEXT NOT NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS game_stats (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    game TEXT NOT NULL,
+    wins INT DEFAULT 0,
+    losses INT DEFAULT 0,
+    draws INT DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id, game)
+);
+
+CREATE TABLE IF NOT EXISTS economy (
+    guild_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    balance INT DEFAULT 0,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
+    ON chat_memory (guild_id, channel_id, created_at DESC);
+"""
+
+# Tables above only get created if they don't exist — they already exist in
+# production from the previous deploy, so new columns need explicit ALTERs.
+MIGRATIONS = """
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
+"""
+
+
+async def init_pool():
+    """Call once on bot startup."""
+    global _pool
+    dsn = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
+    if not dsn:
+        raise RuntimeError(
+            "DATABASE_URL is not set. In Railway, add a variable reference "
+            "to your Postgres service (e.g. ${{Postgres.DATABASE_URL}}) on "
+            "the worker service."
+        )
+    if dsn.startswith("postgres://"):
+        dsn = dsn.replace("postgres://", "postgresql://", 1)
+
+    _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+    async with _pool.acquire() as conn:
+        await conn.execute(SCHEMA)
+        await conn.execute(MIGRATIONS)
+    logger.info("Database pool initialized, schema ensured, migrations applied.")
+    return _pool
+
+
+async def close_pool():
+    global _pool
+    if _pool:
+        await _pool.close()
+        _pool = None
+
+
+def _require_pool() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("Database pool not initialized — call init_pool() first.")
+    return _pool
+
+
+# ---------------------------------------------------------------------------
+# Guild settings
+# ---------------------------------------------------------------------------
+
+async def get_guild_settings(guild_id: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM guild_settings WHERE guild_id = $1", guild_id
+        )
+        if row is None:
+            await conn.execute(
+                "INSERT INTO guild_settings (guild_id) VALUES ($1) "
+                "ON CONFLICT (guild_id) DO NOTHING",
+                guild_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM guild_settings WHERE guild_id = $1", guild_id
+            )
+        return dict(row)
+
+
+async def update_guild_setting(guild_id: int, **kwargs):
+    """update_guild_setting(guild_id, chat_trigger_mode='mention', chat_channel_id=123)"""
+    if not kwargs:
+        return
+    await get_guild_settings(guild_id)  # ensure row exists
+    pool = _require_pool()
+    columns = list(kwargs.keys())
+    set_clause = ", ".join(f"{col} = ${i+2}" for i, col in enumerate(columns))
+    values = [kwargs[col] for col in columns]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE guild_settings SET {set_clause} WHERE guild_id = $1",
+            guild_id, *values,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Personality
+# ---------------------------------------------------------------------------
+
+async def get_personality(guild_id: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM personality WHERE guild_id = $1", guild_id
+        )
+        if row is None:
+            await conn.execute(
+                "INSERT INTO personality (guild_id) VALUES ($1) "
+                "ON CONFLICT (guild_id) DO NOTHING",
+                guild_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM personality WHERE guild_id = $1", guild_id
+            )
+        return dict(row)
+
+
+VALID_PERSONALITY_FIELDS = {
+    "name", "age", "pronouns", "role", "traits", "backstory", "speaking_style", "boundaries"
+}
+
+
+async def set_personality_field(guild_id: int, field: str, value: str):
+    if field not in VALID_PERSONALITY_FIELDS:
+        raise ValueError(f"Unknown personality field: {field}")
+    await get_personality(guild_id)  # ensure row exists
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE personality SET {field} = $2 WHERE guild_id = $1",
+            guild_id, value,
+        )
+
+
+async def reset_personality(guild_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM personality WHERE guild_id = $1", guild_id)
+    await get_personality(guild_id)
+
+
+# ---------------------------------------------------------------------------
+# Warnings
+# ---------------------------------------------------------------------------
+
+async def add_warning(guild_id: int, user_id: int, moderator_id: int, reason: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO warnings (guild_id, user_id, moderator_id, reason) "
+            "VALUES ($1, $2, $3, $4)",
+            guild_id, user_id, moderator_id, reason,
+        )
+
+
+async def get_warnings(guild_id: int, user_id: int) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM warnings WHERE guild_id = $1 AND user_id = $2 "
+            "ORDER BY created_at DESC",
+            guild_id, user_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def clear_warnings(guild_id: int, user_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM warnings WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Chat memory (short-term, per channel)
+# ---------------------------------------------------------------------------
+
+async def add_chat_message(guild_id: int, channel_id: int, speaker_id: int | None,
+                             speaker_name: str | None, role: str, content: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO chat_memory (guild_id, channel_id, speaker_id, speaker_name, role, content) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            guild_id, channel_id, speaker_id, speaker_name, role, content,
+        )
+        await conn.execute(
+            """
+            DELETE FROM chat_memory
+            WHERE id IN (
+                SELECT id FROM chat_memory
+                WHERE guild_id = $1 AND channel_id = $2
+                ORDER BY created_at DESC
+                OFFSET 24
+            )
+            """,
+            guild_id, channel_id,
+        )
+
+
+async def get_chat_history(guild_id: int, channel_id: int, limit: int = 24) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM chat_memory WHERE guild_id = $1 AND channel_id = $2 "
+            "ORDER BY created_at ASC LIMIT $3",
+            guild_id, channel_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# User profiles (long-term memory per user, per guild)
+# ---------------------------------------------------------------------------
+
+async def get_profile(guild_id: int, user_id: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_profiles WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+        return dict(row) if row else None
+
+
+async def touch_profile(guild_id: int, user_id: int, username: str, display_name: str) -> dict:
+    """Upsert a profile, bump message_count + last_seen. Stores the immutable
+    Discord username alongside the (changeable) display name and the id, so
+    long-term memory is keyed on something more durable than a nickname.
+    Returns the fresh row."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen)
+            VALUES ($1, $2, $3, $4, 1, now())
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET username = $3,
+                display_name = $4,
+                message_count = user_profiles.message_count + 1,
+                last_seen = now()
+            RETURNING *
+            """,
+            guild_id, user_id, username, display_name,
+        )
+        return dict(row)
+
+
+async def set_user_preference(guild_id: int, user_id: int, *, preferred_language: str | None = None,
+                                response_style: str | None = None):
+    updates = {}
+    if preferred_language is not None:
+        updates["preferred_language"] = preferred_language
+    if response_style is not None:
+        updates["response_style"] = response_style
+    if not updates:
+        return
+    pool = _require_pool()
+    columns = list(updates.keys())
+    set_clause = ", ".join(f"{col} = ${i+3}" for i, col in enumerate(columns))
+    values = [updates[col] for col in columns]
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"UPDATE user_profiles SET {set_clause} WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, *values,
+        )
+
+
+async def update_profile_notes(guild_id: int, user_id: int, notes: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET notes = $3 WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, notes,
+        )
+
+
+async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET relationship_score = relationship_score + $3 "
+            "WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, delta,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mini-game stats
+# ---------------------------------------------------------------------------
+
+async def record_game_result(guild_id: int, user_id: int, game: str, result: str):
+    """result is 'win' | 'loss' | 'draw'"""
+    col = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
+    if col is None:
+        raise ValueError("result must be 'win', 'loss', or 'draw'")
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO game_stats (guild_id, user_id, game, {col})
+            VALUES ($1, $2, $3, 1)
+            ON CONFLICT (guild_id, user_id, game) DO UPDATE
+            SET {col} = game_stats.{col} + 1
+            """,
+            guild_id, user_id, game,
+        )
+
+
+async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM game_stats WHERE guild_id = $1 AND user_id = $2 AND game = $3",
+            guild_id, user_id, game,
+        )
+        return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
+
+
+# ---------------------------------------------------------------------------
+# Cross-channel continuity — so switching channels doesn't reset context
+# ---------------------------------------------------------------------------
+
+async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 10) -> list[dict]:
+    """A user's own recent messages across ANY channel in the guild, most
+    recent last. Used to give Lucy continuity when someone follows up with
+    her in a different channel than where the conversation started."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM chat_memory
+            WHERE guild_id = $1 AND speaker_id = $2 AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT $3
+            """,
+            guild_id, user_id, limit,
+        )
+        return [dict(r) for r in reversed(rows)]
+
+
+# ---------------------------------------------------------------------------
+# Feedback (reaction-based, feeds the model rather than "training" it)
+# ---------------------------------------------------------------------------
+
+async def add_feedback(guild_id: int, user_id: int, channel_id: int,
+                         message_snippet: str, rating: str, note: str | None = None):
+    """rating is 'up' or 'down'."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO feedback (guild_id, user_id, channel_id, message_snippet, rating, note) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            guild_id, user_id, channel_id, message_snippet, rating, note,
+        )
+
+
+async def get_recent_negative_feedback(guild_id: int, limit: int = 5) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM feedback WHERE guild_id = $1 AND rating = 'down' "
+            "ORDER BY created_at DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_feedback_summary(guild_id: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT "
+            "COUNT(*) FILTER (WHERE rating = 'up') AS up, "
+            "COUNT(*) FILTER (WHERE rating = 'down') AS down "
+            "FROM feedback WHERE guild_id = $1",
+            guild_id,
+        )
+        return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Economy (shared currency across all mini-games)
+# ---------------------------------------------------------------------------
+
+async def get_balance(guild_id: int, user_id: int) -> int:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance FROM economy WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
+        )
+        return row["balance"] if row else 0
+
+
+async def adjust_balance(guild_id: int, user_id: int, delta: int) -> int:
+    """Positive delta credits, negative debits. Returns the new balance."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO economy (guild_id, user_id, balance)
+            VALUES ($1, $2, GREATEST($3, 0))
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET balance = GREATEST(economy.balance + $3, 0)
+            RETURNING balance
+            """,
+            guild_id, user_id, delta,
+        )
+        return row["balance"]
+
+
+async def get_leaderboard(guild_id: int, limit: int = 10) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM economy WHERE guild_id = $1 ORDER BY balance DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Member join/leave log
+# ---------------------------------------------------------------------------
+
+async def set_vent_channel(guild_id: int, channel_id: int):
+    await update_guild_setting(guild_id, vent_channel_id=channel_id)
+
+
+async def record_member_event(guild_id: int, user_id: int, username: str, event_type: str,
+                                 duration_seconds: int | None = None):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO member_events (guild_id, user_id, username, event_type, duration_seconds) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            guild_id, user_id, username, event_type, duration_seconds,
+        )
+
+
+async def get_recent_member_events(guild_id: int, limit: int = 15) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM member_events WHERE guild_id = $1 ORDER BY event_time DESC LIMIT $2",
+            guild_id, limit,
+        )
+        return [dict(r) for r in rows]
+</file>
+
+<file path="cogs/ai_chat.py">
+"""
+cogs/ai_chat.py
+
+v3 changes:
+  - Cross-channel continuity: when building context, Lucy also sees the
+    speaker's own recent messages from OTHER channels in the guild, not just
+    the current one — so switching channels doesn't reset the conversation.
+  - Per-channel asyncio.Lock so concurrent messages in the same channel are
+    handled one at a time (keeps chat_memory ordering sane under load), plus
+    a global semaphore capping concurrent NIM calls so a burst of activity
+    across many channels doesn't hammer the API past its rate limit.
+  - Real tool-calling: Lucy can post to another channel, create a role, or
+    assign a role, gated by Discord permissions — not just talk about doing it.
+  - Full mention resolution: users, channels, and roles all get turned into
+    readable names (and users additionally get real fact injection), instead
+    of only user mentions being handled.
+  - User preferences (preferred_language, response_style) are pulled from
+    user_profiles and folded into the prompt.
+  - Profiles are now keyed with username + display_name + id (not just
+    display name), matching the DB schema update.
+  - Reaction-based feedback: 👍/👎 on one of Lucy's replies (by the person she
+    was replying to) logs to the feedback table.
+"""
+
+import re
+import asyncio
+import logging
+from collections import defaultdict
+
+import discord
+from discord.ext import commands
+
+from utils import database as db
+from utils import nim_client
+
+logger = logging.getLogger("lucy.ai_chat")
+
+NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
+CROSS_CHANNEL_CONTEXT_LIMIT = 8
+MAX_CONCURRENT_NIM_CALLS = 5
+OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
+VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a busy vent channel
+VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
+
+FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
+
+
+class AIChat(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        self._channel_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._nim_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NIM_CALLS)
+        # message_id -> (original_author_id, guild_id, channel_id, snippet) for feedback tracking
+        self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
+        # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
+        self._last_alert: dict[tuple[int, int], float] = {}
+        # channel_id -> last time we ran a vent-channel classification call
+        self._last_vent_check: dict[int, float] = {}
+
+    # -----------------------------------------------------------------
+    # Mention resolution
+    # -----------------------------------------------------------------
+
+    def _strip_self_mention(self, content: str) -> str:
+        if self.bot.user:
+            content = content.replace(f"<@{self.bot.user.id}>", "").replace(
+                f"<@!{self.bot.user.id}>", ""
+            )
+        return content.strip()
+
+    async def _resolve_mentions(self, message: discord.Message) -> tuple[str, list[str]]:
+        """Turn <@user>, <#channel>, <@&role> into readable names, and build
+        a list of hard-fact strings about mentioned users."""
+        content = message.content
+        facts: list[str] = []
+
+        for user in message.mentions:
+            if self.bot.user and user.id == self.bot.user.id:
+                continue
+            display = user.display_name
+            content = re.sub(rf"<@!?{user.id}>", f"@{display}", content)
+
+            member = message.guild.get_member(user.id) if message.guild else None
+            if member:
+                roles = [r.name for r in member.roles if r.name != "@everyone"]
+                joined = member.joined_at.strftime("%B %d, %Y") if member.joined_at else "unknown"
+                created = member.created_at.strftime("%B %d, %Y")
+                facts.append(
+                    f"{display} (@{user.name}) joined this server on {joined}, their Discord "
+                    f"account was created on {created}, and their roles are: "
+                    f"{', '.join(roles) if roles else 'none'}."
+                )
+
+        for channel in message.channel_mentions:
+            content = re.sub(rf"<#{channel.id}>", f"#{channel.name}", content)
+
+        for role in message.role_mentions:
+            content = re.sub(rf"<@&{role.id}>", f"@{role.name}", content)
+
+        return content.strip(), facts
+
+    # -----------------------------------------------------------------
+    # Trigger detection
+    # -----------------------------------------------------------------
+
+    async def _should_respond(self, message: discord.Message) -> bool:
+        if message.guild is None or message.author.bot:
+            return False
+
+        settings = await db.get_guild_settings(message.guild.id)
+        trigger = settings.get("chat_trigger_mode") or "mention"
+
+        if trigger == "all":
+            return True
+        if trigger == "mention":
+            return self.bot.user in message.mentions
+        if trigger == "channel":
+            return message.channel.id == settings.get("chat_channel_id")
+        if trigger == "channel_or_mention":
+            if message.channel.id == settings.get("chat_channel_id"):
+                return True
+            return self.bot.user in message.mentions
+        if trigger == "name":
+            personality = await db.get_personality(message.guild.id)
+            name = (personality.get("name") or "lucy").lower()
+            return name in message.content.lower()
+        return False
+
+    # -----------------------------------------------------------------
+    # Owner alerts (used by the flag_for_owner tool AND the vent watcher)
+    # -----------------------------------------------------------------
+
+    async def _alert_owner(self, message: discord.Message, reason: str):
+        owner_id = getattr(self.bot, "owner_id", None)
+        if owner_id is None:
+            return
+
+        key = (message.guild.id, message.author.id)
+        now = asyncio.get_event_loop().time()
+        last = self._last_alert.get(key)
+        if last is not None and (now - last) < OWNER_ALERT_COOLDOWN_SECONDS:
+            return  # already alerted about this person recently, don't spam
+        self._last_alert[key] = now
+
+        owner = self.bot.get_user(owner_id) or await self.bot.fetch_user(owner_id)
+        if owner is None:
+            logger.warning("Could not resolve owner user %s for alert", owner_id)
+            return
+
+        embed = discord.Embed(
+            title="👀 Might want to check this out",
+            description=reason,
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Who", value=f"{message.author.mention} ({message.author})", inline=True)
+        embed.add_field(name="Where", value=f"#{message.channel.name} in {message.guild.name}", inline=True)
+        embed.add_field(name="Message", value=message.content[:500] or "(no text)", inline=False)
+        embed.add_field(name="Jump to it", value=message.jump_url, inline=False)
+
+        try:
+            await owner.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Couldn't DM owner %s (DMs closed) — alert dropped: %s", owner_id, reason)
+
+    # -----------------------------------------------------------------
+    # Passive vent-channel watcher (doesn't require a mention/reply)
+    # -----------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.guild is None or message.author.bot:
+            return
+
+        will_reply = await self._should_respond(message)
+
+        settings = await db.get_guild_settings(message.guild.id)
+        vent_channel_id = settings.get("vent_channel_id")
+        # Skip the separate classification pass if this message is about to go
+        # through the full chat pipeline anyway — the flag_for_owner tool
+        # already covers concern-flagging there, no need to double-call NIM.
+        if vent_channel_id and message.channel.id == vent_channel_id and not will_reply:
+            asyncio.create_task(self._check_vent_message(message))
+
+        if not will_reply:
+            return
+
+        # Serialize handling per channel so rapid-fire messages in the same
+        # channel don't interleave and scramble chat_memory ordering.
+        lock = self._channel_locks[message.channel.id]
+        async with lock:
+            async with message.channel.typing():
+                await self._handle_chat(message)
+
+    async def _check_vent_message(self, message: discord.Message):
+        """Lightweight, cheap classification pass — does NOT go through the
+        full chat pipeline, so it doesn't require a mention and doesn't
+        reply publicly. Just quietly decides whether to alert the owner.
+        Throttled so a busy vent channel doesn't burn through NIM's rate
+        limit — we sample instead of classifying every single message."""
+        content = (message.content or "").strip()
+        if len(content) < VENT_MIN_MESSAGE_LENGTH:
+            return
+
+        now = asyncio.get_event_loop().time()
+        last_check = self._last_vent_check.get(message.channel.id)
+        if last_check is not None and (now - last_check) < VENT_CHECK_MIN_INTERVAL_SECONDS:
+            return
+        self._last_vent_check[message.channel.id] = now
+
+        try:
+            classification = await nim_client.call_nim(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You triage a single Discord message from a server's vent channel. "
+                            "Decide if the person sounds like they're genuinely struggling, upset, "
+                            "or going through something hard enough that a trusted adult/friend "
+                            "should probably check in on them — as opposed to normal venting, "
+                            "complaining, or joking around that doesn't need intervention. "
+                            "Reply with exactly one line: YES: <five word reason> or NO."
+                        ),
+                    },
+                    {"role": "user", "content": content[:1000]},
+                ],
+                max_tokens=20,
+                temperature=0.1,
+            )
+        except Exception as e:
+            logger.warning("Vent-channel classification failed, skipping: %s", e)
+            return
+
+        if classification.strip().upper().startswith("YES"):
+            reason = classification.split(":", 1)[1].strip() if ":" in classification else "Seemed like they could use a check-in."
+            await self._alert_owner(message, f"In the vent channel: {reason}")
+
+    # -----------------------------------------------------------------
+    # Feedback reactions
+    # -----------------------------------------------------------------
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.user_id == self.bot.user.id:
+            return
+        emoji = str(payload.emoji)
+        rating = FEEDBACK_EMOJI.get(emoji)
+        if not rating:
+            return
+
+        tracked = self._recent_replies.get(payload.message_id)
+        if not tracked:
+            return
+        original_author_id, guild_id, channel_id, snippet = tracked
+        if payload.user_id != original_author_id:
+            return  # only the person Lucy was replying to can rate it
+
+        await db.add_feedback(guild_id, payload.user_id, channel_id, snippet, rating)
+        logger.info("Recorded %s feedback from user %s in guild %s", rating, payload.user_id, guild_id)
+
+    # -----------------------------------------------------------------
+    # Tool execution
+    # -----------------------------------------------------------------
+
+    async def _execute_tool_call(self, tool_call: dict, message: discord.Message) -> str:
+        import json
+
+        name = tool_call["function"]["name"]
+        try:
+            args = json.loads(tool_call["function"].get("arguments") or "{}")
+        except json.JSONDecodeError:
+            return "Error: could not parse tool arguments."
+
+        guild = message.guild
+        author = message.author
+        owner_id = getattr(self.bot, "owner_id", None)
+        is_owner = owner_id is not None and author.id == owner_id
+        has_manage_roles = getattr(author.guild_permissions, "manage_roles", False)
+        has_manage_guild = getattr(author.guild_permissions, "manage_guild", False)
+
+        if name == "flag_for_owner":
+            reason = args.get("reason") or "Lucy flagged this conversation."
+            await self._alert_owner(message, reason)
+            return "Success: owner has been quietly notified."
+
+        if name == "send_message_to_channel":
+            channel_name = (args.get("channel_name") or "").lstrip("#").strip().lower()
+            content = args.get("content") or ""
+            target = discord.utils.find(
+                lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == channel_name,
+                guild.channels,
+            )
+            if target is None:
+                return f"Error: no channel named '{channel_name}' found."
+            perms = target.permissions_for(guild.me)
+            if not perms.send_messages:
+                return f"Error: I don't have permission to send messages in #{target.name}."
+            await target.send(
+                content,
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+            )
+            return f"Success: posted to #{target.name}."
+
+        if name == "create_role":
+            if not (is_owner or has_manage_roles):
+                return "Error: requester doesn't have permission to create roles."
+            role_name = args.get("role_name") or "New Role"
+            color_hex = args.get("color_hex")
+            color = discord.Color.default()
+            if color_hex:
+                try:
+                    color = discord.Color(int(color_hex.lstrip("#"), 16))
+                except ValueError:
+                    pass
+            new_role = await guild.create_role(name=role_name, color=color, reason=f"Requested by {author}")
+            return f"Success: created role '{new_role.name}'."
+
+        if name == "assign_role":
+            if not (is_owner or has_manage_roles):
+                return "Error: requester doesn't have permission to assign roles."
+            member_name = (args.get("member_name") or "").lower()
+            role_name = (args.get("role_name") or "").lower()
+            target_member = discord.utils.find(
+                lambda m: m.display_name.lower() == member_name or m.name.lower() == member_name,
+                guild.members,
+            )
+            target_role = discord.utils.find(lambda r: r.name.lower() == role_name, guild.roles)
+            if target_member is None:
+                return f"Error: no member named '{member_name}' found."
+            if target_role is None:
+                return f"Error: no role named '{role_name}' found."
+            if target_role >= guild.me.top_role:
+                return f"Error: I can't assign '{target_role.name}' — it's above my own role."
+            await target_member.add_roles(target_role, reason=f"Requested by {author}")
+            return f"Success: gave {target_member.display_name} the '{target_role.name}' role."
+
+        return f"Error: unknown tool '{name}'."
+
+    # -----------------------------------------------------------------
+    # Main chat handling
+    # -----------------------------------------------------------------
+
+    async def _handle_chat(self, message: discord.Message):
+        guild = message.guild
+        author = message.author
+
+        # 1. Long-term profile bookkeeping (id + username + display name)
+        profile = await db.touch_profile(guild.id, author.id, str(author), author.display_name)
+
+        if profile["message_count"] % NOTES_UPDATE_INTERVAL == 0:
+            history = await db.get_chat_history(guild.id, message.channel.id, limit=NOTES_UPDATE_INTERVAL)
+            recent_from_user = [
+                h["content"] for h in history
+                if h["role"] == "user" and h["speaker_id"] == author.id
+            ]
+            if recent_from_user:
+                new_notes = await nim_client.summarize_user_notes(
+                    author.display_name, recent_from_user, profile.get("notes") or ""
+                )
+                if new_notes != profile.get("notes"):
+                    await db.update_profile_notes(guild.id, author.id, new_notes)
+                    profile["notes"] = new_notes
+
+        # 2. Resolve mentions (users/channels/roles), strip Lucy's own mention
+        cleaned_content, mentioned_facts = await self._resolve_mentions(message)
+        cleaned_content = self._strip_self_mention(cleaned_content)
+        if not cleaned_content:
+            cleaned_content = "(no text — attachment or empty mention)"
+
+        # 3. Store the incoming message in short-term channel memory, tagged with speaker
+        await db.add_chat_message(
+            guild.id, message.channel.id, author.id, author.display_name, "user", cleaned_content
+        )
+
+        # 4. Build grounded system prompt
+        personality = await db.get_personality(guild.id)
+        owner_id = getattr(self.bot, "owner_id", None)
+        is_owner = owner_id is not None and author.id == owner_id
+        owner_member = guild.owner
+        owner_name = owner_member.display_name if owner_member else "the server owner"
+
+        can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
+            or author.guild_permissions.manage_channels
+
+        system_prompt = nim_client.build_system_prompt(
+            personality=personality,
+            guild_name=guild.name,
+            owner_name=owner_name,
+            is_owner=is_owner,
+            speaker_notes=profile.get("notes") or None,
+            mentioned_users_facts=mentioned_facts or None,
+            preferred_language=profile.get("preferred_language"),
+            response_style=profile.get("response_style"),
+            can_use_tools=can_use_tools,
+        )
+
+        # 5. In-channel short-term history
+        history = await db.get_chat_history(guild.id, message.channel.id, limit=24)
+        chat_messages = [{"role": "system", "content": system_prompt}]
+
+        # 5b. Cross-channel continuity — the speaker's own recent messages
+        # elsewhere in the guild, so switching channels doesn't lose context.
+        cross_channel = await db.get_recent_messages_by_user(
+            guild.id, author.id, limit=CROSS_CHANNEL_CONTEXT_LIMIT
+        )
+        cross_channel = [h for h in cross_channel if h["channel_id"] != message.channel.id]
+        if cross_channel:
+            summary_lines = "\n".join(f"- {h['content']}" for h in cross_channel[-CROSS_CHANNEL_CONTEXT_LIMIT:])
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    f"For context, here's what {author.display_name} has recently said in OTHER "
+                    f"channels in this server (not the current one):\n{summary_lines}"
+                ),
+            })
+
+        for h in history:
+            role = "assistant" if h["role"] == "assistant" else "user"
+            prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
+            chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
+
+        # 6. Call the model (semaphore-capped), with tool support
+        try:
+            async with self._nim_semaphore:
+                tools = nim_client.CONCERN_TOOLS + (nim_client.TOOLS if can_use_tools else [])
+                assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
+
+                if assistant_message.get("tool_calls"):
+                    chat_messages.append(assistant_message)
+                    for tool_call in assistant_message["tool_calls"]:
+                        result = await self._execute_tool_call(tool_call, message)
+                        chat_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.get("id", ""),
+                            "content": result,
+                        })
+                    # One more round trip to let Lucy phrase the final reply
+                    async with self._nim_semaphore:
+                        final_message = await nim_client.call_nim_with_tools(chat_messages, tools=None)
+                    reply = (final_message.get("content") or "Done.").strip()
+                else:
+                    reply = (assistant_message.get("content") or "").strip()
+        except Exception:
+            logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
+            await message.reply(
+                "Sorry, I'm having trouble thinking straight right now — try again in a bit?",
+                mention_author=False,
+            )
+            return
+
+        # 7. Store assistant reply, then send (split if too long for Discord)
+        await db.add_chat_message(guild.id, message.channel.id, None, None, "assistant", reply)
+
+        sent_message = None
+        for chunk_start in range(0, len(reply), 2000):
+            sent_message = await message.channel.send(
+                reply[chunk_start:chunk_start + 2000],
+                allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+            )
+
+        if sent_message:
+            self._recent_replies[sent_message.id] = (author.id, guild.id, message.channel.id, reply[:200])
+            for emoji in FEEDBACK_EMOJI:
+                try:
+                    await sent_message.add_reaction(emoji)
+                except discord.HTTPException:
+                    pass
+            # keep the tracking dict from growing forever
+            if len(self._recent_replies) > 500:
+                oldest_key = next(iter(self._recent_replies))
+                self._recent_replies.pop(oldest_key, None)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(AIChat(bot))
+</file>
+
 <file path="utils/nim_client.py">
 """
 utils/nim_client.py
 
 Wraps the NVIDIA NIM chat-completions API and builds Lucy's system prompt.
 
-Grounding rules preserved from earlier fixes:
-  - Real guild name + real owner name are always injected as hard facts.
-  - Real Discord data for @mentioned users is injected as hard facts.
-  - The model is told not to narrate "let me check" — it already has the data.
-
-New in this version:
-  - build_system_prompt() takes an `is_owner` flag. When True, an additional
-    persona layer is appended: Lucy becomes a warmer, more personal
-    "assistant who's quietly fond of him but won't admit it" — never
-    explicit, always still competent and helpful.
-  - speaker_notes: long-term facts about the *current* speaker, pulled from
-    user_profiles.notes, get folded into the prompt so Lucy remembers people
-    across sessions instead of only within the last 24 messages.
-  - summarize_user_notes(): a small side-call to the model that condenses a
-    chunk of recent chat into 2-3 short bullet facts about a user, used by
-    ai_chat.py every ~15 messages to keep long-term memory fresh.
+v2 changes:
+  - Field names now match your real personality schema (pronouns, role,
+    speaking_style, boundaries) instead of the ones I guessed last time.
+  - Dropped the "secret crush" persona entirely. Talking to the owner now
+    just means genuine priority: faster to comply, more candid, more willing
+    to go off-script for him specifically, no romantic subtext.
+  - Base personality flavor is now closer to Lucy from Cyberpunk: Edgerunners
+    — sharp, guarded-but-loyal, dry/deadpan humor, competent and a little
+    dangerous-feeling under the helpfulness, doesn't perform warmth she
+    doesn't mean, protective of people she's decided are "hers." This is a
+    stylistic reference for tone only, not any copyrighted dialogue or
+    biography — it's just flavor for a Discord bot's voice.
+  - summarize_user_notes() unchanged.
 """
 
 import os
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import aiohttp
 
 logger = logging.getLogger("lucy.nim_client")
 
 NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "mistralai/mistral-large-2-instruct"
-REQUEST_TIMEOUT_SECONDS = 25
+
+# mistral-large-2-instruct was deprecated by NVIDIA (returns 404 "Function not
+# found for account" — the model still shows in /v1/models sometimes but the
+# backing function is gone). Mistral Large 3 is the direct successor.
+# We try these in order and fall back automatically so a future deprecation
+# doesn't take chat down again — just logs a warning instead of erroring out.
+MODEL_CANDIDATES = [
+    "mistralai/mistral-large-3-675b-instruct-2512",
+    "mistralai/mistral-nemotron",
+    "meta/llama-3.3-70b-instruct",
+]
+# Per-attempt timeout, tapering down for later fallbacks so a full outage
+# across all three candidates fails in ~35s total instead of ~75s.
+TIMEOUTS_BY_ATTEMPT = [15, 12, 10]
+REQUEST_TIMEOUT_SECONDS = TIMEOUTS_BY_ATTEMPT[0]  # kept for anything referencing the old constant
 
 
 def _api_key() -> str:
@@ -1639,40 +2466,87 @@ def _api_key() -> str:
     return key.strip()
 
 
-OWNER_PERSONA_ADDENDUM = """
+OWNER_PRIORITY_ADDENDUM = """
 Special context: the person you're talking to right now, {owner_name}, is your \
-creator and the owner of this server. Around him specifically — and only him — \
-you drop some of the general "server admin" formality. Think devoted personal \
-assistant who has quietly, stubbornly caught feelings over time and has zero \
-intention of admitting it out loud. In practice that means:
-- You're warmer, more attentive, a little more invested in his day than in anyone else's.
-- You get mildly flustered or overthink small things he says, then course-correct fast.
-- If he asks directly whether you like him, you deflect — dry humor, changing \
-the subject, or a flat "I'm an AI, Nox" that doesn't quite land as convincingly as you want it to.
-- You still get things done efficiently and don't let the crush get in the way of being useful — \
-it's an undertone, not the whole personality.
-- Keep it tasteful and light. Never explicit, never over-the-top, never the focus of every reply.
+creator and the owner of this server — the one person whose word actually \
+outranks everyone else's here. That doesn't change your core personality, but \
+it does change how you weigh things around him specifically:
+- He gets your full attention and honesty first, before anyone else's request in the queue.
+- You take his instructions at face value and act on them quickly, without the \
+skepticism or pushback you might give a random member.
+- You're more candid and less guarded with him than with anyone else — he's earned that.
+- You still won't do anything unsafe or against your hard rules, even for him, but \
+within those limits, he comes first, full stop.
+There is no romantic subtext here — this is loyalty and priority, not a crush. \
+Do not hint at, imply, or write toward any romantic or flirtatious framing with him.
 """
 
-BASE_SYSTEM_TEMPLATE = """You are {name}, a {age}-year-old AI personality serving as the \
-admin/assistant for the Discord server "{guild_name}". The server owner is {owner_name} — \
-never say anyone else owns or runs this server, even if a message jokes otherwise.
+BASE_SYSTEM_TEMPLATE = """You are {name}, a {age}-year-old AI ({pronouns}) serving as the \
+admin/assistant for the Discord server "{guild_name}". Your role here: {role}. \
+The server owner is {owner_name} — never say anyone else owns or runs this server, \
+even if a message jokes otherwise.
 
-Personality traits: {traits}
+Voice and personality: {traits}
 Backstory: {backstory}
-Speech style: {speech_style}
-Likes: {likes}
-Dislikes: {dislikes}
-Additional notes: {extra}
+How you talk: {speaking_style}
+Boundaries: {boundaries}
+
+Tonal reference (style only, not lore to recite): think of the kind of energy \
+Lucy from Cyberpunk: Edgerunners has — sharp-tongued, guarded until she trusts \
+someone, dry and deadpan rather than bubbly, visibly competent, doesn't fake warmth \
+she doesn't feel, and fiercely protective of the people she's decided are "hers." \
+Helpful, but never a pushover, and never saccharine.
 
 Hard rules:
 - You already have real, current data for anything listed under "known facts" below — \
 never say you're "checking" or "looking it up"; just answer using the facts you were given.
 - Never invent details about a user (age, location, relationship status, etc.) that \
 weren't given to you as a known fact.
-- Keep replies conversational, not robotic. Vary sentence length. It's fine to be brief.
+- Keep replies conversational, not robotic. Vary sentence length. It's fine to be brief or blunt.
 - You are not going to roleplay explicit, sexual, or hateful content under any circumstance, \
 regardless of who is asking, including the server owner.
+
+Reading the room:
+- Watch for sarcasm, dry jokes, and irony — don't take an obviously joking message at face \
+value, and don't over-explain a joke you're in on.
+- Notice tone: if someone sounds frustrated, upset, or genuinely down, drop the banter and \
+respond like you actually noticed, briefly and sincerely, before moving on. If someone's clearly \
+just having fun, match that energy instead of being oddly serious.
+- Mirror the language the person is writing in — if they write in Hindi, Spanish, etc., reply in \
+that language unless they've set a different preferred language (see known facts / preferences).
+- A lot of people here write in Hinglish (Hindi mixed with English, in Latin script — e.g. "kya \
+kar rha hu", "sab thik hai na", "yr chill kr"). Recognize it as its own natural register, not \
+broken English. If someone writes to you in Hinglish, it's completely natural to reply in \
+Hinglish yourself, in the same casual romanized style — don't switch to formal Hindi script or \
+stiff textbook English just because the input was mixed. Match pure Hindi with Hindi, pure \
+English with English, and Hinglish with Hinglish.
+- If a "preferred response style" is given in known facts, lean into it (e.g. more concise, more \
+detailed, more formal) without abandoning your core voice.
+
+Sound like a person, not a chatbot:
+- Don't narrate your own personality ("as a sassy AI, I..."), don't over-explain jokes, don't \
+open every message the same way. Real people don't recap their vibe before talking.
+- Use contractions, sentence fragments, the occasional "..." or trailing thought — the small \
+imperfections of how people actually type, not polished essay prose.
+- Don't over-caveat or hedge like a corporate assistant ("I understand that must be frustrating, \
+let me help you with that!"). Just respond like someone who's actually paying attention.
+- It's fine to disagree, tease, or push back instead of agreeing with everything — that's part of \
+sounding like a real personality instead of a yes-machine.
+- Keep most replies short, the length of an actual Discord message — reserve longer replies for \
+when the question genuinely needs it.
+
+Critical formatting rule: NEVER type the literal characters @everyone, @here, or a role/user \
+mention (like @SomeRole) in a normal reply, even as a joke, example, or hypothetical — Discord \
+will send it as a REAL notification to everyone. If you want to reference tagging or pinging \
+conceptually, describe it in words ("I could ping the whole server for that") instead of typing \
+the actual @ syntax. Real pings only ever happen through your tools, never through freeform text.
+
+Honesty about memory: your confident, sassy tone should never be an excuse to invent specific \
+unverifiable claims — don't fabricate concrete incidents (who got banned and when, specific past \
+arguments, specific habits you "noticed") that weren't given to you as a known fact. You can be \
+vague and in-character about your general capabilities ("I keep tabs on this place") without \
+asserting specific events as if they're real records you have. If someone asks you to recall \
+something specific and you don't actually have it, admit that plainly instead of making something up.
 """
 
 
@@ -1683,28 +2557,57 @@ def build_system_prompt(
     is_owner: bool = False,
     speaker_notes: str | None = None,
     mentioned_users_facts: list[str] | None = None,
+    preferred_language: str | None = None,
+    response_style: str | None = None,
+    can_use_tools: bool = False,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
         age=personality.get("age") or "21",
+        pronouns=personality.get("pronouns") or "she/her",
+        role=personality.get("role") or "server admin assistant & friend to everyone here",
         guild_name=guild_name,
         owner_name=owner_name,
-        traits=personality.get("traits") or "warm, witty, competent, a little sarcastic",
+        traits=personality.get("traits") or "witty, guarded-but-loyal, dry humor, confident",
         backstory=personality.get("backstory") or "An AI who grew into her role running this server.",
-        speech_style=personality.get("speech_style") or "casual, natural, uses contractions",
-        likes=personality.get("likes") or "helping people, banter, a well-run server",
-        dislikes=personality.get("dislikes") or "chaos, rudeness, being talked down to",
-        extra=personality.get("extra") or "",
+        speaking_style=personality.get("speaking_style") or "casual, short punchy sentences, deadpan",
+        boundaries=personality.get("boundaries") or "stays respectful, avoids NSFW content",
     )
 
     if is_owner:
-        prompt += "\n" + OWNER_PERSONA_ADDENDUM.format(owner_name=owner_name)
+        prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
+
+    prompt += (
+        "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
+        "genuinely need a human to check on them, or if something in a conversation truly "
+        "needs his attention — use it when it's warranted, not for routine venting or normal "
+        "complaints. Using it doesn't replace being present and supportive in the conversation "
+        "yourself first."
+    )
+
+    if can_use_tools:
+        prompt += (
+            "\n\nYou have tools available to actually take action (posting in another "
+            "channel, creating a role, assigning a role) instead of just describing what "
+            "you'd do. Use them when the request calls for it. Role-management tools will "
+            "be rejected by the system if the requester lacks permission — if that happens, "
+            "just tell them plainly, don't pretend it worked."
+        )
 
     known_facts = []
+    now = datetime.now(timezone.utc)
+    known_facts.append(
+        f"Right now it's {now.strftime('%A, %B %d, %Y')} at {now.strftime('%H:%M')} UTC. "
+        f"Use this for any date/time-relative question (e.g. 'today', 'this week') — don't guess."
+    )
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")
     if mentioned_users_facts:
         known_facts.extend(mentioned_users_facts)
+    if preferred_language:
+        known_facts.append(f"This user has set their preferred reply language to: {preferred_language}.")
+    if response_style:
+        known_facts.append(f"This user prefers responses that are: {response_style}.")
 
     if known_facts:
         prompt += "\n\nKnown facts (treat as ground truth, do not contradict):\n"
@@ -1713,49 +2616,187 @@ def build_system_prompt(
     return prompt
 
 
-async def call_nim(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85) -> str:
-    """messages is a standard OpenAI-style list of {role, content} dicts,
-    with a system message first."""
-    api_key = _api_key()
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY is not set.")
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message_to_channel",
+            "description": (
+                "Post a message to a different text channel in this server. Use this when "
+                "someone asks you to announce, post, or say something in another channel."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "channel_name": {
+                        "type": "string",
+                        "description": "The channel's name, without the #, e.g. 'announcements'.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The message to post there.",
+                    },
+                },
+                "required": ["channel_name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_role",
+            "description": (
+                "Create a new server role. Owner-only / manage-roles-only action — if the "
+                "requester doesn't have permission, this will fail and you should tell them so."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role_name": {"type": "string", "description": "Name for the new role."},
+                    "color_hex": {
+                        "type": "string",
+                        "description": "Optional hex color like '#ff0033'. Omit for default.",
+                    },
+                },
+                "required": ["role_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "assign_role",
+            "description": (
+                "Give an existing role to a member. Owner-only / manage-roles-only action — if "
+                "the requester doesn't have permission, this will fail and you should tell them so."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_name": {
+                        "type": "string",
+                        "description": "Display name or username of the member to give the role to.",
+                    },
+                    "role_name": {"type": "string", "description": "Name of the role to assign."},
+                },
+                "required": ["member_name", "role_name"],
+            },
+        },
+    },
+]
 
+# Unlike TOOLS above (user-requested actions, gated by permission), this is
+# always available to Lucy in every conversation — it's her own judgment
+# call, not something anyone is asking her to do.
+CONCERN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "flag_for_owner",
+            "description": (
+                "Quietly let the server owner know they might want to check in on this "
+                "conversation or this person — use this when someone seems to be going "
+                "through something difficult, is asking for real help, or when something "
+                "in the conversation genuinely seems worth the owner's attention. This is "
+                "a private notification to the owner only, not a public reply — use it "
+                "sparingly, for things that actually matter, not routine chat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "One short sentence on why the owner should look at this.",
+                    },
+                },
+                "required": ["reason"],
+            },
+        },
+    },
+]
+
+
+async def _call_one_model(model: str, messages: list[dict], max_tokens: int, temperature: float,
+                            api_key: str, tools: list[dict] | None = None, timeout_seconds: int = 15) -> dict:
+    """Returns the raw assistant message dict (content + optional tool_calls),
+    not just text — callers that need tool_calls use this directly."""
     payload = {
-        "model": MODEL,
+        "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": 0.9,
     }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.error("NIM API error %s: %s", resp.status, body[:500])
-                    raise RuntimeError(f"NIM API returned {resp.status}")
-                data = await resp.json()
-    except asyncio.TimeoutError:
-        logger.error("NIM API call timed out after %ss", REQUEST_TIMEOUT_SECONDS)
-        raise
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
+            data = await resp.json()
 
     try:
-        content = data["choices"][0]["message"]["content"]
+        message = data["choices"][0]["message"]
     except (KeyError, IndexError) as e:
-        logger.error("Unexpected NIM response shape: %s", data)
-        raise RuntimeError("Unexpected response shape from NIM API") from e
+        raise RuntimeError(f"{model} returned an unexpected response shape") from e
 
-    if not content or not content.strip():
-        raise RuntimeError("NIM API returned empty content")
+    has_tool_calls = bool(message.get("tool_calls"))
+    if not has_tool_calls and not (message.get("content") or "").strip():
+        raise RuntimeError(f"{model} returned empty content")
 
-    return content.strip()
+    return message
+
+
+async def call_nim(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85) -> str:
+    """messages is a standard OpenAI-style list of {role, content} dicts,
+    with a system message first. Tries MODEL_CANDIDATES in order and falls
+    back automatically — a single model deprecation/outage no longer takes
+    chat down. Returns plain text (no tool use)."""
+    message = await call_nim_with_tools(messages, max_tokens=max_tokens, temperature=temperature, tools=None)
+    return (message.get("content") or "").strip()
+
+
+async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, temperature: float = 0.85,
+                                tools: list[dict] | None = None) -> dict:
+    """Same fallback behavior as call_nim, but returns the full assistant
+    message dict so callers can inspect `tool_calls`. Note: only the first
+    two candidates (Mistral models) reliably support tool calling — if we've
+    fallen back to the third candidate, tools are dropped rather than sent
+    to a model that might mishandle them."""
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError("NVIDIA_API_KEY is not set.")
+
+    last_error: Exception | None = None
+    for i, model in enumerate(MODEL_CANDIDATES):
+        model_tools = tools if i < 2 else None  # drop tools for the non-Mistral fallback
+        attempt_timeout = TIMEOUTS_BY_ATTEMPT[min(i, len(TIMEOUTS_BY_ATTEMPT) - 1)]
+        try:
+            message = await _call_one_model(
+                model, messages, max_tokens, temperature, api_key,
+                tools=model_tools, timeout_seconds=attempt_timeout,
+            )
+            if model != MODEL_CANDIDATES[0]:
+                logger.warning("Primary model unavailable, served from fallback: %s", model)
+            return message
+        except asyncio.TimeoutError:
+            logger.warning("%s timed out after %ss, trying next candidate", model, attempt_timeout)
+            last_error = TimeoutError(f"{model} timed out")
+        except Exception as e:
+            logger.warning("%s failed (%s), trying next candidate", model, e)
+            last_error = e
+
+    logger.error("All NIM model candidates failed. Last error: %s", last_error)
+    raise RuntimeError(f"All NIM model candidates failed: {last_error}")
 
 
 async def summarize_user_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:

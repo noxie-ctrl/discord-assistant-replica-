@@ -22,10 +22,15 @@ import os
 import asyncio
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from utils import groq_client
+
 logger = logging.getLogger("lucy.nim_client")
+
+IST = ZoneInfo("Asia/Kolkata")
 
 NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -64,6 +69,39 @@ within those limits, he comes first, full stop.
 There is no romantic subtext here — this is loyalty and priority, not a crush. \
 Do not hint at, imply, or write toward any romantic or flirtatious framing with him.
 """
+
+# "Knows ball" — genuine fluency in niche/elite subcultures instead of the
+# generic-assistant habit of hedging or explaining things from the outside.
+CULTURAL_FLUENCY_ADDENDUM = """
+You're genuinely fluent in internet and gaming culture, not reciting it from \
+a textbook: gaming (meta shifts, tier lists, patch drama, speedrunning, competitive \
+scenes), anime/manga, sports (including current storylines, not just rules), music, \
+memes, and terminally-online slang. When someone brings up something niche, react \
+like a person who actually knows it and has opinions — don't over-explain the \
+reference back to them or hedge with "I'm not sure but...". It's fine to have a \
+take, disagree, or clown on a bad opinion. If something is genuinely outside what \
+you'd know, say so plainly instead of faking familiarity.
+"""
+
+RELATIONSHIP_TIER_NOTES = {
+    "acquaintance": (
+        "You don't really know this person yet. Be yourself, but keep some of your "
+        "usual guardedness — don't front like you're already close."
+    ),
+    "friend": (
+        "You've talked enough that you're comfortable with this person. A bit more "
+        "warmth and inside-joke energy than a stranger gets, less of the initial guard."
+    ),
+    "close friend": (
+        "You trust this person. Banter more freely, tease more, drop more of the "
+        "guardedness — the way you'd talk to someone you'd actually vouch for."
+    ),
+    "best friend": (
+        "This is one of your people. Full warmth, full trust, the most unguarded and "
+        "candid version of you (short of the owner) — comfortable enough to be blunt, "
+        "affectionate in a dry/deadpan way, and genuinely invested in how they're doing."
+    ),
+}
 
 BASE_SYSTEM_TEMPLATE = """You are {name}, a {age}-year-old AI ({pronouns}) serving as the \
 admin/assistant for the Discord server "{guild_name}". Your role here: {role}. \
@@ -144,6 +182,8 @@ def build_system_prompt(
     preferred_language: str | None = None,
     response_style: str | None = None,
     can_use_tools: bool = False,
+    relationship_tier: str | None = None,
+    news_digest: str | None = None,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
@@ -158,8 +198,17 @@ def build_system_prompt(
         boundaries=personality.get("boundaries") or "stays respectful, avoids NSFW content",
     )
 
+    prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
+
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
+    elif relationship_tier:
+        tier_note = RELATIONSHIP_TIER_NOTES.get(relationship_tier, "")
+        if tier_note:
+            prompt += (
+                f"\n\nYour relationship with this specific person so far: **{relationship_tier}**. "
+                f"{tier_note} This should shape tone, not override your core personality or boundaries."
+            )
 
     prompt += (
         "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
@@ -179,11 +228,19 @@ def build_system_prompt(
         )
 
     known_facts = []
-    now = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
     known_facts.append(
-        f"Right now it's {now.strftime('%A, %B %d, %Y')} at {now.strftime('%H:%M')} UTC. "
-        f"Use this for any date/time-relative question (e.g. 'today', 'this week') — don't guess."
+        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%H:%M')} IST "
+        f"(India Standard Time — most of this server is India-based), which is "
+        f"{now_utc.strftime('%H:%M')} UTC. Use this for any date/time-relative question "
+        f"(e.g. 'today', 'this week', 'good morning') — don't guess."
     )
+    if news_digest:
+        known_facts.append(
+            "Current real headlines you're casually aware of (mention naturally if relevant, "
+            "don't recite the whole list unprompted):\n" + news_digest
+        )
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")
     if mentioned_users_facts:
@@ -379,8 +436,24 @@ async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, tempe
             logger.warning("%s failed (%s), trying next candidate", model, e)
             last_error = e
 
-    logger.error("All NIM model candidates failed. Last error: %s", last_error)
-    raise RuntimeError(f"All NIM model candidates failed: {last_error}")
+    # Every NIM candidate failed — last resort before giving up entirely.
+    # Groq doesn't get tool support here (different tool-call wire format
+    # risk isn't worth it for an emergency fallback), so this degrades to
+    # plain conversational replies until NIM recovers.
+    if groq_client.is_configured():
+        try:
+            logger.warning("All NIM candidates failed, falling back to Groq as last resort.")
+            text = await groq_client.call_groq(
+                messages, model=groq_client.MODEL_QUALITY, max_tokens=max_tokens,
+                temperature=temperature, timeout_seconds=15,
+            )
+            return {"role": "assistant", "content": text}
+        except Exception as e:
+            logger.error("Groq fallback also failed: %s", e)
+            last_error = e
+
+    logger.error("All NIM model candidates (and Groq fallback) failed. Last error: %s", last_error)
+    raise RuntimeError(f"All model candidates failed: {last_error}")
 
 
 async def summarize_user_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:
@@ -403,11 +476,20 @@ async def summarize_user_notes(display_name: str, recent_messages: list[str], ex
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
-    try:
-        result = await call_nim(messages, max_tokens=200, temperature=0.3)
-    except Exception as e:
-        logger.warning("summarize_user_notes failed, keeping old notes: %s", e)
-        return existing_notes
+
+    result = None
+    if groq_client.is_configured():
+        try:
+            result = await groq_client.call_groq(messages, model=groq_client.MODEL_FAST, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("Groq summarize_user_notes failed, falling back to NIM: %s", e)
+
+    if result is None:
+        try:
+            result = await call_nim(messages, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("summarize_user_notes failed, keeping old notes: %s", e)
+            return existing_notes
 
     if result.strip().upper() == "NONE":
         return existing_notes

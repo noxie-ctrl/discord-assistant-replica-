@@ -1,13 +1,13 @@
 # Lucy — Your Discord AI Assistant
 
-A Python Discord bot with a customizable AI personality (powered by NVIDIA NIM, free tier),
-full moderation, and server utilities. Both slash (`/`) and prefix (`!`) commands supported.
+A Python Discord bot with a customizable AI personality (NVIDIA NIM as the main chat
+engine, Groq as a background/fallback engine), full moderation, server utilities, and
+mini-games. Both slash (`/`) and prefix (`!`) commands supported.
 
 ## 1. Create the Discord bot
 1. Go to https://discord.com/developers/applications → **New Application**.
 2. Go to the **Bot** tab → click **Reset Token** → copy it (this is `DISCORD_TOKEN`).
 3. Under **Privileged Gateway Intents**, enable:
-   - Presence Intent (optional)
    - Server Members Intent (required)
    - Message Content Intent (required)
 4. Go to **OAuth2 → URL Generator**:
@@ -15,17 +15,26 @@ full moderation, and server utilities. Both slash (`/`) and prefix (`!`) command
    - Bot permissions: `Administrator` (simplest for full-power admin bot)
    - Copy the generated URL and open it to invite Lucy to your server.
 
-## 2. Get an NVIDIA NIM API key (free)
-1. Go to https://build.nvidia.com → sign in → pick a chat model (e.g. `meta/llama-3.3-70b-instruct`).
-2. Click **Get API Key** → copy it (this is `NVIDIA_API_KEY`). NIM has a generous free tier.
+## 2. Get API keys (both free)
+- **NVIDIA NIM** (main chat engine): https://build.nvidia.com → sign in → **Get API Key**
+  → this is `NVIDIA_API_KEY`. Generous free tier; Lucy defaults to the strongest available
+  model (`mistralai/mistral-large-3-675b-instruct-2512`) with automatic fallback to two
+  other models if it's ever unavailable.
+- **Groq** (background tasks + emergency fallback): https://console.groq.com → **API Keys**
+  → create two keys, `GROQ_API_KEY_1` and `GROQ_API_KEY_2`. Groq is used for vent-channel
+  triage, long-term memory summarization, and the daily news digest — keeping that traffic
+  off the main NIM quota — and as a last-resort fallback for main chat if NIM is fully down.
+  Optional but recommended; Lucy works without it, just with less background-task headroom.
 
 ## 3. Configure environment
 Copy `.env.example` to `.env` and fill in:
 ```
 DISCORD_TOKEN=...
 NVIDIA_API_KEY=...
-NIM_MODEL=meta/llama-3.3-70b-instruct
-DEFAULT_PREFIX=!
+GROQ_API_KEY_1=...
+GROQ_API_KEY_2=...
+OWNER_ID=1462759265864519722
+DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
 ```
 
 ## 4. Run locally (optional test)
@@ -37,32 +46,42 @@ python main.py
 ## 5. Deploy free on Railway
 1. Push this folder to a GitHub repo.
 2. Go to https://railway.app → **New Project → Deploy from GitHub repo**.
-3. Add the environment variables from `.env` in Railway's **Variables** tab.
-4. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
-
-⚠️ **Note on SQLite + Railway free tier:** the filesystem resets on redeploy unless you attach a
-persistent Volume (Railway supports this in the free tier — mount it at `/app/data`). Without a
-volume, warnings/personality/chat memory reset each time you redeploy (bot still works fine day-to-day).
+3. Add a Postgres plugin, and reference its `DATABASE_URL` on the worker service.
+4. Add the rest of the environment variables from `.env` in Railway's **Variables** tab.
+5. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
 
 ## 6. Configure Lucy in your server
 Run these once, in Discord:
-- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries (one field at a time)
+- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
 - `/profile` — view Lucy's current profile
-- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / name-said / all)
+- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
 - `/setchatchannel` — pick her dedicated chat channel (if using that mode)
+- `/setventchannel` — a channel she quietly watches, flagging the owner if someone seems
+  like they need real human support (not a public reply — a private heads-up)
+- `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
 - `/setlogchannel` — where moderation actions get logged
 - `/setwelcome` — welcome channel + message for new members
 
 ## What's included
 - **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
 - **Utility:** welcome messages, role give/remove, ticket system, server/user info
-- **AI Chat:** Lucy responds in character using NVIDIA NIM, remembers last ~12 messages per channel
-- **Personality:** fully editable per-server via slash commands, no code editing needed
+- **AI Chat:** Lucy talks like an active member of the server, not a generic assistant —
+  she adapts tone (banter vs. sincerity vs. Hinglish), has real opinions on niche/gaming/anime/
+  internet-culture topics, knows the current date/time in IST, and stays casually aware of
+  real current headlines. She naturally warms up to people over time (acquaintance → friend →
+  close friend → best friend, based on how much you've talked and how well it's gone), while
+  the owner always gets top priority and candor.
+- **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
+  to need a real person to check in — separate from normal banter/venting.
+- **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number
+  (solo / vs a member / vs Lucy), and Trivia (solo or open free-for-all, multiple categories
+  including gaming/anime/sports/internet culture) — all feeding a shared coin economy with
+  `/balance`, `/leaderboard`, `/gamestats`.
+- **Personality:** fully editable per-server via slash commands, no code editing needed.
 
-## Adding more later
-This is a clean foundation — economy/games, leveling, reaction roles, and auto-mod filters can all
-be added as new cogs in `cogs/` without touching existing code.
-# discord-assistant-replica-
-# discord-assistant-replica-
-# discord-assistant-replica-
-# discord-assistant-replica-
+## Two-engine model
+- **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
+  → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
+- **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
+  the news digest and emergency main-chat fallback) round-robins across your two keys so a
+  single key's rate limit doesn't stall anything.

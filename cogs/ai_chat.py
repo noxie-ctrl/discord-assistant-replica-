@@ -28,10 +28,12 @@ import logging
 from collections import defaultdict
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from utils import database as db
 from utils import nim_client
+from utils import groq_client
+from utils import awareness
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -56,6 +58,22 @@ class AIChat(commands.Cog):
         self._last_alert: dict[tuple[int, int], float] = {}
         # channel_id -> last time we ran a vent-channel classification call
         self._last_vent_check: dict[int, float] = {}
+
+    async def cog_load(self):
+        # Prime the news digest once at startup so the very first replies
+        # already have it, then keep it refreshed in the background.
+        asyncio.create_task(awareness.refresh_digest(force=True))
+        self._news_refresh_loop.start()
+
+    async def cog_unload(self):
+        self._news_refresh_loop.cancel()
+
+    @tasks.loop(hours=3)
+    async def _news_refresh_loop(self):
+        try:
+            await awareness.refresh_digest()
+        except Exception:
+            logger.exception("Background news digest refresh failed")
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -207,28 +225,39 @@ class AIChat(commands.Cog):
             return
         self._last_vent_check[message.channel.id] = now
 
-        try:
-            classification = await nim_client.call_nim(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You triage a single Discord message from a server's vent channel. "
-                            "Decide if the person sounds like they're genuinely struggling, upset, "
-                            "or going through something hard enough that a trusted adult/friend "
-                            "should probably check in on them — as opposed to normal venting, "
-                            "complaining, or joking around that doesn't need intervention. "
-                            "Reply with exactly one line: YES: <five word reason> or NO."
-                        ),
-                    },
-                    {"role": "user", "content": content[:1000]},
-                ],
-                max_tokens=20,
-                temperature=0.1,
-            )
-        except Exception as e:
-            logger.warning("Vent-channel classification failed, skipping: %s", e)
-            return
+        triage_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You triage a single Discord message from a server's vent channel. "
+                    "Decide if the person sounds like they're genuinely struggling, upset, "
+                    "or going through something hard enough that a trusted adult/friend "
+                    "should probably check in on them — as opposed to normal venting, "
+                    "complaining, or joking around that doesn't need intervention. "
+                    "Reply with exactly one line: YES: <five word reason> or NO."
+                ),
+            },
+            {"role": "user", "content": content[:1000]},
+        ]
+
+        # Cheap, high-frequency background task — keep it off the main NIM
+        # quota by preferring Groq, falling back to NIM only if Groq isn't
+        # configured or has a transient failure.
+        classification = None
+        if groq_client.is_configured():
+            try:
+                classification = await groq_client.call_groq(
+                    triage_messages, model=groq_client.MODEL_FAST, max_tokens=20, temperature=0.1,
+                )
+            except Exception as e:
+                logger.warning("Groq vent triage failed, falling back to NIM: %s", e)
+
+        if classification is None:
+            try:
+                classification = await nim_client.call_nim(triage_messages, max_tokens=20, temperature=0.1)
+            except Exception as e:
+                logger.warning("Vent-channel classification failed, skipping: %s", e)
+                return
 
         if classification.strip().upper().startswith("YES"):
             reason = classification.split(":", 1)[1].strip() if ":" in classification else "Seemed like they could use a check-in."
@@ -381,6 +410,8 @@ class AIChat(commands.Cog):
         can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
             or author.guild_permissions.manage_channels
 
+        relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
+
         system_prompt = nim_client.build_system_prompt(
             personality=personality,
             guild_name=guild.name,
@@ -391,6 +422,8 @@ class AIChat(commands.Cog):
             preferred_language=profile.get("preferred_language"),
             response_style=profile.get("response_style"),
             can_use_tools=can_use_tools,
+            relationship_tier=relationship_tier,
+            news_digest=awareness.get_cached_digest() or None,
         )
 
         # 5. In-channel short-term history

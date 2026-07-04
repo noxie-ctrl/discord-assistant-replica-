@@ -343,26 +343,52 @@ async def get_profile(guild_id: int, user_id: int) -> dict | None:
 
 
 async def touch_profile(guild_id: int, user_id: int, username: str, display_name: str) -> dict:
-    """Upsert a profile, bump message_count + last_seen. Stores the immutable
-    Discord username alongside the (changeable) display name and the id, so
-    long-term memory is keyed on something more durable than a nickname.
-    Returns the fresh row."""
+    """Upsert a profile, bump message_count + last_seen + relationship_score.
+    Stores the immutable Discord username alongside the (changeable) display
+    name and the id, so long-term memory is keyed on something more durable
+    than a nickname. Returns the fresh row.
+
+    relationship_score climbs by 1 per message (see get_relationship_tier
+    below for the tier thresholds) — this is what lets Lucy naturally warm
+    up to someone over time instead of treating every conversation like the
+    first one."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen)
-            VALUES ($1, $2, $3, $4, 1, now())
+            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen, relationship_score)
+            VALUES ($1, $2, $3, $4, 1, now(), 1)
             ON CONFLICT (guild_id, user_id) DO UPDATE
             SET username = $3,
                 display_name = $4,
                 message_count = user_profiles.message_count + 1,
-                last_seen = now()
+                last_seen = now(),
+                relationship_score = user_profiles.relationship_score + 1
             RETURNING *
             """,
             guild_id, user_id, username, display_name,
         )
         return dict(row)
+
+
+# Tier thresholds on relationship_score (roughly: score climbs ~1/message,
+# plus small bumps from positive feedback and playing games together — see
+# add_feedback callers and record_game_result callers). Tuned so a
+# reasonably active member reaches "friend" within a few real conversations,
+# not months.
+RELATIONSHIP_TIERS = [
+    (250, "best friend"),
+    (80, "close friend"),
+    (20, "friend"),
+    (0, "acquaintance"),
+]
+
+
+def get_relationship_tier(score: int) -> str:
+    for threshold, label in RELATIONSHIP_TIERS:
+        if score >= threshold:
+            return label
+    return "acquaintance"
 
 
 async def set_user_preference(guild_id: int, user_id: int, *, preferred_language: str | None = None,
@@ -398,7 +424,7 @@ async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
     pool = _require_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE user_profiles SET relationship_score = relationship_score + $3 "
+            "UPDATE user_profiles SET relationship_score = GREATEST(relationship_score + $3, 0) "
             "WHERE guild_id = $1 AND user_id = $2",
             guild_id, user_id, delta,
         )
@@ -409,7 +435,9 @@ async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
 # ---------------------------------------------------------------------------
 
 async def record_game_result(guild_id: int, user_id: int, game: str, result: str):
-    """result is 'win' | 'loss' | 'draw'"""
+    """result is 'win' | 'loss' | 'draw'. Playing together (any result) is a
+    small bonding signal, so it nudges relationship_score a little — same
+    idea as the feedback bump above, just smaller and unconditional."""
     col = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
     if col is None:
         raise ValueError("result must be 'win', 'loss', or 'draw'")
@@ -424,6 +452,19 @@ async def record_game_result(guild_id: int, user_id: int, game: str, result: str
             """,
             guild_id, user_id, game,
         )
+    if user_id != _BOT_PLACEHOLDER_ID:
+        await adjust_relationship_score(guild_id, user_id, 1)
+
+
+# record_game_result is also called with the bot's own user id (Lucy "vs AI"
+# guess-the-number wins) — skip the relationship bump in that one case since
+# there's no user_profiles row for the bot and it wouldn't mean anything.
+_BOT_PLACEHOLDER_ID = None  # set at runtime by main.py via set_bot_user_id()
+
+
+def set_bot_user_id(bot_user_id: int):
+    global _BOT_PLACEHOLDER_ID
+    _BOT_PLACEHOLDER_ID = bot_user_id
 
 
 async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
@@ -464,7 +505,9 @@ async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 
 
 async def add_feedback(guild_id: int, user_id: int, channel_id: int,
                          message_snippet: str, rating: str, note: str | None = None):
-    """rating is 'up' or 'down'."""
+    """rating is 'up' or 'down'. A 👍 is a small direct signal the
+    conversation actually went well, so it nudges relationship_score a bit
+    beyond the flat per-message bump; a 👎 nudges it back down slightly."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -472,6 +515,7 @@ async def add_feedback(guild_id: int, user_id: int, channel_id: int,
             "VALUES ($1, $2, $3, $4, $5, $6)",
             guild_id, user_id, channel_id, message_snippet, rating, note,
         )
+    await adjust_relationship_score(guild_id, user_id, 3 if rating == "up" else -1)
 
 
 async def get_recent_negative_feedback(guild_id: int, limit: int = 5) -> list[dict]:
