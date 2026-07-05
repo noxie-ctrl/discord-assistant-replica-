@@ -348,104 +348,148 @@ class GuessNumberGame:
 # internet-culture questions, so it works whether someone wants a quick
 # solo round or a competitive group session that rewards "knowing ball."
 TRIVIA_BANK = [
-    # -- anime (heavily expanded per request) --------------------------------
-    {"q": "Which company developed the game Elden Ring?", "choices": ["FromSoftware", "CD Projekt Red", "Naughty Dog", "Bungie"], "answer": 0, "cat": "gaming"},
-    {"q": "In One Piece, what is the name of Luffy's signature attack style?", "choices": ["Gum-Gum", "Ice-Ice", "Soul King", "Water Seven"], "answer": 0, "cat": "anime"},
-    {"q": "Which anime features the Survey Corps fighting Titans?", "choices": ["Demon Slayer", "Attack on Titan", "My Hero Academia", "Naruto"], "answer": 1, "cat": "anime"},
-    {"q": "In Naruto, what village is Naruto from?", "choices": ["Sand Village", "Leaf Village", "Mist Village", "Cloud Village"], "answer": 1, "cat": "anime"},
-    {"q": "In Death Note, who is the detective opposing Light Yagami?", "choices": ["Near", "Mello", "L", "Ryuk"], "answer": 2, "cat": "anime"},
-    {"q": "What alias does Light Yagami use as a vigilante in Death Note?", "choices": ["Shinigami", "Kira", "Yagami", "Raito"], "answer": 1, "cat": "anime"},
-    {"q": "In My Hero Academia, what term describes a superpower?", "choices": ["Nen", "Quirk", "Semblance", "Stand"], "answer": 1, "cat": "anime"},
-    {"q": "Who is known as the Symbol of Peace in My Hero Academia?", "choices": ["All Might", "Endeavor", "Deku", "Aizawa"], "answer": 0, "cat": "anime"},
-    {"q": "What are the names of the two brothers in Fullmetal Alchemist?", "choices": ["Edward and Alphonse", "Naruto and Sasuke", "Ichigo and Renji", "Light and Ryuk"], "answer": 0, "cat": "anime"},
-    {"q": "In Dragon Ball, what alien race is Goku?", "choices": ["Namekian", "Saiyan", "Android", "Majin"], "answer": 1, "cat": "anime"},
-    {"q": "In Jujutsu Kaisen, what does Yuji Itadori consume that binds him to a curse?", "choices": ["A finger", "A tooth", "An eye", "A hand"], "answer": 0, "cat": "anime"},
-    {"q": "In Tokyo Ghoul, what are the flesh-eating creatures called?", "choices": ["Titans", "Ghouls", "Hollows", "Demons"], "answer": 1, "cat": "anime"},
-    {"q": "In Sword Art Online, what happens if a player dies inside the game?", "choices": ["They respawn", "They lose items", "They die in real life", "Nothing happens"], "answer": 2, "cat": "anime"},
-    {"q": "What exam kicks off the early plot of Hunter x Hunter?", "choices": ["Chunin Exam", "Hunter Exam", "S-Class Trial", "Shinobi Trial"], "answer": 1, "cat": "anime"},
-    {"q": "What is the name of the protagonist in One Punch Man?", "choices": ["Saitama", "Genos", "Mob", "Bang"], "answer": 0, "cat": "anime"},
-    {"q": "In Bleach, what are the evil spirit enemies called?", "choices": ["Hollows", "Ghouls", "Titans", "Arrancar only"], "answer": 0, "cat": "anime"},
-    {"q": "What is the name of the ship in Cowboy Bebop?", "choices": ["Bebop", "Serenity", "Nostromo", "Andromeda"], "answer": 0, "cat": "anime"},
-    {"q": "In Spy x Family, what is Loid Forger's spy codename?", "choices": ["Shadow", "Twilight", "Phantom", "Eclipse"], "answer": 1, "cat": "anime"},
-    {"q": "What is the protagonist's name in Chainsaw Man?", "choices": ["Denji", "Aki", "Power", "Makima"], "answer": 0, "cat": "anime"},
-    {"q": "What is Shigeo Kageyama better known as in Mob Psycho 100?", "choices": ["Reigen", "Mob", "Dimple", "Ritsu"], "answer": 1, "cat": "anime"},
-    {"q": "What type of sword do Demon Slayer Corps members use?", "choices": ["Katana", "Nichirin Blade", "Zanpakuto", "Nodachi only"], "answer": 1, "cat": "anime"},
-    {"q": "What is the outermost of the three walls in Attack on Titan?", "choices": ["Wall Sina", "Wall Rose", "Wall Maria", "Wall Titan"], "answer": 2, "cat": "anime"},
-    {"q": "What are the nine tailed beasts collectively called in Naruto?", "choices": ["Bijuu", "Akatsuki", "Sannin", "Kage"], "answer": 0, "cat": "anime"},
-    {"q": "What is the legendary treasure everyone searches for in One Piece called?", "choices": ["The One Piece", "Poneglyph", "Road Log", "Devil Fruit"], "answer": 0, "cat": "anime"},
-    {"q": "In Death Note, what supernatural being drops the notebook?", "choices": ["A demon", "A shinigami", "A ghost", "An angel"], "answer": 1, "cat": "anime"},
+    # -- anime: mainstream/well-known ----------------------------------------
+    {"q": "In One Piece, what is the name of Luffy\'s signature attack style?", "choices": ["Gum-Gum", "Ice-Ice", "Soul King", "Water Seven"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "Which anime features the Survey Corps fighting Titans?", "choices": ["Demon Slayer", "Attack on Titan", "My Hero Academia", "Naruto"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Naruto, what village is Naruto from?", "choices": ["Sand Village", "Leaf Village", "Mist Village", "Cloud Village"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Death Note, who is the detective opposing Light Yagami?", "choices": ["Near", "Mello", "L", "Ryuk"], "answer": 2, "cat": "anime", "diff": "easy"},
+    {"q": "What alias does Light Yagami use as a vigilante in Death Note?", "choices": ["Shinigami", "Kira", "Yagami", "Raito"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In My Hero Academia, what term describes a superpower?", "choices": ["Nen", "Quirk", "Semblance", "Stand"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "Who is known as the Symbol of Peace in My Hero Academia?", "choices": ["All Might", "Endeavor", "Deku", "Aizawa"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "What are the names of the two brothers in Fullmetal Alchemist?", "choices": ["Edward and Alphonse", "Naruto and Sasuke", "Ichigo and Renji", "Light and Ryuk"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Dragon Ball, what alien race is Goku?", "choices": ["Namekian", "Saiyan", "Android", "Majin"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Jujutsu Kaisen, what does Yuji Itadori consume that binds him to a curse?", "choices": ["A finger", "A tooth", "An eye", "A hand"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "In Tokyo Ghoul, what are the flesh-eating creatures called?", "choices": ["Titans", "Ghouls", "Hollows", "Demons"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "In Sword Art Online, what happens if a player dies inside the game?", "choices": ["They respawn", "They lose items", "They die in real life", "Nothing happens"], "answer": 2, "cat": "anime", "diff": "medium"},
+    {"q": "What exam kicks off the early plot of Hunter x Hunter?", "choices": ["Chunin Exam", "Hunter Exam", "S-Class Trial", "Shinobi Trial"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the name of the protagonist in One Punch Man?", "choices": ["Saitama", "Genos", "Mob", "Bang"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Bleach, what are the evil spirit enemies called?", "choices": ["Hollows", "Ghouls", "Titans", "Arrancar only"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "What is the name of the ship in Cowboy Bebop?", "choices": ["Bebop", "Serenity", "Nostromo", "Andromeda"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "In Spy x Family, what is Loid Forger\'s spy codename?", "choices": ["Shadow", "Twilight", "Phantom", "Eclipse"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the protagonist\'s name in Chainsaw Man?", "choices": ["Denji", "Aki", "Power", "Makima"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "What is Shigeo Kageyama better known as in Mob Psycho 100?", "choices": ["Reigen", "Mob", "Dimple", "Ritsu"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What type of sword do Demon Slayer Corps members use?", "choices": ["Katana", "Nichirin Blade", "Zanpakuto", "Nodachi only"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the outermost of the three walls in Attack on Titan?", "choices": ["Wall Sina", "Wall Rose", "Wall Maria", "Wall Titan"], "answer": 2, "cat": "anime", "diff": "medium"},
+    {"q": "What are the nine tailed beasts collectively called in Naruto?", "choices": ["Bijuu", "Akatsuki", "Sannin", "Kage"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "What is the legendary treasure everyone searches for in One Piece called?", "choices": ["The One Piece", "Poneglyph", "Road Log", "Devil Fruit"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Death Note, what supernatural being drops the notebook?", "choices": ["A demon", "A shinigami", "A ghost", "An angel"], "answer": 1, "cat": "anime", "diff": "medium"},
 
+    # -- anime: niche/hard (deeper cuts across many franchises) ---------------
+    {"q": "What is the name of the supernatural ability system introduced in JoJo\'s Bizarre Adventure Part 3?", "choices": ["Stands", "Nen", "Quirks", "Cursed Techniques"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated both the 2003 Fullmetal Alchemist and Brotherhood?", "choices": ["Bones", "MAPPA", "ufotable", "Wit Studio"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated Jujutsu Kaisen\'s first season?", "choices": ["MAPPA", "Wit Studio", "Bones", "Madhouse"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio took over animating Attack on Titan\'s Final Season from Wit Studio?", "choices": ["MAPPA", "ufotable", "Bones", "CloverWorks"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio is best known for Demon Slayer\'s animation?", "choices": ["ufotable", "Kyoto Animation", "Trigger", "A-1 Pictures"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated One Punch Man\'s acclaimed first season?", "choices": ["Madhouse", "J.C.Staff", "Bones", "Sunrise"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Code Geass, what is the name of Lelouch\'s power?", "choices": ["Geass", "Nen", "Haki", "Semblance"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Death Note, what two things must you know to kill someone with the notebook?", "choices": ["Name and face", "Name and birthdate", "Blood and name", "Fingerprint and name"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What taboo act costs Edward Elric his limbs in Fullmetal Alchemist?", "choices": ["Human transmutation", "Time travel", "Soul binding", "Blood alchemy"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Vinland Saga?", "choices": ["Thorfinn", "Askeladd", "Thorkell", "Canute"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the name of Guts\' massive sword in Berserk?", "choices": ["Dragon Slayer", "Dawnbreaker", "Sword of Judgment", "Behemoth"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Steins;Gate, what is the nickname for the text messages sent to the past?", "choices": ["D-Mail", "Time-Text", "Retro-Mail", "Echo Mail"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Re:Zero, what is Subaru\'s core ability called?", "choices": ["Return by Death", "Time Leap", "Reset Point", "Second Chance"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In the Fate series, what is the name of the ritual Servants fight in?", "choices": ["Holy Grail War", "Grand Tournament", "Command War", "Servant Trial"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Made in Abyss, what is the giant chasm at the center of the story called?", "choices": ["The Abyss", "The Void", "The Pit", "The Hollow"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Naoki Urasawa\'s Monster, what is the antagonist\'s name?", "choices": ["Johan Liebert", "Franz Bonaparta", "Tenma", "Roberto"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Neon Genesis Evangelion, what are the giant piloted robots called?", "choices": ["Evangelions", "Titans", "Guardians", "Jaegers"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Neon Genesis Evangelion, what are the mysterious enemy beings called?", "choices": ["Angels", "Titans", "Hollows", "Nobodies"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Akira, what is the name of Kaneda\'s biker gang?", "choices": ["The Capsules", "The Espers", "Neo-Tokyo Riders", "The Clowns"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s full name in Trigun?", "choices": ["Vash the Stampede", "Nicholas Wolfwood", "Knives Millions", "Legato Bluesummers"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Hellsing, Alucard\'s name is a reversed reference to which classic character?", "choices": ["Dracula", "Frankenstein", "Nosferatu", "Van Helsing"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Black Lagoon, what is the mercenary crew\'s name?", "choices": ["Lagoon Company", "Rip-Off Church", "Hotel Moscow", "Balalaika Corps"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Fruits Basket, what happens to the Sohma family members when hugged by the opposite sex?", "choices": ["They transform into zodiac animals", "They lose their memory", "They fall asleep", "They swap bodies"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What sport is Haikyuu!! centered around?", "choices": ["Volleyball", "Basketball", "Baseball", "Tennis"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What sport is Slam Dunk centered around?", "choices": ["Basketball", "Volleyball", "Baseball", "Boxing"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Gintoki\'s usual weapon of choice in Gintama?", "choices": ["A wooden bokuto", "A katana", "A rifle", "A yo-yo"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Part 1 of JoJo\'s Bizarre Adventure called?", "choices": ["Phantom Blood", "Battle Tendency", "Stardust Crusaders", "Steel Ball Run"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Overlord, what was the protagonist\'s original in-game name before becoming Ainz Ooal Gown?", "choices": ["Momonga", "Ulbert", "Peroroncino", "Touch Me"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s slime name in That Time I Got Reincarnated as a Slime?", "choices": ["Rimuru Tempest", "Veldora", "Benimaru", "Milim"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Dr. Stone, what field does the protagonist rely on to rebuild civilization?", "choices": ["Science", "Magic", "Alchemy", "Engineering only"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the orphanage called in The Promised Neverland?", "choices": ["Grace Field House", "Sunny Meadows", "Hope\'s Peak", "Willowbrook House"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Assassination Classroom, what must the students do to their teacher?", "choices": ["Assassinate him", "Protect him", "Train under him only", "Report him"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Parasyte, what part of the host\'s body do the alien parasites take over?", "choices": ["The head/brain", "The heart", "The hands", "The eyes"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in the Devilman franchise?", "choices": ["Akira Fudo", "Ryo Asuka", "Ken Ogata", "Miki Makimura"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Inuyasha, what is the protagonist\'s demon heritage?", "choices": ["Half-dog-demon, half-human", "Full demon", "Half-fox-demon", "Half-dragon-demon"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Yu Yu Hakusho, what role does Yusuke take on after his death?", "choices": ["Spirit Detective", "Demon Hunter", "Tournament Champion", "Underworld Judge"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What vow does Kenshin take in Rurouni Kenshin?", "choices": ["Not to kill", "Never to draw his sword", "To serve the Shogun", "To abandon swordsmanship"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What magical items does the protagonist collect in Cardcaptor Sakura?", "choices": ["Clow Cards", "Tarot Cards", "Spirit Orbs", "Star Fragments"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Sailor Moon\'s civilian name?", "choices": ["Usagi Tsukino", "Rei Hino", "Ami Mizuno", "Minako Aino"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Spirited Away?", "choices": ["Chihiro", "Sophie", "San", "Kiki"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Princess Mononoke?", "choices": ["Ashitaka", "San", "Jiro", "Okkoto"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Totoro, in My Neighbor Totoro?", "choices": ["A forest spirit", "A ghost", "A talking cat", "A dream creature"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Ghost in the Shell, what does the Major\'s cyborg body famously let her do?", "choices": ["Dive into networks", "Fly", "Turn invisible", "Time travel"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What kind of devil is Pochita in Chainsaw Man?", "choices": ["Chainsaw Devil", "Blood Devil", "Gun Devil", "Fire Devil"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What school do the protagonists attend in Jujutsu Kaisen?", "choices": ["Tokyo Jujutsu High", "Kyoto Jujutsu High", "Sorcery Academy", "Curse Institute"], "answer": 0, "cat": "anime", "diff": "hard"},
     # -- gaming ---------------------------------------------------------------
-    {"q": "In Minecraft, what do you need to craft a Nether Portal?", "choices": ["Iron blocks", "Obsidian", "Netherite", "Cobblestone"], "answer": 1, "cat": "gaming"},
-    {"q": "What was the first battle royale game to hit mainstream popularity?", "choices": ["Apex Legends", "Fortnite", "PUBG", "Warzone"], "answer": 2, "cat": "gaming"},
-    {"q": "In gaming slang, what does 'GG' stand for?", "choices": ["Great Game", "Go Get", "Good Game", "Game Grid"], "answer": 2, "cat": "gaming"},
-    {"q": "What does 'nerfed' mean when talking about a game update?", "choices": ["Made stronger", "Made weaker", "Removed entirely", "Made faster"], "answer": 1, "cat": "gaming"},
-    {"q": "Which company created The Legend of Zelda series?", "choices": ["Sega", "Nintendo", "Capcom", "Square Enix"], "answer": 1, "cat": "gaming"},
-    {"q": "Which company makes the PlayStation console?", "choices": ["Microsoft", "Nintendo", "Sony", "Sega"], "answer": 2, "cat": "gaming"},
-    {"q": "What does 'AFK' stand for?", "choices": ["Away From Keyboard", "Always Fully Known", "Attack From Kill", "Away For Kicks"], "answer": 0, "cat": "gaming"},
-    {"q": "What does 'NPC' stand for?", "choices": ["Non-Player Character", "New Player Class", "Network Player Code", "Non-Playable Client"], "answer": 0, "cat": "gaming"},
-    {"q": "Which studio developed Minecraft?", "choices": ["Mojang", "Valve", "Epic Games", "Rockstar"], "answer": 0, "cat": "gaming"},
-    {"q": "What does 'DLC' stand for?", "choices": ["Downloadable Content", "Direct Live Connection", "Digital License Code", "Default Level Class"], "answer": 0, "cat": "gaming"},
-    {"q": "Which game features the character Master Chief?", "choices": ["Halo", "Gears of War", "Destiny", "Doom"], "answer": 0, "cat": "gaming"},
-    {"q": "What in-game currency is used in Fortnite's item shop?", "choices": ["V-Bucks", "Robux", "Gold", "Credits"], "answer": 0, "cat": "gaming"},
-    {"q": "What does 'MMORPG' stand for?", "choices": [
-        "Massively Multiplayer Online Role-Playing Game", "Multi-Mode Online RPG", "Massive Multiplayer Overworld RPG", "Main Menu Online Role-Playing Game"
-    ], "answer": 0, "cat": "gaming"},
+    {"q": "Which company developed the game Elden Ring?", "choices": ["FromSoftware", "CD Projekt Red", "Naughty Dog", "Bungie"], "answer": 0, "cat": "gaming", "diff": "medium"},
+    {"q": "In Minecraft, what do you need to craft a Nether Portal?", "choices": ["Iron blocks", "Obsidian", "Netherite", "Cobblestone"], "answer": 1, "cat": "gaming", "diff": "medium"},
+    {"q": "What was the first battle royale game to hit mainstream popularity?", "choices": ["Apex Legends", "Fortnite", "PUBG", "Warzone"], "answer": 2, "cat": "gaming", "diff": "medium"},
+    {"q": "In gaming slang, what does \'GG\' stand for?", "choices": ["Great Game", "Go Get", "Good Game", "Game Grid"], "answer": 2, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'nerfed\' mean when talking about a game update?", "choices": ["Made stronger", "Made weaker", "Removed entirely", "Made faster"], "answer": 1, "cat": "gaming", "diff": "easy"},
+    {"q": "Which company created The Legend of Zelda series?", "choices": ["Sega", "Nintendo", "Capcom", "Square Enix"], "answer": 1, "cat": "gaming", "diff": "easy"},
+    {"q": "Which company makes the PlayStation console?", "choices": ["Microsoft", "Nintendo", "Sony", "Sega"], "answer": 2, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'AFK\' stand for?", "choices": ["Away From Keyboard", "Always Fully Known", "Attack From Kill", "Away For Kicks"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'NPC\' stand for?", "choices": ["Non-Player Character", "New Player Class", "Network Player Code", "Non-Playable Client"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "Which studio developed Minecraft?", "choices": ["Mojang", "Valve", "Epic Games", "Rockstar"], "answer": 0, "cat": "gaming", "diff": "medium"},
+    {"q": "What does \'DLC\' stand for?", "choices": ["Downloadable Content", "Direct Live Connection", "Digital License Code", "Default Level Class"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "Which game features the character Master Chief?", "choices": ["Halo", "Gears of War", "Destiny", "Doom"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What in-game currency is used in Fortnite\'s item shop?", "choices": ["V-Bucks", "Robux", "Gold", "Credits"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'MMORPG\' stand for?", "choices": ["Massively Multiplayer Online Role-Playing Game", "Multi-Mode Online RPG", "Massive Multiplayer Overworld RPG", "Main Menu Online Role-Playing Game"], "answer": 0, "cat": "gaming", "diff": "medium"},
 
-    # -- sports -----------------------------------------------------------------
-    {"q": "In football (soccer), how many players per team are on the pitch at once?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports"},
-    {"q": "How many points is a touchdown worth in American football (before extra point/conversion)?", "choices": ["5", "6", "7", "3"], "answer": 1, "cat": "sports"},
-    {"q": "Which country has won the most FIFA World Cups?", "choices": ["Germany", "Argentina", "Brazil", "Italy"], "answer": 2, "cat": "sports"},
-    {"q": "How many Grand Slam tournaments are there in tennis each year?", "choices": ["2", "3", "4", "5"], "answer": 2, "cat": "sports"},
-    {"q": "How many players are on an NBA basketball court per team at once?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports"},
-    {"q": "What sport uses a shuttlecock?", "choices": ["Tennis", "Squash", "Badminton", "Table Tennis"], "answer": 2, "cat": "sports"},
-    {"q": "In cricket, how many players are on a team?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports"},
-    {"q": "What is the maximum possible score in ten-pin bowling?", "choices": ["100", "200", "300", "500"], "answer": 2, "cat": "sports"},
-    {"q": "How many rings are on the Olympic flag?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports"},
+    # -- sports ---------------------------------------------------------------
+    {"q": "In football (soccer), how many players per team are on the pitch at once?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "How many points is a touchdown worth in American football (before extra point/conversion)?", "choices": ["5", "6", "7", "3"], "answer": 1, "cat": "sports", "diff": "medium"},
+    {"q": "Which country has won the most FIFA World Cups?", "choices": ["Germany", "Argentina", "Brazil", "Italy"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many Grand Slam tournaments are there in tennis each year?", "choices": ["2", "3", "4", "5"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many players are on an NBA basketball court per team at once?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports", "diff": "easy"},
+    {"q": "What sport uses a shuttlecock?", "choices": ["Tennis", "Squash", "Badminton", "Table Tennis"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "In cricket, how many players are on a team?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "What is the maximum possible score in ten-pin bowling?", "choices": ["100", "200", "300", "500"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many rings are on the Olympic flag?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports", "diff": "easy"},
 
-    # -- movies -------------------------------------------------------------
-    {"q": "Who directed the movie 'Inception'?", "choices": ["Steven Spielberg", "James Cameron", "Christopher Nolan", "Denis Villeneuve"], "answer": 2, "cat": "movies"},
-    {"q": "Which movie won the Academy Award for Best Picture in 2020 (for 2019 films)?", "choices": ["1917", "Joker", "Parasite", "Once Upon a Time in Hollywood"], "answer": 2, "cat": "movies"},
-    {"q": "Who played Iron Man in the Marvel Cinematic Universe?", "choices": ["Chris Evans", "Chris Hemsworth", "Robert Downey Jr.", "Mark Ruffalo"], "answer": 2, "cat": "movies"},
-    {"q": "Which movie features the line 'I'll be back'?", "choices": ["RoboCop", "The Terminator", "Predator", "Total Recall"], "answer": 1, "cat": "movies"},
-    {"q": "Who directed both Jaws and E.T.?", "choices": ["George Lucas", "Steven Spielberg", "Ridley Scott", "James Cameron"], "answer": 1, "cat": "movies"},
-    {"q": "Which studio produces the Toy Story franchise?", "choices": ["DreamWorks", "Illumination", "Pixar", "Blue Sky Studios"], "answer": 2, "cat": "movies"},
-    {"q": "What color is Shrek?", "choices": ["Blue", "Green", "Purple", "Brown"], "answer": 1, "cat": "movies"},
-    {"q": "Which fictional school does Harry Potter attend?", "choices": ["Hogwarts", "Camp Half-Blood", "Xavier's School", "Brakebills"], "answer": 0, "cat": "movies"},
+    # -- movies ---------------------------------------------------------------
+    {"q": "Who directed the movie \'Inception\'?", "choices": ["Steven Spielberg", "James Cameron", "Christopher Nolan", "Denis Villeneuve"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "Which movie won the Academy Award for Best Picture in 2020 (for 2019 films)?", "choices": ["1917", "Joker", "Parasite", "Once Upon a Time in Hollywood"], "answer": 2, "cat": "movies", "diff": "medium"},
+    {"q": "Who played Iron Man in the Marvel Cinematic Universe?", "choices": ["Chris Evans", "Chris Hemsworth", "Robert Downey Jr.", "Mark Ruffalo"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "Which movie features the line \'I\'ll be back\'?", "choices": ["RoboCop", "The Terminator", "Predator", "Total Recall"], "answer": 1, "cat": "movies", "diff": "easy"},
+    {"q": "Who directed both Jaws and E.T.?", "choices": ["George Lucas", "Steven Spielberg", "Ridley Scott", "James Cameron"], "answer": 1, "cat": "movies", "diff": "medium"},
+    {"q": "Which studio produces the Toy Story franchise?", "choices": ["DreamWorks", "Illumination", "Pixar", "Blue Sky Studios"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "What color is Shrek?", "choices": ["Blue", "Green", "Purple", "Brown"], "answer": 1, "cat": "movies", "diff": "easy"},
+    {"q": "Which fictional school does Harry Potter attend?", "choices": ["Hogwarts", "Camp Half-Blood", "Xavier\'s School", "Brakebills"], "answer": 0, "cat": "movies", "diff": "easy"},
 
-    # -- internet / meme culture ---------------------------------------------
-    {"q": "What does 'GOAT' mean in internet slang?", "choices": ["Great Or Awful Time", "Greatest Of All Time", "Game Over And Terminated", "Getting Older And Tired"], "answer": 1, "cat": "internet"},
-    {"q": "What's the internet slang term for a message someone regrets sending?", "choices": ["L take", "Ratio", "Delete this", "Cringe"], "answer": 3, "cat": "internet"},
-    {"q": "Which streaming platform is Discord most commonly used alongside for gaming communities?", "choices": ["Netflix", "Twitch", "Hulu", "Disney+"], "answer": 1, "cat": "internet"},
-    {"q": "What does 'IRL' stand for?", "choices": ["In Real Life", "I Really Like", "Internet Relay Log", "Is Really Legit"], "answer": 0, "cat": "internet"},
-    {"q": "What does 'FOMO' stand for?", "choices": ["Fear Of Missing Out", "Focus On My Own", "Fear Of Moving On", "Fun Only Matters Once"], "answer": 0, "cat": "internet"},
-    {"q": "What does 'TL;DR' mean?", "choices": ["Too Long; Didn't Read", "Talk Later; Did Reply", "Time Left; Day Remaining", "This Line Doesn't Register"], "answer": 0, "cat": "internet"},
-    {"q": "What does 'POV' stand for in a meme/video caption?", "choices": ["Point Of View", "Power Of Video", "Play On Voice", "Post Of the Various"], "answer": 0, "cat": "internet"},
-    {"q": "Which platform popularized the 'For You Page'?", "choices": ["Instagram", "TikTok", "Snapchat", "YouTube"], "answer": 1, "cat": "internet"},
+    # -- internet / meme culture ---------------------------------------------------------------
+    {"q": "What does \'GOAT\' mean in internet slang?", "choices": ["Great Or Awful Time", "Greatest Of All Time", "Game Over And Terminated", "Getting Older And Tired"], "answer": 1, "cat": "internet", "diff": "easy"},
+    {"q": "What\'s the internet slang term for a message someone regrets sending?", "choices": ["L take", "Ratio", "Delete this", "Cringe"], "answer": 3, "cat": "internet", "diff": "medium"},
+    {"q": "Which streaming platform is Discord most commonly used alongside for gaming communities?", "choices": ["Netflix", "Twitch", "Hulu", "Disney+"], "answer": 1, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'IRL\' stand for?", "choices": ["In Real Life", "I Really Like", "Internet Relay Log", "Is Really Legit"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'FOMO\' stand for?", "choices": ["Fear Of Missing Out", "Focus On My Own", "Fear Of Moving On", "Fun Only Matters Once"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'TL;DR\' mean?", "choices": ["Too Long; Didn\'t Read", "Talk Later; Did Reply", "Time Left; Day Remaining", "This Line Doesn\'t Register"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'POV\' stand for in a meme/video caption?", "choices": ["Point Of View", "Power Of Video", "Play On Voice", "Post Of the Various"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "Which platform popularized the \'For You Page\'?", "choices": ["Instagram", "TikTok", "Snapchat", "YouTube"], "answer": 1, "cat": "internet", "diff": "easy"},
 
-    # -- general knowledge ----------------------------------------------------
-    {"q": "What is the capital of Japan?", "choices": ["Osaka", "Kyoto", "Tokyo", "Nagoya"], "answer": 2, "cat": "general"},
-    {"q": "What is the largest planet in our solar system?", "choices": ["Saturn", "Jupiter", "Neptune", "Uranus"], "answer": 1, "cat": "general"},
-    {"q": "Which element has the chemical symbol 'Fe'?", "choices": ["Fluorine", "Iron", "Francium", "Ferrite"], "answer": 1, "cat": "general"},
-    {"q": "What is the smallest planet in our solar system?", "choices": ["Mars", "Mercury", "Venus", "Pluto"], "answer": 1, "cat": "general"},
-    {"q": "Which ocean is the largest by area?", "choices": ["Atlantic", "Indian", "Arctic", "Pacific"], "answer": 3, "cat": "general"},
-    {"q": "What is the hardest naturally occurring substance on Earth?", "choices": ["Quartz", "Diamond", "Titanium", "Granite"], "answer": 1, "cat": "general"},
-    {"q": "How many continents are there?", "choices": ["5", "6", "7", "8"], "answer": 2, "cat": "general"},
-    {"q": "What is the official currency of Japan?", "choices": ["Won", "Yuan", "Yen", "Ringgit"], "answer": 2, "cat": "general"},
+    # -- general knowledge ---------------------------------------------------------------
+    {"q": "What is the capital of Japan?", "choices": ["Osaka", "Kyoto", "Tokyo", "Nagoya"], "answer": 2, "cat": "general", "diff": "easy"},
+    {"q": "What is the largest planet in our solar system?", "choices": ["Saturn", "Jupiter", "Neptune", "Uranus"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "Which element has the chemical symbol \'Fe\'?", "choices": ["Fluorine", "Iron", "Francium", "Ferrite"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "What is the smallest planet in our solar system?", "choices": ["Mars", "Mercury", "Venus", "Pluto"], "answer": 1, "cat": "general", "diff": "medium"},
+    {"q": "Which ocean is the largest by area?", "choices": ["Atlantic", "Indian", "Arctic", "Pacific"], "answer": 3, "cat": "general", "diff": "easy"},
+    {"q": "What is the hardest naturally occurring substance on Earth?", "choices": ["Quartz", "Diamond", "Titanium", "Granite"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "How many continents are there?", "choices": ["5", "6", "7", "8"], "answer": 2, "cat": "general", "diff": "easy"},
+    {"q": "What is the official currency of Japan?", "choices": ["Won", "Yuan", "Yen", "Ringgit"], "answer": 2, "cat": "general", "diff": "easy"},
 
-    # -- music (new category) -------------------------------------------------
-    {"q": "Which artist is known as the 'King of Pop'?", "choices": ["Prince", "Elvis Presley", "Michael Jackson", "Stevie Wonder"], "answer": 2, "cat": "music"},
-    {"q": "How many strings does a standard acoustic guitar have?", "choices": ["4", "5", "6", "7"], "answer": 2, "cat": "music"},
-    {"q": "Which British band performed 'Bohemian Rhapsody'?", "choices": ["The Beatles", "Queen", "Led Zeppelin", "Pink Floyd"], "answer": 1, "cat": "music"},
-    {"q": "How many keys does a standard piano have?", "choices": ["76", "88", "96", "100"], "answer": 1, "cat": "music"},
-    {"q": "Which streaming platform's logo is a green circle with sound bars?", "choices": ["Apple Music", "SoundCloud", "Spotify", "Tidal"], "answer": 2, "cat": "music"},
+    # -- music ---------------------------------------------------------------
+    {"q": "Which artist is known as the \'King of Pop\'?", "choices": ["Prince", "Elvis Presley", "Michael Jackson", "Stevie Wonder"], "answer": 2, "cat": "music", "diff": "easy"},
+    {"q": "How many strings does a standard acoustic guitar have?", "choices": ["4", "5", "6", "7"], "answer": 2, "cat": "music", "diff": "easy"},
+    {"q": "Which British band performed \'Bohemian Rhapsody\'?", "choices": ["The Beatles", "Queen", "Led Zeppelin", "Pink Floyd"], "answer": 1, "cat": "music", "diff": "medium"},
+    {"q": "How many keys does a standard piano have?", "choices": ["76", "88", "96", "100"], "answer": 1, "cat": "music", "diff": "medium"},
+    {"q": "Which streaming platform\'s logo is a green circle with sound bars?", "choices": ["Apple Music", "SoundCloud", "Spotify", "Tidal"], "answer": 2, "cat": "music", "diff": "easy"},
 
-    # -- science (new category) -------------------------------------------------
-    {"q": "What is the chemical formula for water?", "choices": ["CO2", "H2O", "O2", "NaCl"], "answer": 1, "cat": "science"},
-    {"q": "Which planet is known as the Red Planet?", "choices": ["Venus", "Jupiter", "Mars", "Saturn"], "answer": 2, "cat": "science"},
-    {"q": "What gas do plants absorb from the atmosphere for photosynthesis?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], "answer": 2, "cat": "science"},
-    {"q": "Roughly how fast does light travel in a vacuum?", "choices": ["3,000 km/s", "30,000 km/s", "300,000 km/s", "3,000,000 km/s"], "answer": 2, "cat": "science"},
-    {"q": "Which part of a cell contains its genetic material?", "choices": ["Mitochondria", "Nucleus", "Cytoplasm", "Ribosome"], "answer": 1, "cat": "science"},
+    # -- science ---------------------------------------------------------------
+    {"q": "What is the chemical formula for water?", "choices": ["CO2", "H2O", "O2", "NaCl"], "answer": 1, "cat": "science", "diff": "easy"},
+    {"q": "Which planet is known as the Red Planet?", "choices": ["Venus", "Jupiter", "Mars", "Saturn"], "answer": 2, "cat": "science", "diff": "easy"},
+    {"q": "What gas do plants absorb from the atmosphere for photosynthesis?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], "answer": 2, "cat": "science", "diff": "easy"},
+    {"q": "Roughly how fast does light travel in a vacuum?", "choices": ["3,000 km/s", "30,000 km/s", "300,000 km/s", "3,000,000 km/s"], "answer": 2, "cat": "science", "diff": "medium"},
+    {"q": "Which part of a cell contains its genetic material?", "choices": ["Mitochondria", "Nucleus", "Cytoplasm", "Ribosome"], "answer": 1, "cat": "science", "diff": "easy"},
 ]
 
 
@@ -712,6 +756,7 @@ class Games(commands.Cog):
     @app_commands.describe(
         rounds="How many questions (default 5, max 10)",
         category="Optional: limit to one category",
+        level="Difficulty. Auto uses your own progress — you unlock harder tiers by answering correctly over time.",
     )
     @app_commands.choices(category=[
         app_commands.Choice(name="General knowledge", value="general"),
@@ -723,11 +768,18 @@ class Games(commands.Cog):
         app_commands.Choice(name="Music", value="music"),
         app_commands.Choice(name="Science", value="science"),
     ])
+    @app_commands.choices(level=[
+        app_commands.Choice(name="Auto (based on your progress)", value="auto"),
+        app_commands.Choice(name="Easy", value="easy"),
+        app_commands.Choice(name="Medium", value="medium"),
+        app_commands.Choice(name="Hard (niche)", value="hard"),
+    ])
     async def trivia(
         self,
         interaction: discord.Interaction,
         rounds: app_commands.Range[int, 1, 10] = 5,
         category: app_commands.Choice[str] | None = None,
+        level: app_commands.Choice[str] | None = None,
     ):
         if interaction.channel_id in self.active_trivia_channels:
             await interaction.response.send_message(
@@ -735,10 +787,34 @@ class Games(commands.Cog):
             )
             return
 
-        pool = TRIVIA_BANK if category is None else [q for q in TRIVIA_BANK if q["cat"] == category.value]
-        if not pool:
+        # Auto mode: the invoker's own progress decides the tier — this is
+        # what lets someone naturally advance to harder/niche questions as
+        # they rack up correct answers, without having to know to ask for it.
+        level_value = (level.value if level else "auto")
+        invoker_correct = (await db.get_game_stats(interaction.guild_id, interaction.user.id, "trivia")).get("wins", 0)
+        auto_level = db.get_trivia_level(invoker_correct)
+        effective_level = auto_level if level_value == "auto" else level_value
+
+        category_pool = TRIVIA_BANK if category is None else [q for q in TRIVIA_BANK if q["cat"] == category.value]
+        if not category_pool:
             await interaction.response.send_message("No questions in that category yet.", ephemeral=True)
             return
+
+        # Exact difficulty match first; if that's too thin (a filtered
+        # category might not have many "hard" entries yet), broaden to
+        # easier tiers rather than failing outright — same fallback
+        # philosophy as the repeat-avoidance logic below.
+        DIFFICULTY_FALLBACK = {"hard": ["hard", "medium", "easy"], "medium": ["medium", "easy"], "easy": ["easy"]}
+        pool = []
+        for tier in DIFFICULTY_FALLBACK.get(effective_level, ["easy"]):
+            pool = [q for q in category_pool if q["diff"] == tier]
+            if len(pool) >= rounds:
+                break
+            # keep the largest tier seen so far as a fallback if none hit `rounds`
+            if not pool:
+                continue
+        if not pool:
+            pool = category_pool  # last resort: any difficulty in this category
         rounds = min(rounds, len(pool))
 
         # Avoid repeating whatever this channel was just asked. If the
@@ -771,15 +847,17 @@ class Games(commands.Cog):
         self.active_trivia_channels.add(interaction.channel_id)
         scoreboard: dict[int, int] = {}
 
+        level_note = f" — {effective_level} tier" if level_value == "auto" else ""
         await interaction.response.send_message(
-            f"🧠 Trivia time — {len(questions)} question(s), first correct answer wins each round. Go!"
+            f"🧠 Trivia time{level_note} — {len(questions)} question(s), first correct answer wins each round. Go!"
         )
 
         try:
             for i, question in enumerate(questions, start=1):
                 view = TriviaRoundView(question, interaction.guild_id, scoreboard)
+                diff_tag = question.get("diff", "easy")
                 msg = await interaction.channel.send(
-                    f"**Q{i}/{len(questions)} ({question['cat']}):** {question['q']}", view=view
+                    f"**Q{i}/{len(questions)} ({question['cat']}, {diff_tag}):** {question['q']}", view=view
                 )
                 await view.wait()
                 if not view.winner:
@@ -804,6 +882,15 @@ class Games(commands.Cog):
                 embed = discord.Embed(
                     title="🏆 Trivia results", description="\n".join(lines), color=discord.Color.gold()
                 )
+                # Nudge the invoker with their live progress toward the next
+                # difficulty tier — makes the progression visible instead of
+                # something that just silently happens in the background.
+                new_correct = (await db.get_game_stats(interaction.guild_id, interaction.user.id, "trivia")).get("wins", 0)
+                next_level, remaining = db.trivia_next_level_info(new_correct)
+                if next_level:
+                    embed.set_footer(text=f"Your trivia level: {db.get_trivia_level(new_correct)} — {remaining} more correct to unlock {next_level}.")
+                else:
+                    embed.set_footer(text=f"Your trivia level: {db.get_trivia_level(new_correct)} (max tier)")
                 await interaction.channel.send(embed=embed)
             else:
                 await interaction.channel.send("Nobody got one right that round — tough crowd. 😏")
