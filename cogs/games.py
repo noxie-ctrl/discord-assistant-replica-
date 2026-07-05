@@ -23,6 +23,7 @@ their own spec.
 
 import random
 import asyncio
+import collections
 
 import discord
 from discord import app_commands
@@ -347,27 +348,106 @@ class GuessNumberGame:
 # internet-culture questions, so it works whether someone wants a quick
 # solo round or a competitive group session that rewards "knowing ball."
 TRIVIA_BANK = [
+    # -- anime (heavily expanded per request) --------------------------------
     {"q": "Which company developed the game Elden Ring?", "choices": ["FromSoftware", "CD Projekt Red", "Naughty Dog", "Bungie"], "answer": 0, "cat": "gaming"},
-    {"q": "In Minecraft, what do you need to craft a Nether Portal?", "choices": ["Iron blocks", "Obsidian", "Netherite", "Cobblestone"], "answer": 1, "cat": "gaming"},
-    {"q": "What was the first battle royale game to hit mainstream popularity?", "choices": ["Apex Legends", "Fortnite", "PUBG", "Warzone"], "answer": 2, "cat": "gaming"},
     {"q": "In One Piece, what is the name of Luffy's signature attack style?", "choices": ["Gum-Gum", "Ice-Ice", "Soul King", "Water Seven"], "answer": 0, "cat": "anime"},
     {"q": "Which anime features the Survey Corps fighting Titans?", "choices": ["Demon Slayer", "Attack on Titan", "My Hero Academia", "Naruto"], "answer": 1, "cat": "anime"},
-    {"q": "What does 'GOAT' mean in internet slang?", "choices": ["Great Or Awful Time", "Greatest Of All Time", "Game Over And Terminated", "Getting Older And Tired"], "answer": 1, "cat": "internet"},
-    {"q": "What's the internet slang term for a message someone regrets sending?", "choices": ["L take", "Ratio", "Delete this", "Cringe"], "answer": 3, "cat": "internet"},
+    {"q": "In Naruto, what village is Naruto from?", "choices": ["Sand Village", "Leaf Village", "Mist Village", "Cloud Village"], "answer": 1, "cat": "anime"},
+    {"q": "In Death Note, who is the detective opposing Light Yagami?", "choices": ["Near", "Mello", "L", "Ryuk"], "answer": 2, "cat": "anime"},
+    {"q": "What alias does Light Yagami use as a vigilante in Death Note?", "choices": ["Shinigami", "Kira", "Yagami", "Raito"], "answer": 1, "cat": "anime"},
+    {"q": "In My Hero Academia, what term describes a superpower?", "choices": ["Nen", "Quirk", "Semblance", "Stand"], "answer": 1, "cat": "anime"},
+    {"q": "Who is known as the Symbol of Peace in My Hero Academia?", "choices": ["All Might", "Endeavor", "Deku", "Aizawa"], "answer": 0, "cat": "anime"},
+    {"q": "What are the names of the two brothers in Fullmetal Alchemist?", "choices": ["Edward and Alphonse", "Naruto and Sasuke", "Ichigo and Renji", "Light and Ryuk"], "answer": 0, "cat": "anime"},
+    {"q": "In Dragon Ball, what alien race is Goku?", "choices": ["Namekian", "Saiyan", "Android", "Majin"], "answer": 1, "cat": "anime"},
+    {"q": "In Jujutsu Kaisen, what does Yuji Itadori consume that binds him to a curse?", "choices": ["A finger", "A tooth", "An eye", "A hand"], "answer": 0, "cat": "anime"},
+    {"q": "In Tokyo Ghoul, what are the flesh-eating creatures called?", "choices": ["Titans", "Ghouls", "Hollows", "Demons"], "answer": 1, "cat": "anime"},
+    {"q": "In Sword Art Online, what happens if a player dies inside the game?", "choices": ["They respawn", "They lose items", "They die in real life", "Nothing happens"], "answer": 2, "cat": "anime"},
+    {"q": "What exam kicks off the early plot of Hunter x Hunter?", "choices": ["Chunin Exam", "Hunter Exam", "S-Class Trial", "Shinobi Trial"], "answer": 1, "cat": "anime"},
+    {"q": "What is the name of the protagonist in One Punch Man?", "choices": ["Saitama", "Genos", "Mob", "Bang"], "answer": 0, "cat": "anime"},
+    {"q": "In Bleach, what are the evil spirit enemies called?", "choices": ["Hollows", "Ghouls", "Titans", "Arrancar only"], "answer": 0, "cat": "anime"},
+    {"q": "What is the name of the ship in Cowboy Bebop?", "choices": ["Bebop", "Serenity", "Nostromo", "Andromeda"], "answer": 0, "cat": "anime"},
+    {"q": "In Spy x Family, what is Loid Forger's spy codename?", "choices": ["Shadow", "Twilight", "Phantom", "Eclipse"], "answer": 1, "cat": "anime"},
+    {"q": "What is the protagonist's name in Chainsaw Man?", "choices": ["Denji", "Aki", "Power", "Makima"], "answer": 0, "cat": "anime"},
+    {"q": "What is Shigeo Kageyama better known as in Mob Psycho 100?", "choices": ["Reigen", "Mob", "Dimple", "Ritsu"], "answer": 1, "cat": "anime"},
+    {"q": "What type of sword do Demon Slayer Corps members use?", "choices": ["Katana", "Nichirin Blade", "Zanpakuto", "Nodachi only"], "answer": 1, "cat": "anime"},
+    {"q": "What is the outermost of the three walls in Attack on Titan?", "choices": ["Wall Sina", "Wall Rose", "Wall Maria", "Wall Titan"], "answer": 2, "cat": "anime"},
+    {"q": "What are the nine tailed beasts collectively called in Naruto?", "choices": ["Bijuu", "Akatsuki", "Sannin", "Kage"], "answer": 0, "cat": "anime"},
+    {"q": "What is the legendary treasure everyone searches for in One Piece called?", "choices": ["The One Piece", "Poneglyph", "Road Log", "Devil Fruit"], "answer": 0, "cat": "anime"},
+    {"q": "In Death Note, what supernatural being drops the notebook?", "choices": ["A demon", "A shinigami", "A ghost", "An angel"], "answer": 1, "cat": "anime"},
+
+    # -- gaming ---------------------------------------------------------------
+    {"q": "In Minecraft, what do you need to craft a Nether Portal?", "choices": ["Iron blocks", "Obsidian", "Netherite", "Cobblestone"], "answer": 1, "cat": "gaming"},
+    {"q": "What was the first battle royale game to hit mainstream popularity?", "choices": ["Apex Legends", "Fortnite", "PUBG", "Warzone"], "answer": 2, "cat": "gaming"},
+    {"q": "In gaming slang, what does 'GG' stand for?", "choices": ["Great Game", "Go Get", "Good Game", "Game Grid"], "answer": 2, "cat": "gaming"},
+    {"q": "What does 'nerfed' mean when talking about a game update?", "choices": ["Made stronger", "Made weaker", "Removed entirely", "Made faster"], "answer": 1, "cat": "gaming"},
+    {"q": "Which company created The Legend of Zelda series?", "choices": ["Sega", "Nintendo", "Capcom", "Square Enix"], "answer": 1, "cat": "gaming"},
+    {"q": "Which company makes the PlayStation console?", "choices": ["Microsoft", "Nintendo", "Sony", "Sega"], "answer": 2, "cat": "gaming"},
+    {"q": "What does 'AFK' stand for?", "choices": ["Away From Keyboard", "Always Fully Known", "Attack From Kill", "Away For Kicks"], "answer": 0, "cat": "gaming"},
+    {"q": "What does 'NPC' stand for?", "choices": ["Non-Player Character", "New Player Class", "Network Player Code", "Non-Playable Client"], "answer": 0, "cat": "gaming"},
+    {"q": "Which studio developed Minecraft?", "choices": ["Mojang", "Valve", "Epic Games", "Rockstar"], "answer": 0, "cat": "gaming"},
+    {"q": "What does 'DLC' stand for?", "choices": ["Downloadable Content", "Direct Live Connection", "Digital License Code", "Default Level Class"], "answer": 0, "cat": "gaming"},
+    {"q": "Which game features the character Master Chief?", "choices": ["Halo", "Gears of War", "Destiny", "Doom"], "answer": 0, "cat": "gaming"},
+    {"q": "What in-game currency is used in Fortnite's item shop?", "choices": ["V-Bucks", "Robux", "Gold", "Credits"], "answer": 0, "cat": "gaming"},
+    {"q": "What does 'MMORPG' stand for?", "choices": [
+        "Massively Multiplayer Online Role-Playing Game", "Multi-Mode Online RPG", "Massive Multiplayer Overworld RPG", "Main Menu Online Role-Playing Game"
+    ], "answer": 0, "cat": "gaming"},
+
+    # -- sports -----------------------------------------------------------------
     {"q": "In football (soccer), how many players per team are on the pitch at once?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports"},
     {"q": "How many points is a touchdown worth in American football (before extra point/conversion)?", "choices": ["5", "6", "7", "3"], "answer": 1, "cat": "sports"},
     {"q": "Which country has won the most FIFA World Cups?", "choices": ["Germany", "Argentina", "Brazil", "Italy"], "answer": 2, "cat": "sports"},
+    {"q": "How many Grand Slam tournaments are there in tennis each year?", "choices": ["2", "3", "4", "5"], "answer": 2, "cat": "sports"},
+    {"q": "How many players are on an NBA basketball court per team at once?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports"},
+    {"q": "What sport uses a shuttlecock?", "choices": ["Tennis", "Squash", "Badminton", "Table Tennis"], "answer": 2, "cat": "sports"},
+    {"q": "In cricket, how many players are on a team?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports"},
+    {"q": "What is the maximum possible score in ten-pin bowling?", "choices": ["100", "200", "300", "500"], "answer": 2, "cat": "sports"},
+    {"q": "How many rings are on the Olympic flag?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports"},
+
+    # -- movies -------------------------------------------------------------
+    {"q": "Who directed the movie 'Inception'?", "choices": ["Steven Spielberg", "James Cameron", "Christopher Nolan", "Denis Villeneuve"], "answer": 2, "cat": "movies"},
+    {"q": "Which movie won the Academy Award for Best Picture in 2020 (for 2019 films)?", "choices": ["1917", "Joker", "Parasite", "Once Upon a Time in Hollywood"], "answer": 2, "cat": "movies"},
+    {"q": "Who played Iron Man in the Marvel Cinematic Universe?", "choices": ["Chris Evans", "Chris Hemsworth", "Robert Downey Jr.", "Mark Ruffalo"], "answer": 2, "cat": "movies"},
+    {"q": "Which movie features the line 'I'll be back'?", "choices": ["RoboCop", "The Terminator", "Predator", "Total Recall"], "answer": 1, "cat": "movies"},
+    {"q": "Who directed both Jaws and E.T.?", "choices": ["George Lucas", "Steven Spielberg", "Ridley Scott", "James Cameron"], "answer": 1, "cat": "movies"},
+    {"q": "Which studio produces the Toy Story franchise?", "choices": ["DreamWorks", "Illumination", "Pixar", "Blue Sky Studios"], "answer": 2, "cat": "movies"},
+    {"q": "What color is Shrek?", "choices": ["Blue", "Green", "Purple", "Brown"], "answer": 1, "cat": "movies"},
+    {"q": "Which fictional school does Harry Potter attend?", "choices": ["Hogwarts", "Camp Half-Blood", "Xavier's School", "Brakebills"], "answer": 0, "cat": "movies"},
+
+    # -- internet / meme culture ---------------------------------------------
+    {"q": "What does 'GOAT' mean in internet slang?", "choices": ["Great Or Awful Time", "Greatest Of All Time", "Game Over And Terminated", "Getting Older And Tired"], "answer": 1, "cat": "internet"},
+    {"q": "What's the internet slang term for a message someone regrets sending?", "choices": ["L take", "Ratio", "Delete this", "Cringe"], "answer": 3, "cat": "internet"},
+    {"q": "Which streaming platform is Discord most commonly used alongside for gaming communities?", "choices": ["Netflix", "Twitch", "Hulu", "Disney+"], "answer": 1, "cat": "internet"},
+    {"q": "What does 'IRL' stand for?", "choices": ["In Real Life", "I Really Like", "Internet Relay Log", "Is Really Legit"], "answer": 0, "cat": "internet"},
+    {"q": "What does 'FOMO' stand for?", "choices": ["Fear Of Missing Out", "Focus On My Own", "Fear Of Moving On", "Fun Only Matters Once"], "answer": 0, "cat": "internet"},
+    {"q": "What does 'TL;DR' mean?", "choices": ["Too Long; Didn't Read", "Talk Later; Did Reply", "Time Left; Day Remaining", "This Line Doesn't Register"], "answer": 0, "cat": "internet"},
+    {"q": "What does 'POV' stand for in a meme/video caption?", "choices": ["Point Of View", "Power Of Video", "Play On Voice", "Post Of the Various"], "answer": 0, "cat": "internet"},
+    {"q": "Which platform popularized the 'For You Page'?", "choices": ["Instagram", "TikTok", "Snapchat", "YouTube"], "answer": 1, "cat": "internet"},
+
+    # -- general knowledge ----------------------------------------------------
     {"q": "What is the capital of Japan?", "choices": ["Osaka", "Kyoto", "Tokyo", "Nagoya"], "answer": 2, "cat": "general"},
     {"q": "What is the largest planet in our solar system?", "choices": ["Saturn", "Jupiter", "Neptune", "Uranus"], "answer": 1, "cat": "general"},
     {"q": "Which element has the chemical symbol 'Fe'?", "choices": ["Fluorine", "Iron", "Francium", "Ferrite"], "answer": 1, "cat": "general"},
-    {"q": "Who directed the movie 'Inception'?", "choices": ["Steven Spielberg", "James Cameron", "Christopher Nolan", "Denis Villeneuve"], "answer": 2, "cat": "movies"},
-    {"q": "Which movie won the Academy Award for Best Picture in 2020 (for 2019 films)?", "choices": ["1917", "Joker", "Parasite", "Once Upon a Time in Hollywood"], "answer": 2, "cat": "movies"},
-    {"q": "In gaming slang, what does 'GG' stand for?", "choices": ["Great Game", "Go Get", "Good Game", "Game Grid"], "answer": 2, "cat": "gaming"},
-    {"q": "What does 'nerfed' mean when talking about a game update?", "choices": ["Made stronger", "Made weaker", "Removed entirely", "Made faster"], "answer": 1, "cat": "gaming"},
-    {"q": "Which streaming platform is Discord most commonly used alongside for gaming communities?", "choices": ["Netflix", "Twitch", "Hulu", "Disney+"], "answer": 1, "cat": "internet"},
-    {"q": "In Naruto, what village is Naruto from?", "choices": ["Sand Village", "Leaf Village", "Mist Village", "Cloud Village"], "answer": 1, "cat": "anime"},
-    {"q": "How many Grand Slam tournaments are there in tennis each year?", "choices": ["2", "3", "4", "5"], "answer": 2, "cat": "sports"},
+    {"q": "What is the smallest planet in our solar system?", "choices": ["Mars", "Mercury", "Venus", "Pluto"], "answer": 1, "cat": "general"},
+    {"q": "Which ocean is the largest by area?", "choices": ["Atlantic", "Indian", "Arctic", "Pacific"], "answer": 3, "cat": "general"},
+    {"q": "What is the hardest naturally occurring substance on Earth?", "choices": ["Quartz", "Diamond", "Titanium", "Granite"], "answer": 1, "cat": "general"},
+    {"q": "How many continents are there?", "choices": ["5", "6", "7", "8"], "answer": 2, "cat": "general"},
+    {"q": "What is the official currency of Japan?", "choices": ["Won", "Yuan", "Yen", "Ringgit"], "answer": 2, "cat": "general"},
+
+    # -- music (new category) -------------------------------------------------
+    {"q": "Which artist is known as the 'King of Pop'?", "choices": ["Prince", "Elvis Presley", "Michael Jackson", "Stevie Wonder"], "answer": 2, "cat": "music"},
+    {"q": "How many strings does a standard acoustic guitar have?", "choices": ["4", "5", "6", "7"], "answer": 2, "cat": "music"},
+    {"q": "Which British band performed 'Bohemian Rhapsody'?", "choices": ["The Beatles", "Queen", "Led Zeppelin", "Pink Floyd"], "answer": 1, "cat": "music"},
+    {"q": "How many keys does a standard piano have?", "choices": ["76", "88", "96", "100"], "answer": 1, "cat": "music"},
+    {"q": "Which streaming platform's logo is a green circle with sound bars?", "choices": ["Apple Music", "SoundCloud", "Spotify", "Tidal"], "answer": 2, "cat": "music"},
+
+    # -- science (new category) -------------------------------------------------
+    {"q": "What is the chemical formula for water?", "choices": ["CO2", "H2O", "O2", "NaCl"], "answer": 1, "cat": "science"},
+    {"q": "Which planet is known as the Red Planet?", "choices": ["Venus", "Jupiter", "Mars", "Saturn"], "answer": 2, "cat": "science"},
+    {"q": "What gas do plants absorb from the atmosphere for photosynthesis?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], "answer": 2, "cat": "science"},
+    {"q": "Roughly how fast does light travel in a vacuum?", "choices": ["3,000 km/s", "30,000 km/s", "300,000 km/s", "3,000,000 km/s"], "answer": 2, "cat": "science"},
+    {"q": "Which part of a cell contains its genetic material?", "choices": ["Mitochondria", "Nucleus", "Cytoplasm", "Ribosome"], "answer": 1, "cat": "science"},
 ]
+
 
 
 class TriviaAnswerButton(discord.ui.Button):
@@ -437,6 +517,11 @@ class Games(commands.Cog):
         self.bot = bot
         self.active_guess_games: dict[int, GuessNumberGame] = {}
         self.active_trivia_channels: set[int] = set()
+        # channel_id -> deque of recently-asked question texts, so back-to-back
+        # /trivia rounds in the same channel don't immediately repeat — this
+        # was the exact issue reported (small pool meant round 2 restarted
+        # with the same 3 questions as round 1).
+        self.recent_trivia_questions: dict[int, collections.deque] = {}
 
     # -- Tic Tac Toe --------------------------------------------------------
 
@@ -635,6 +720,8 @@ class Games(commands.Cog):
         app_commands.Choice(name="Sports", value="sports"),
         app_commands.Choice(name="Movies", value="movies"),
         app_commands.Choice(name="Internet culture", value="internet"),
+        app_commands.Choice(name="Music", value="music"),
+        app_commands.Choice(name="Science", value="science"),
     ])
     async def trivia(
         self,
@@ -652,8 +739,35 @@ class Games(commands.Cog):
         if not pool:
             await interaction.response.send_message("No questions in that category yet.", ephemeral=True)
             return
+        rounds = min(rounds, len(pool))
 
-        questions = random.sample(pool, k=min(rounds, len(pool)))
+        # Avoid repeating whatever this channel was just asked. If the
+        # category's pool is too small to fill the round without dipping into
+        # recent questions, top off from the full pool rather than erroring —
+        # a slightly-sooner repeat beats not being able to run trivia at all.
+        recent = self.recent_trivia_questions.get(interaction.channel_id, collections.deque())
+        fresh_pool = [q for q in pool if q["q"] not in recent]
+        if len(fresh_pool) >= rounds:
+            questions = random.sample(fresh_pool, k=rounds)
+        else:
+            questions = fresh_pool + random.sample(
+                [q for q in pool if q not in fresh_pool], k=min(rounds - len(fresh_pool), len(pool) - len(fresh_pool))
+            )
+            random.shuffle(questions)
+
+        # Remember these so the next round (in this channel) skips them too.
+        # Window sized relative to the full bank so small category filters
+        # don't lock themselves out of their own (smaller) pool.
+        window_size = max(rounds, min(60, len(TRIVIA_BANK) - 5))
+        recent_deque = self.recent_trivia_questions.setdefault(
+            interaction.channel_id, collections.deque(maxlen=window_size)
+        )
+        if recent_deque.maxlen != window_size:
+            recent_deque = collections.deque(recent_deque, maxlen=window_size)
+            self.recent_trivia_questions[interaction.channel_id] = recent_deque
+        for q in questions:
+            recent_deque.append(q["q"])
+
         self.active_trivia_channels.add(interaction.channel_id)
         scoreboard: dict[int, int] = {}
 
