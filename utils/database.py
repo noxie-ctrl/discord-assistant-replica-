@@ -477,6 +477,34 @@ async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
         return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
 
 
+# Trivia difficulty progression — driven entirely by the existing game_stats
+# "wins" count for game='trivia' (already incremented on every correct answer
+# via record_game_result), so no schema migration needed. Thresholds tuned so
+# progression feels earned but reachable within a normal play session or two,
+# not something that takes weeks.
+TRIVIA_LEVEL_THRESHOLDS = [
+    (30, "hard"),
+    (10, "medium"),
+    (0, "easy"),
+]
+
+
+def get_trivia_level(correct_count: int) -> str:
+    for threshold, label in TRIVIA_LEVEL_THRESHOLDS:
+        if correct_count >= threshold:
+            return label
+    return "easy"
+
+
+def trivia_next_level_info(correct_count: int) -> tuple[str | None, int]:
+    """Returns (next_level_name, correct_answers_still_needed), or (None, 0)
+    if already at the top tier."""
+    for threshold, label in reversed(TRIVIA_LEVEL_THRESHOLDS):
+        if correct_count < threshold:
+            return label, threshold - correct_count
+    return None, 0
+
+
 # ---------------------------------------------------------------------------
 # Cross-channel continuity — so switching channels doesn't reset context
 # ---------------------------------------------------------------------------

@@ -803,18 +803,20 @@ class Games(commands.Cog):
         # Exact difficulty match first; if that's too thin (a filtered
         # category might not have many "hard" entries yet), broaden to
         # easier tiers rather than failing outright — same fallback
-        # philosophy as the repeat-avoidance logic below.
+        # philosophy as the repeat-avoidance logic below. actual_tier tracks
+        # whichever tier we actually land on, since it can differ from what
+        # was requested when a category doesn't have that tier populated yet.
         DIFFICULTY_FALLBACK = {"hard": ["hard", "medium", "easy"], "medium": ["medium", "easy"], "easy": ["easy"]}
         pool = []
+        actual_tier = effective_level
         for tier in DIFFICULTY_FALLBACK.get(effective_level, ["easy"]):
-            pool = [q for q in category_pool if q["diff"] == tier]
-            if len(pool) >= rounds:
+            candidate = [q for q in category_pool if q["diff"] == tier]
+            if candidate:
+                pool, actual_tier = candidate, tier
+            if len(candidate) >= rounds:
                 break
-            # keep the largest tier seen so far as a fallback if none hit `rounds`
-            if not pool:
-                continue
         if not pool:
-            pool = category_pool  # last resort: any difficulty in this category
+            pool, actual_tier = category_pool, "mixed"
         rounds = min(rounds, len(pool))
 
         # Avoid repeating whatever this channel was just asked. If the
@@ -847,7 +849,9 @@ class Games(commands.Cog):
         self.active_trivia_channels.add(interaction.channel_id)
         scoreboard: dict[int, int] = {}
 
-        level_note = f" — {effective_level} tier" if level_value == "auto" else ""
+        level_note = f" — {actual_tier} tier" if actual_tier != "mixed" else ""
+        if actual_tier != effective_level and effective_level != "auto":
+            level_note += f" (not enough '{effective_level}' questions here yet, so this is {actual_tier})"
         await interaction.response.send_message(
             f"🧠 Trivia time{level_note} — {len(questions)} question(s), first correct answer wins each round. Go!"
         )
