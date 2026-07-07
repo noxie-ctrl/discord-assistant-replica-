@@ -516,6 +516,11 @@ class TriviaRoundView(discord.ui.View):
         self.scoreboard = scoreboard
         self.winner: discord.Member | None = None
         self.resolved = asyncio.Event()
+        # Tracks who's already answered wrong on THIS question, so a miss is
+        # only recorded once per person (not once per click) — stops someone
+        # from spam-clicking wrong answers to pad their loss count, while
+        # still letting them keep guessing other options for the round.
+        self.wrong_users: set[int] = set()
         labels = ["🇦", "🇧", "🇨", "🇩"]
         for i, choice in enumerate(question["choices"]):
             self.add_item(TriviaAnswerButton(f"{labels[i]} {choice}", i))
@@ -526,7 +531,15 @@ class TriviaRoundView(discord.ui.View):
             return
 
         if index != self.question["answer"]:
-            await interaction.response.send_message("Nope — try another option.", ephemeral=True)
+            if interaction.user.id not in self.wrong_users:
+                self.wrong_users.add(interaction.user.id)
+                await db.record_game_result(self.guild_id, interaction.user.id, "trivia", "loss")
+                await interaction.response.send_message("Nope — try another option.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "Already marked wrong on this one — let someone else take a shot, or wait for the next question.",
+                    ephemeral=True,
+                )
             return
 
         self.winner = interaction.user
