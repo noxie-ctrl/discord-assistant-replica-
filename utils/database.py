@@ -224,6 +224,22 @@ async def update_guild_setting(guild_id: int, **kwargs):
 # Personality
 # ---------------------------------------------------------------------------
 
+def _load_default_personality() -> dict:
+    """personality_default.json is meant to be the single source of truth for
+    a fresh personality. Previously new rows were seeded from this table's
+    bare SQL column DEFAULTs instead (which don't match the JSON file, and
+    silently drift from it), so a brand-new guild's very first message used a
+    different, thinner personality than /resetpersonality would give it.
+    This makes both paths read from the same file."""
+    import json
+    try:
+        with open(DEFAULT_PERSONALITY_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Could not load personality_default.json, falling back to bare row.")
+        return {}
+
+
 async def get_personality(guild_id: int) -> dict:
     pool = _require_pool()
     async with pool.acquire() as conn:
@@ -231,10 +247,22 @@ async def get_personality(guild_id: int) -> dict:
             "SELECT * FROM personality WHERE guild_id = $1", guild_id
         )
         if row is None:
+            defaults = _load_default_personality()
             await conn.execute(
-                "INSERT INTO personality (guild_id) VALUES ($1) "
-                "ON CONFLICT (guild_id) DO NOTHING",
+                """
+                INSERT INTO personality (guild_id, name, age, pronouns, role, traits, backstory, speaking_style, boundaries)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (guild_id) DO NOTHING
+                """,
                 guild_id,
+                defaults.get("name", "Lucy"),
+                defaults.get("age", "21"),
+                defaults.get("pronouns", "she/her"),
+                defaults.get("role", "Server admin assistant & friend to everyone here"),
+                defaults.get("traits", ""),
+                defaults.get("backstory", ""),
+                defaults.get("speaking_style", ""),
+                defaults.get("boundaries", ""),
             )
             row = await conn.fetchrow(
                 "SELECT * FROM personality WHERE guild_id = $1", guild_id

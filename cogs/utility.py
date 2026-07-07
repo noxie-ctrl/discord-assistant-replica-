@@ -168,22 +168,22 @@ class Utility(commands.Cog):
         embed.set_thumbnail(url=member.display_avatar.url)
         await interaction.response.send_message(embed=embed)
 
+    # ---------- OPENROUTER VISION TEST ----------
+    @app_commands.command(name="describeimage", description="(Admin) Describe an image URL using OpenRouter (for testing)")
+    @is_admin_or_mod()
+    async def describeimage(self, interaction: discord.Interaction, image_url: str):
+        await interaction.response.defer()
+        from utils import openrouter_client
+        if not openrouter_client.is_configured():
+            await interaction.followup.send("OpenRouter is not configured on this instance.", ephemeral=True)
+            return
+        try:
+            desc = await openrouter_client.describe_images([image_url])
+        except Exception as e:
+            await interaction.followup.send(f"Image description failed: {e}")
+            return
+        await interaction.followup.send(f"Image description:\n{desc}")
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Utility(bot))
-
-
-@app_commands.command(name="describeimage", description="(Admin) Describe an image URL using OpenRouter (for testing)")
-@is_admin_or_mod()
-async def describeimage(interaction: discord.Interaction, image_url: str):
-    await interaction.response.defer()
-    from utils import openrouter_client
-    if not openrouter_client.is_configured():
-        await interaction.followup.send("OpenRouter is not configured on this instance.", ephemeral=True)
-        return
-    try:
-        desc = await openrouter_client.describe_images([image_url])
-    except Exception as e:
-        await interaction.followup.send(f"Image description failed: {e}")
-        return
-    await interaction.followup.send(f"Image description:\n{desc}")

@@ -37,14 +37,18 @@ OWNER_ID=1462759265864519722
 DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
 ```
 
-Optional OpenRouter (vision + fallback):
+Optional OpenRouter (vision + 4th-tier main-chat fallback):
 ```
 OPENROUTER_API_KEY=...       # your primary OpenRouter key (optional)
 OPENROUTER_API_KEY_2=...     # optional secondary key for redundancy
-OPENROUTER_MODEL=...         # optional model override (defaults provided in code)
+OPENROUTER_MODEL=...         # optional: pin a specific model instead of the default free router
 ```
-If you don't set OpenRouter keys, the image-understanding features stay off and Lucy
-will still work normally.
+Defaults to `openrouter/free` — OpenRouter's own free-model router, which auto-selects a
+currently-free model (including a vision-capable one when the request has an image) at
+$0/token, no credits required. Free model *names* on OpenRouter rotate often, so this
+avoids pinning one that goes stale; set `OPENROUTER_MODEL` if you'd rather pin something
+specific. If you don't set OpenRouter keys, vision and the 4th fallback tier stay off and
+Lucy still works normally on NIM + Groq.
 
 Testing the vision feature locally
 ---------------------------------
@@ -83,6 +87,10 @@ python main.py
 ## 6. Configure Lucy in your server
 Run these once, in Discord:
 - `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
+- `/resetpersonality` — reset to `personality_default.json`. Since your server already has
+  a saved personality row, editing `personality_default.json` alone won't change how Lucy
+  talks on your existing server — run this once after a deploy that changes the default to
+  actually apply it (new servers get the current default automatically on first message).
 - `/profile` — view Lucy's current profile
 - `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
 - `/setchatchannel` — pick her dedicated chat channel (if using that mode)
@@ -109,9 +117,12 @@ Run these once, in Discord:
   `/balance`, `/leaderboard`, `/gamestats`.
 - **Personality:** fully editable per-server via slash commands, no code editing needed.
 
-## Two-engine model
+## Engines
 - **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
   → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
 - **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
   the news digest and emergency main-chat fallback) round-robins across your two keys so a
   single key's rate limit doesn't stall anything.
+- **OpenRouter** (optional) handles vision, and is the 4th-tier main-chat fallback — tried
+  only if every NIM candidate *and* Groq have failed, so a simultaneous NIM+Groq outage
+  still doesn't take Lucy fully offline.

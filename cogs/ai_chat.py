@@ -284,7 +284,7 @@ class AIChat(commands.Cog):
                 continue
 
             try:
-                await channel.send("quiet in here, huh. staying on the radar.")
+                await channel.send("it's quiet in here today — how's everyone doing?")
                 self._last_idle_chatter_at[channel.id] = now_ts
             except discord.HTTPException:
                 logger.debug("Idle chatter failed for %s", channel.id)

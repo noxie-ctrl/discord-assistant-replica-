@@ -15,6 +15,7 @@ errors when the external APIs are not available.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import itertools
 import logging
@@ -26,8 +27,15 @@ import aiohttp
 logger = logging.getLogger("lucy.openrouter")
 
 OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
-DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", DEFAULT_CHAT_MODEL)
+# "openrouter/free" is OpenRouter's own free-model router, not a single pinned
+# model: it auto-selects from whatever's currently free (including vision-
+# capable models when the request includes an image), at $0/token. Free
+# model *names* rotate constantly (things lose :free status without notice),
+# so pinning a specific one here would go stale — this router sidesteps that
+# and never requires OpenRouter credits. Override via env var if you want a
+# specific pinned model instead (e.g. a paid one for quality).
+DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openrouter/free")
 
 _key_cycle = None
 

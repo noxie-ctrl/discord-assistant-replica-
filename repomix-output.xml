@@ -50,12 +50,16 @@ cogs/
   preferences.py
   serverlog.py
   utility.py
+tests/
+  test_ai_chat_helpers.py
+  test_openrouter_client.py
 utils/
   __init__.py
   awareness.py
   database.py
   groq_client.py
   nim_client.py
+  openrouter_client.py
   permissions.py
 .gitignore
 main.py
@@ -577,6 +581,33 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(ServerLog(bot))
 </file>
 
+<file path="tests/test_ai_chat_helpers.py">
+import unittest
+
+from cogs.ai_chat import maybe_suggest_channel_redirection
+
+
+class ChannelAwarenessTests(unittest.TestCase):
+    def test_detects_off_topic_vent_in_memes_channel(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="Memes and random fun",
+            content="I feel like I am falling apart and need someone to talk to",
+        )
+        self.assertIsNotNone(suggestion)
+        self.assertIn("vent", suggestion.lower())
+
+    def test_ignores_on_topic_content(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="General chat and casual conversation",
+            content="How was your day?",
+        )
+        self.assertIsNone(suggestion)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
 <file path="utils/__init__.py">
 
 </file>
@@ -832,6 +863,33 @@ def is_configured() -> bool:
 worker: python main.py
 </file>
 
+<file path="tests/test_openrouter_client.py">
+import os
+import unittest
+
+from utils import openrouter_client
+
+
+class OpenRouterClientTests(unittest.TestCase):
+    def test_is_configured_false_by_default(self):
+        # Ensure no OPENROUTER_API_KEY env vars are set in this test
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY_2", None)
+        self.assertFalse(openrouter_client.is_configured())
+
+    def test_describe_images_raises_when_not_configured(self):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY_2", None)
+        with self.assertRaises(RuntimeError):
+            # Should raise because no key configured
+            import asyncio
+            asyncio.run(openrouter_client.describe_images(["https://example.com/image.png"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
 <file path="utils/permissions.py">
 import os
 import discord
@@ -870,11 +928,6 @@ def is_owner_only():
     return app_commands.check(predicate)
 </file>
 
-<file path=".gitignore">
-.env
-data/
-</file>
-
 <file path="personality_default.json">
 {
   "name": "Lucy",
@@ -893,6 +946,212 @@ discord.py>=2.4.0
 aiohttp>=3.9.0
 asyncpg>=0.29.0
 python-dotenv>=1.0.0
+</file>
+
+<file path="utils/openrouter_client.py">
+"""OpenRouter client utilities.
+
+Provides a thin wrapper around OpenRouter's chat/completions API for two
+purposes used in this project:
+- `call_openrouter`: generic chat-style calls used for fallback text tasks.
+- `describe_images`: a vision-oriented helper that accepts a list of image URLs
+  and returns a short plain-language description. Results are cached in the
+  project's Postgres DB (if configured) to avoid repeated API calls for the
+  same images.
+
+This module is deliberately lightweight and defensive: missing env keys or a
+missing DB do not cause import-time failures; callers must handle runtime
+errors when the external APIs are not available.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import logging
+import os
+from typing import Any, Dict, List
+
+import aiohttp
+
+logger = logging.getLogger("lucy.openrouter")
+
+OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", DEFAULT_CHAT_MODEL)
+
+_key_cycle = None
+
+
+class _RateLimited(Exception):
+    """Raised when an OpenRouter key returns HTTP 429."""
+
+
+def _get_keys() -> List[str]:
+    keys = [
+        os.getenv("OPENROUTER_API_KEY", "").strip(),
+        os.getenv("OPENROUTER_API_KEY_2", "").strip(),
+    ]
+    return [k for k in keys if k]
+
+
+def _next_key_order() -> List[str]:
+    """Return available keys in round-robin order for load distribution."""
+    global _key_cycle
+    keys = _get_keys()
+    if not keys:
+        return []
+    if _key_cycle is None:
+        _key_cycle = itertools.cycle(range(len(keys)))
+    start = next(_key_cycle)
+    return keys[start:] + keys[:start]
+
+
+async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float,
+                    api_key: str, timeout_seconds: int = 12) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(OPENROUTER_API_URL, json=payload, headers=headers) as resp:
+            if resp.status == 429:
+                raise _RateLimited(f"OpenRouter key rate-limited on {model}")
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"OpenRouter {model} returned {resp.status}: {body[:300]}")
+            data = await resp.json()
+
+    try:
+        # Support typical OpenAI-compatible shape: choices[0].message.content
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError("OpenRouter returned an unexpected response shape") from e
+    if not content:
+        raise RuntimeError(f"OpenRouter {model} returned empty content")
+    return content
+
+
+async def call_openrouter(messages: List[Dict[str, Any]], model: str = DEFAULT_CHAT_MODEL,
+                          max_tokens: int = 400, temperature: float = 0.3,
+                          timeout_seconds: int = 12) -> str:
+    """Call OpenRouter with round-robin API key handling.
+
+    Raises RuntimeError if no keys configured or all keys fail.
+    """
+    keys = _next_key_order()
+    if not keys:
+        raise RuntimeError("No OPENROUTER_API_KEY configured.")
+
+    last_error: Exception | None = None
+    for key in keys:
+        try:
+            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
+        except asyncio.TimeoutError:
+            last_error = TimeoutError(f"OpenRouter {model} timed out")
+            logger.warning("OpenRouter key timed out on %s, trying next key if any", model)
+        except _RateLimited as e:
+            last_error = e
+            logger.warning("OpenRouter key rate-limited, trying next key if any")
+        except Exception as e:
+            last_error = e
+            logger.warning("OpenRouter call failed (%s), trying next key if any", e)
+
+    raise RuntimeError(f"All OpenRouter keys failed: {last_error}")
+
+
+def _make_cache_key(urls: List[str]) -> str:
+    """Create a deterministic short cache key for a list of image URLs."""
+    joined = "|".join(urls)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+async def describe_images(image_urls: List[str], prompt: str = "Describe the image(s) plainly and briefly.") -> str:
+    """Return a short description for the given image URLs.
+
+    Uses the DB cache if available, and stores results back into the cache.
+    Raises RuntimeError if the model signals the content is blocked.
+    """
+    if not image_urls:
+        return ""
+
+    cache_key = _make_cache_key(image_urls)
+    # Try cache (best-effort)
+    try:
+        from utils import database as db
+
+        cached = await db.get_image_description(cache_key)
+        if cached:
+            logger.debug("OpenRouter: cache hit for %s", cache_key)
+            return cached
+    except Exception:
+        cached = None
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You describe images for a Discord bot. Reply with a plain-language summary "
+                "of what the image contains, keeping it brief and factual. If the content is "
+                "safety-flagged or not appropriate to describe, respond with: SAFETY_BLOCKED"
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                *[
+                    {"type": "image_url", "image_url": {"url": url}}
+                    for url in image_urls
+                ],
+            ],
+        },
+    ]
+
+    result = await call_openrouter(messages, model=DEFAULT_VISION_MODEL, max_tokens=220, temperature=0.2)
+    if result.strip().upper() == "SAFETY_BLOCKED":
+        raise RuntimeError("OpenRouter safety blocked image description")
+    desc = result.strip()
+
+    # Store in cache (best-effort)
+    try:
+        from utils import database as db
+
+        await db.set_image_description(cache_key, desc)
+    except Exception:
+        logger.debug("OpenRouter: failed to write cache for %s", cache_key)
+
+    return desc
+
+
+def is_configured() -> bool:
+    """Return True if any OpenRouter key is configured."""
+    return bool(_get_keys())
+</file>
+
+<file path=".gitignore">
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+.DS_Store
+tests/__pycache__/
+utils/__pycache__/
+cogs/__pycache__/
+
+# keep the data folder tracked if you want, otherwise uncomment
+# data/
+data/
 </file>
 
 <file path="cogs/utility.py">
@@ -965,6 +1224,22 @@ class Utility(commands.Cog):
         await interaction.response.send_message(
             f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
             "like they need a check-in. She won't reply publicly there unless mentioned."
+        )
+
+    @app_commands.command(name="setchannelawareness", description="Toggle Lucy's verbal channel-redirection hints")
+    @is_admin_or_mod()
+    async def setchannelawareness(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, channel_redirection_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Channel-redirection hints are now {'on' if enabled else 'off'}."
+        )
+
+    @app_commands.command(name="setidlechatter", description="Toggle Lucy's low-key idle chatter in quiet chat channels")
+    @is_admin_or_mod()
+    async def setidlechatter(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, idle_chatter_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Idle chatter is now {'on' if enabled else 'off'}."
         )
 
     @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
@@ -1053,6 +1328,22 @@ class Utility(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Utility(bot))
+
+
+@app_commands.command(name="describeimage", description="(Admin) Describe an image URL using OpenRouter (for testing)")
+@is_admin_or_mod()
+async def describeimage(interaction: discord.Interaction, image_url: str):
+    await interaction.response.defer()
+    from utils import openrouter_client
+    if not openrouter_client.is_configured():
+        await interaction.followup.send("OpenRouter is not configured on this instance.", ephemeral=True)
+        return
+    try:
+        desc = await openrouter_client.describe_images([image_url])
+    except Exception as e:
+        await interaction.followup.send(f"Image description failed: {e}")
+        return
+    await interaction.followup.send(f"Image description:\n{desc}")
 </file>
 
 <file path="main.py">
@@ -1150,96 +1441,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-</file>
-
-<file path="README.md">
-# Lucy — Your Discord AI Assistant
-
-A Python Discord bot with a customizable AI personality (NVIDIA NIM as the main chat
-engine, Groq as a background/fallback engine), full moderation, server utilities, and
-mini-games. Both slash (`/`) and prefix (`!`) commands supported.
-
-## 1. Create the Discord bot
-1. Go to https://discord.com/developers/applications → **New Application**.
-2. Go to the **Bot** tab → click **Reset Token** → copy it (this is `DISCORD_TOKEN`).
-3. Under **Privileged Gateway Intents**, enable:
-   - Server Members Intent (required)
-   - Message Content Intent (required)
-4. Go to **OAuth2 → URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot permissions: `Administrator` (simplest for full-power admin bot)
-   - Copy the generated URL and open it to invite Lucy to your server.
-
-## 2. Get API keys (both free)
-- **NVIDIA NIM** (main chat engine): https://build.nvidia.com → sign in → **Get API Key**
-  → this is `NVIDIA_API_KEY`. Generous free tier; Lucy defaults to the strongest available
-  model (`mistralai/mistral-large-3-675b-instruct-2512`) with automatic fallback to two
-  other models if it's ever unavailable.
-- **Groq** (background tasks + emergency fallback): https://console.groq.com → **API Keys**
-  → create two keys, `GROQ_API_KEY_1` and `GROQ_API_KEY_2`. Groq is used for vent-channel
-  triage, long-term memory summarization, and the daily news digest — keeping that traffic
-  off the main NIM quota — and as a last-resort fallback for main chat if NIM is fully down.
-  Optional but recommended; Lucy works without it, just with less background-task headroom.
-
-## 3. Configure environment
-Copy `.env.example` to `.env` and fill in:
-```
-DISCORD_TOKEN=...
-NVIDIA_API_KEY=...
-GROQ_API_KEY_1=...
-GROQ_API_KEY_2=...
-OWNER_ID=1462759265864519722
-DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
-```
-
-## 4. Run locally (optional test)
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-## 5. Deploy free on Railway
-1. Push this folder to a GitHub repo.
-2. Go to https://railway.app → **New Project → Deploy from GitHub repo**.
-3. Add a Postgres plugin, and reference its `DATABASE_URL` on the worker service.
-4. Add the rest of the environment variables from `.env` in Railway's **Variables** tab.
-5. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
-
-## 6. Configure Lucy in your server
-Run these once, in Discord:
-- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
-- `/profile` — view Lucy's current profile
-- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
-- `/setchatchannel` — pick her dedicated chat channel (if using that mode)
-- `/setventchannel` — a channel she quietly watches, flagging the owner if someone seems
-  like they need real human support (not a public reply — a private heads-up)
-- `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
-- `/setlogchannel` — where moderation actions get logged
-- `/setwelcome` — welcome channel + message for new members
-
-## What's included
-- **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
-- **Utility:** welcome messages, role give/remove, ticket system, server/user info
-- **AI Chat:** Lucy talks like an active member of the server, not a generic assistant —
-  she adapts tone (banter vs. sincerity vs. Hinglish), has real opinions on niche/gaming/anime/
-  internet-culture topics, knows the current date/time in IST, and stays casually aware of
-  real current headlines. She naturally warms up to people over time (acquaintance → friend →
-  close friend → best friend, based on how much you've talked and how well it's gone), while
-  the owner always gets top priority and candor.
-- **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
-  to need a real person to check in — separate from normal banter/venting.
-- **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number
-  (solo / vs a member / vs Lucy), and Trivia (solo or open free-for-all, multiple categories
-  including gaming/anime/sports/internet culture) — all feeding a shared coin economy with
-  `/balance`, `/leaderboard`, `/gamestats`.
-- **Personality:** fully editable per-server via slash commands, no code editing needed.
-
-## Two-engine model
-- **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
-  → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
-- **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
-  the news digest and emergency main-chat fallback) round-robins across your two keys so a
-  single key's rate limit doesn't stall anything.
 </file>
 
 <file path="cogs/games.py">
@@ -2209,6 +2410,126 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Games(bot))
 </file>
 
+<file path="README.md">
+# Lucy — Your Discord AI Assistant
+
+A Python Discord bot with a customizable AI personality (NVIDIA NIM as the main chat
+engine, Groq as a background/fallback engine), full moderation, server utilities, and
+mini-games. Both slash (`/`) and prefix (`!`) commands supported.
+
+## 1. Create the Discord bot
+1. Go to https://discord.com/developers/applications → **New Application**.
+2. Go to the **Bot** tab → click **Reset Token** → copy it (this is `DISCORD_TOKEN`).
+3. Under **Privileged Gateway Intents**, enable:
+   - Server Members Intent (required)
+   - Message Content Intent (required)
+4. Go to **OAuth2 → URL Generator**:
+   - Scopes: `bot`, `applications.commands`
+   - Bot permissions: `Administrator` (simplest for full-power admin bot)
+   - Copy the generated URL and open it to invite Lucy to your server.
+
+## 2. Get API keys (both free)
+- **NVIDIA NIM** (main chat engine): https://build.nvidia.com → sign in → **Get API Key**
+  → this is `NVIDIA_API_KEY`. Generous free tier; Lucy defaults to the strongest available
+  model (`mistralai/mistral-large-3-675b-instruct-2512`) with automatic fallback to two
+  other models if it's ever unavailable.
+- **Groq** (background tasks + emergency fallback): https://console.groq.com → **API Keys**
+  → create two keys, `GROQ_API_KEY_1` and `GROQ_API_KEY_2`. Groq is used for vent-channel
+  triage, long-term memory summarization, and the daily news digest — keeping that traffic
+  off the main NIM quota — and as a last-resort fallback for main chat if NIM is fully down.
+  Optional but recommended; Lucy works without it, just with less background-task headroom.
+
+## 3. Configure environment
+Copy `.env.example` to `.env` and fill in:
+```
+DISCORD_TOKEN=...
+NVIDIA_API_KEY=...
+GROQ_API_KEY_1=...
+GROQ_API_KEY_2=...
+OWNER_ID=1462759265864519722
+DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
+```
+
+Optional OpenRouter (vision + fallback):
+```
+OPENROUTER_API_KEY=...       # your primary OpenRouter key (optional)
+OPENROUTER_API_KEY_2=...     # optional secondary key for redundancy
+OPENROUTER_MODEL=...         # optional model override (defaults provided in code)
+```
+If you don't set OpenRouter keys, the image-understanding features stay off and Lucy
+will still work normally.
+
+Testing the vision feature locally
+---------------------------------
+If you set `OPENROUTER_API_KEY` (and optionally `OPENROUTER_API_KEY_2`), you can test
+the image description path with the `/describeimage` admin command (works even if the
+bot isn't set to auto-describe attachments). Example:
+
+```
+# in Discord, as an admin or mod:
+/describeimage image_url:https://example.com/pic.jpg
+```
+
+Locally, run the bot in a venv and ensure env vars are set in your shell or `.env`:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+export OPENROUTER_API_KEY="your_key_here"
+python main.py
+```
+
+## 4. Run locally (optional test)
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+## 5. Deploy free on Railway
+1. Push this folder to a GitHub repo.
+2. Go to https://railway.app → **New Project → Deploy from GitHub repo**.
+3. Add a Postgres plugin, and reference its `DATABASE_URL` on the worker service.
+4. Add the rest of the environment variables from `.env` in Railway's **Variables** tab.
+5. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
+
+## 6. Configure Lucy in your server
+Run these once, in Discord:
+- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
+- `/profile` — view Lucy's current profile
+- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
+- `/setchatchannel` — pick her dedicated chat channel (if using that mode)
+- `/setventchannel` — a channel she quietly watches, flagging the owner if someone seems
+  like they need real human support (not a public reply — a private heads-up)
+- `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
+- `/setlogchannel` — where moderation actions get logged
+- `/setwelcome` — welcome channel + message for new members
+
+## What's included
+- **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
+- **Utility:** welcome messages, role give/remove, ticket system, server/user info
+- **AI Chat:** Lucy talks like an active member of the server, not a generic assistant —
+  she adapts tone (banter vs. sincerity vs. Hinglish), has real opinions on niche/gaming/anime/
+  internet-culture topics, knows the current date/time in IST, and stays casually aware of
+  real current headlines. She naturally warms up to people over time (acquaintance → friend →
+  close friend → best friend, based on how much you've talked and how well it's gone), while
+  the owner always gets top priority and candor.
+- **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
+  to need a real person to check in — separate from normal banter/venting.
+- **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number
+  (solo / vs a member / vs Lucy), and Trivia (solo or open free-for-all, multiple categories
+  including gaming/anime/sports/internet culture) — all feeding a shared coin economy with
+  `/balance`, `/leaderboard`, `/gamestats`.
+- **Personality:** fully editable per-server via slash commands, no code editing needed.
+
+## Two-engine model
+- **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
+  → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
+- **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
+  the news digest and emergency main-chat fallback) round-robins across your two keys so a
+  single key's rate limit doesn't stall anything.
+</file>
+
 <file path="utils/database.py">
 """
 utils/database.py
@@ -2245,7 +2566,9 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     chat_channel_id BIGINT,
     welcome_channel_id BIGINT,
     welcome_message TEXT,
-    vent_channel_id BIGINT
+    vent_channel_id BIGINT,
+    channel_redirection_enabled BOOLEAN DEFAULT TRUE,
+    idle_chatter_enabled BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS member_events (
@@ -2338,6 +2661,12 @@ CREATE TABLE IF NOT EXISTS economy (
 
 CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
     ON chat_memory (guild_id, channel_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS image_descriptions (
+    cache_key TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -2347,6 +2676,8 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
 """
 
 
@@ -2850,6 +3181,36 @@ async def get_recent_member_events(guild_id: int, limit: int = 15) -> list[dict]
             guild_id, limit,
         )
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Image description cache
+# ---------------------------------------------------------------------------
+
+async def get_image_description(cache_key: str) -> str | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT description FROM image_descriptions WHERE cache_key = $1",
+            cache_key,
+        )
+        return row["description"] if row else None
+
+
+async def set_image_description(cache_key: str, description: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO image_descriptions (cache_key, description) VALUES ($1, $2) "
+            "ON CONFLICT (cache_key) DO UPDATE SET description = EXCLUDED.description, created_at = now()",
+            cache_key,
+            description,
+        )
+
+
+def _normalize_cache_key(key: str) -> str:
+    """Internal normalizer for cache keys; kept small for future uses."""
+    return key.strip()
 </file>
 
 <file path="cogs/ai_chat.py">
@@ -2881,6 +3242,9 @@ import re
 import asyncio
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
@@ -2889,10 +3253,21 @@ from utils import database as db
 from utils import nim_client
 from utils import groq_client
 from utils import awareness
+from utils import openrouter_client
 
 logger = logging.getLogger("lucy.ai_chat")
 
 NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
+IDLE_CHATTER_INTERVAL_SECONDS = 4 * 60 * 60
+IDLE_CHATTER_START_HOUR_IST = 8
+IDLE_CHATTER_END_HOUR_IST = 23
+IST = ZoneInfo("Asia/Kolkata")
+DEFAULT_CHANNEL_REDIRECTION_HINTS = {
+    "vent": "a vent or support channel",
+    "memes": "a memes or fun channel",
+    "announcement": "an announcements channel",
+    "general": "a general chat channel",
+}
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
 OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
@@ -2900,6 +3275,21 @@ VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
+
+
+def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str) -> Optional[str]:
+    if not content:
+        return None
+    text = (content or "").strip().lower()
+    if len(text) < 12:
+        return None
+    if any(token in text for token in ["feel", "hurt", "panic", "suic", "die", "depressed", "alone", "breakdown"]):
+        if "meme" in (channel_topic or "").lower() or "fun" in (channel_topic or "").lower():
+            return "This sounds like it belongs in a vent or support channel rather than a memes/fun channel."
+    if any(token in text for token in ["announcement", "news", "update", "server", "important"]):
+        if "announcement" in (channel_topic or "").lower() or "news" in (channel_topic or "").lower():
+            return "This looks more like a discussion topic than an announcement post."
+    return None
 
 
 class AIChat(commands.Cog):
@@ -2911,6 +3301,10 @@ class AIChat(commands.Cog):
         self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
         # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
         self._last_alert: dict[tuple[int, int], float] = {}
+        # channel_id -> last time we saw a real message there
+        self._last_activity_at: dict[int, float] = {}
+        # channel_id -> last time we sent idle chatter there
+        self._last_idle_chatter_at: dict[int, float] = {}
         # channel_id -> last time we ran a vent-channel classification call
         self._last_vent_check: dict[int, float] = {}
 
@@ -2919,9 +3313,11 @@ class AIChat(commands.Cog):
         # already have it, then keep it refreshed in the background.
         asyncio.create_task(awareness.refresh_digest(force=True))
         self._news_refresh_loop.start()
+        self._idle_chatter_loop.start()
 
     async def cog_unload(self):
         self._news_refresh_loop.cancel()
+        self._idle_chatter_loop.cancel()
 
     @tasks.loop(hours=3)
     async def _news_refresh_loop(self):
@@ -2929,6 +3325,13 @@ class AIChat(commands.Cog):
             await awareness.refresh_digest()
         except Exception:
             logger.exception("Background news digest refresh failed")
+
+    @tasks.loop(minutes=15)
+    async def _idle_chatter_loop(self):
+        try:
+            await self._maybe_send_idle_chatter()
+        except Exception:
+            logger.exception("Idle chatter loop failed")
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -3044,9 +3447,15 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
+        self._last_activity_at[message.channel.id] = asyncio.get_event_loop().time()
         will_reply = await self._should_respond(message)
 
         settings = await db.get_guild_settings(message.guild.id)
+        if not will_reply and settings.get("channel_redirection_enabled"):
+            channel_topic = getattr(message.channel, "topic", "") or ""
+            suggestion = maybe_suggest_channel_redirection(channel_topic, message.content)
+            if suggestion and message.channel.id != settings.get("chat_channel_id"):
+                asyncio.create_task(self._maybe_redirect_channel(message, suggestion))
         vent_channel_id = settings.get("vent_channel_id")
         # Skip the separate classification pass if this message is about to go
         # through the full chat pipeline anyway — the flag_for_owner tool
@@ -3063,6 +3472,49 @@ class AIChat(commands.Cog):
         async with lock:
             async with message.channel.typing():
                 await self._handle_chat(message)
+
+    async def _maybe_send_idle_chatter(self):
+        now = datetime.now(timezone.utc).astimezone(IST)
+        if not (IDLE_CHATTER_START_HOUR_IST <= now.hour <= IDLE_CHATTER_END_HOUR_IST):
+            return
+
+        for guild in self.bot.guilds:
+            settings = await db.get_guild_settings(guild.id)
+            if not settings.get("idle_chatter_enabled"):
+                continue
+            channel_id = settings.get("chat_channel_id")
+            if not channel_id:
+                continue
+            channel = guild.get_channel(int(channel_id))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            if not channel.permissions_for(guild.me).send_messages:
+                continue
+
+            now_ts = asyncio.get_event_loop().time()
+            last_activity = self._last_activity_at.get(channel.id, 0.0)
+            last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
+            if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
+                continue
+            if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
+                continue
+
+            try:
+                await channel.send("quiet in here, huh. staying on the radar.")
+                self._last_idle_chatter_at[channel.id] = now_ts
+            except discord.HTTPException:
+                logger.debug("Idle chatter failed for %s", channel.id)
+
+    async def _maybe_redirect_channel(self, message: discord.Message, suggestion: str):
+        try:
+            if not message.channel.permissions_for(message.guild.me).send_messages:
+                return
+            await message.reply(
+                f"{suggestion} If you want, I can help you move it to a more fitting channel.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            logger.debug("Channel redirection hint failed for %s", message.id)
 
     async def _check_vent_message(self, message: discord.Message):
         """Lightweight, cheap classification pass — does NOT go through the
@@ -3223,6 +3675,30 @@ class AIChat(commands.Cog):
     # Main chat handling
     # -----------------------------------------------------------------
 
+    async def _maybe_attach_image_context(self, message: discord.Message, chat_messages: list[dict]) -> None:
+        if not openrouter_client.is_configured():
+            return
+        if not message.attachments:
+            return
+        if not any(att.content_type and att.content_type.startswith("image/") for att in message.attachments):
+            return
+        urls = []
+        for attachment in message.attachments:
+            if attachment.content_type and attachment.content_type.startswith("image/"):
+                urls.append(attachment.url)
+        if not urls:
+            return
+        try:
+            description = await openrouter_client.describe_images(urls)
+        except Exception as e:
+            logger.warning("Image description failed: %s", e)
+            return
+        if description:
+            chat_messages.append({
+                "role": "system",
+                "content": f"Image context from the message: {description}",
+            })
+
     async def _handle_chat(self, message: discord.Message):
         guild = message.guild
         author = message.author
@@ -3305,6 +3781,8 @@ class AIChat(commands.Cog):
             role = "assistant" if h["role"] == "assistant" else "user"
             prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
             chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
+
+        await self._maybe_attach_image_context(message, chat_messages)
 
         # 6. Call the model (semaphore-capped), with tool support
         try:
