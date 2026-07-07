@@ -46,6 +46,27 @@ OPENROUTER_MODEL=...         # optional model override (defaults provided in cod
 If you don't set OpenRouter keys, the image-understanding features stay off and Lucy
 will still work normally.
 
+Testing the vision feature locally
+---------------------------------
+If you set `OPENROUTER_API_KEY` (and optionally `OPENROUTER_API_KEY_2`), you can test
+the image description path with the `/describeimage` admin command (works even if the
+bot isn't set to auto-describe attachments). Example:
+
+```
+# in Discord, as an admin or mod:
+/describeimage image_url:https://example.com/pic.jpg
+```
+
+Locally, run the bot in a venv and ensure env vars are set in your shell or `.env`:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+export OPENROUTER_API_KEY="your_key_here"
+python main.py
+```
+
 ## 4. Run locally (optional test)
 ```bash
 pip install -r requirements.txt
