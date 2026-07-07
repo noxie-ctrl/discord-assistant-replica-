@@ -37,6 +37,15 @@ OWNER_ID=1462759265864519722
 DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
 ```
 
+Optional OpenRouter (vision + fallback):
+```
+OPENROUTER_API_KEY=...       # your primary OpenRouter key (optional)
+OPENROUTER_API_KEY_2=...     # optional secondary key for redundancy
+OPENROUTER_MODEL=...         # optional model override (defaults provided in code)
+```
+If you don't set OpenRouter keys, the image-understanding features stay off and Lucy
+will still work normally.
+
 ## 4. Run locally (optional test)
 ```bash
 pip install -r requirements.txt
