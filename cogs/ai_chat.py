@@ -26,6 +26,9 @@ import re
 import asyncio
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands, tasks
@@ -34,10 +37,21 @@ from utils import database as db
 from utils import nim_client
 from utils import groq_client
 from utils import awareness
+from utils import openrouter_client
 
 logger = logging.getLogger("lucy.ai_chat")
 
 NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
+IDLE_CHATTER_INTERVAL_SECONDS = 4 * 60 * 60
+IDLE_CHATTER_START_HOUR_IST = 8
+IDLE_CHATTER_END_HOUR_IST = 23
+IST = ZoneInfo("Asia/Kolkata")
+DEFAULT_CHANNEL_REDIRECTION_HINTS = {
+    "vent": "a vent or support channel",
+    "memes": "a memes or fun channel",
+    "announcement": "an announcements channel",
+    "general": "a general chat channel",
+}
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
 OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
@@ -45,6 +59,21 @@ VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
+
+
+def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str) -> Optional[str]:
+    if not content:
+        return None
+    text = (content or "").strip().lower()
+    if len(text) < 12:
+        return None
+    if any(token in text for token in ["feel", "hurt", "panic", "suic", "die", "depressed", "alone", "breakdown"]):
+        if "meme" in (channel_topic or "").lower() or "fun" in (channel_topic or "").lower():
+            return "This sounds like it belongs in a vent or support channel rather than a memes/fun channel."
+    if any(token in text for token in ["announcement", "news", "update", "server", "important"]):
+        if "announcement" in (channel_topic or "").lower() or "news" in (channel_topic or "").lower():
+            return "This looks more like a discussion topic than an announcement post."
+    return None
 
 
 class AIChat(commands.Cog):
@@ -56,6 +85,10 @@ class AIChat(commands.Cog):
         self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
         # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
         self._last_alert: dict[tuple[int, int], float] = {}
+        # channel_id -> last time we saw a real message there
+        self._last_activity_at: dict[int, float] = {}
+        # channel_id -> last time we sent idle chatter there
+        self._last_idle_chatter_at: dict[int, float] = {}
         # channel_id -> last time we ran a vent-channel classification call
         self._last_vent_check: dict[int, float] = {}
 
@@ -64,9 +97,11 @@ class AIChat(commands.Cog):
         # already have it, then keep it refreshed in the background.
         asyncio.create_task(awareness.refresh_digest(force=True))
         self._news_refresh_loop.start()
+        self._idle_chatter_loop.start()
 
     async def cog_unload(self):
         self._news_refresh_loop.cancel()
+        self._idle_chatter_loop.cancel()
 
     @tasks.loop(hours=3)
     async def _news_refresh_loop(self):
@@ -74,6 +109,13 @@ class AIChat(commands.Cog):
             await awareness.refresh_digest()
         except Exception:
             logger.exception("Background news digest refresh failed")
+
+    @tasks.loop(minutes=15)
+    async def _idle_chatter_loop(self):
+        try:
+            await self._maybe_send_idle_chatter()
+        except Exception:
+            logger.exception("Idle chatter loop failed")
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -189,9 +231,15 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
+        self._last_activity_at[message.channel.id] = asyncio.get_event_loop().time()
         will_reply = await self._should_respond(message)
 
         settings = await db.get_guild_settings(message.guild.id)
+        if not will_reply and settings.get("channel_redirection_enabled"):
+            channel_topic = getattr(message.channel, "topic", "") or ""
+            suggestion = maybe_suggest_channel_redirection(channel_topic, message.content)
+            if suggestion and message.channel.id != settings.get("chat_channel_id"):
+                asyncio.create_task(self._maybe_redirect_channel(message, suggestion))
         vent_channel_id = settings.get("vent_channel_id")
         # Skip the separate classification pass if this message is about to go
         # through the full chat pipeline anyway — the flag_for_owner tool
@@ -208,6 +256,49 @@ class AIChat(commands.Cog):
         async with lock:
             async with message.channel.typing():
                 await self._handle_chat(message)
+
+    async def _maybe_send_idle_chatter(self):
+        now = datetime.now(timezone.utc).astimezone(IST)
+        if not (IDLE_CHATTER_START_HOUR_IST <= now.hour <= IDLE_CHATTER_END_HOUR_IST):
+            return
+
+        for guild in self.bot.guilds:
+            settings = await db.get_guild_settings(guild.id)
+            if not settings.get("idle_chatter_enabled"):
+                continue
+            channel_id = settings.get("chat_channel_id")
+            if not channel_id:
+                continue
+            channel = guild.get_channel(int(channel_id))
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            if not channel.permissions_for(guild.me).send_messages:
+                continue
+
+            now_ts = asyncio.get_event_loop().time()
+            last_activity = self._last_activity_at.get(channel.id, 0.0)
+            last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
+            if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
+                continue
+            if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
+                continue
+
+            try:
+                await channel.send("quiet in here, huh. staying on the radar.")
+                self._last_idle_chatter_at[channel.id] = now_ts
+            except discord.HTTPException:
+                logger.debug("Idle chatter failed for %s", channel.id)
+
+    async def _maybe_redirect_channel(self, message: discord.Message, suggestion: str):
+        try:
+            if not message.channel.permissions_for(message.guild.me).send_messages:
+                return
+            await message.reply(
+                f"{suggestion} If you want, I can help you move it to a more fitting channel.",
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            logger.debug("Channel redirection hint failed for %s", message.id)
 
     async def _check_vent_message(self, message: discord.Message):
         """Lightweight, cheap classification pass — does NOT go through the
@@ -368,6 +459,30 @@ class AIChat(commands.Cog):
     # Main chat handling
     # -----------------------------------------------------------------
 
+    async def _maybe_attach_image_context(self, message: discord.Message, chat_messages: list[dict]) -> None:
+        if not openrouter_client.is_configured():
+            return
+        if not message.attachments:
+            return
+        if not any(att.content_type and att.content_type.startswith("image/") for att in message.attachments):
+            return
+        urls = []
+        for attachment in message.attachments:
+            if attachment.content_type and attachment.content_type.startswith("image/"):
+                urls.append(attachment.url)
+        if not urls:
+            return
+        try:
+            description = await openrouter_client.describe_images(urls)
+        except Exception as e:
+            logger.warning("Image description failed: %s", e)
+            return
+        if description:
+            chat_messages.append({
+                "role": "system",
+                "content": f"Image context from the message: {description}",
+            })
+
     async def _handle_chat(self, message: discord.Message):
         guild = message.guild
         author = message.author
@@ -450,6 +565,8 @@ class AIChat(commands.Cog):
             role = "assistant" if h["role"] == "assistant" else "user"
             prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
             chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
+
+        await self._maybe_attach_image_context(message, chat_messages)
 
         # 6. Call the model (semaphore-capped), with tool support
         try:

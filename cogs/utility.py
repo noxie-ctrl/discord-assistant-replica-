@@ -69,6 +69,22 @@ class Utility(commands.Cog):
             "like they need a check-in. She won't reply publicly there unless mentioned."
         )
 
+    @app_commands.command(name="setchannelawareness", description="Toggle Lucy's verbal channel-redirection hints")
+    @is_admin_or_mod()
+    async def setchannelawareness(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, channel_redirection_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Channel-redirection hints are now {'on' if enabled else 'off'}."
+        )
+
+    @app_commands.command(name="setidlechatter", description="Toggle Lucy's low-key idle chatter in quiet chat channels")
+    @is_admin_or_mod()
+    async def setidlechatter(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, idle_chatter_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Idle chatter is now {'on' if enabled else 'off'}."
+        )
+
     @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
     @is_admin_or_mod()
     async def disableventchannel(self, interaction: discord.Interaction):

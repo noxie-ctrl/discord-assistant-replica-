@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     chat_channel_id BIGINT,
     welcome_channel_id BIGINT,
     welcome_message TEXT,
-    vent_channel_id BIGINT
+    vent_channel_id BIGINT,
+    channel_redirection_enabled BOOLEAN DEFAULT TRUE,
+    idle_chatter_enabled BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS member_events (
@@ -135,6 +137,8 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS username TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS preferred_language TEXT;
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
 """
 
 

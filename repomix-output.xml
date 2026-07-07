@@ -52,7 +52,9 @@ cogs/
   utility.py
 utils/
   __init__.py
+  awareness.py
   database.py
+  groq_client.py
   nim_client.py
   permissions.py
 .gitignore
@@ -579,24 +581,685 @@ async def setup(bot: commands.Bot):
 
 </file>
 
+<file path="utils/awareness.py">
+"""
+utils/awareness.py
+
+Gives Lucy passive "peak awareness" of current events without spending a
+model call on every message. A background refresh (started from
+cogs/ai_chat.py's cog_load) pulls real headlines from the same BBC feeds
+cogs/news.py already uses, then condenses them into a short digest string
+via Groq (cheap/fast — this is exactly the kind of background task that
+shouldn't touch the main NIM quota). The digest is cached in memory and
+just re-read (no network/model call) every time a chat reply is built.
+
+If Groq isn't configured, we fall back to a plain title list — still
+correct, just less conversationally condensed.
+"""
+
+import time
+import logging
+import xml.etree.ElementTree as ET
+
+import aiohttp
+
+from utils import groq_client
+
+logger = logging.getLogger("lucy.awareness")
+
+REFRESH_INTERVAL_SECONDS = 3 * 60 * 60  # refresh every 3 hours
+FEEDS = [
+    "http://feeds.bbci.co.uk/news/rss.xml",       # top stories
+    "http://feeds.bbci.co.uk/news/world/rss.xml",  # world
+]
+
+_cached_digest: str | None = None
+_cached_at: float = 0.0
+
+
+async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
+    titles: list[str] = []
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in FEEDS:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    raw = await resp.text()
+                root = ET.fromstring(raw)
+                for item in root.findall(".//item")[:limit_per_feed]:
+                    title = (item.findtext("title", default="") or "").strip()
+                    if title:
+                        titles.append(title)
+            except Exception as e:
+                logger.warning("Failed fetching feed %s: %s", url, e)
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique[:8]
+
+
+async def _condense(titles: list[str]) -> str:
+    if not titles:
+        return ""
+    raw_list = "\n".join(f"- {t}" for t in titles)
+    if not groq_client.is_configured():
+        return raw_list
+
+    try:
+        return await groq_client.call_groq(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Condense these real news headlines into at most 5 short factual "
+                        "one-line bullet points a person could casually mention knowing about "
+                        "today. No commentary, no markdown headers, just '- fact' lines."
+                    ),
+                },
+                {"role": "user", "content": raw_list},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=220,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning("News digest condensation failed, using raw titles: %s", e)
+        return raw_list
+
+
+async def refresh_digest(force: bool = False) -> str:
+    """Fetches + condenses fresh headlines and updates the cache. Safe to
+    call often — internally no-ops if the cache is still fresh, unless
+    force=True."""
+    global _cached_digest, _cached_at
+    now = time.time()
+    if not force and _cached_digest is not None and (now - _cached_at) < REFRESH_INTERVAL_SECONDS:
+        return _cached_digest
+
+    try:
+        titles = await _fetch_headlines()
+        digest = await _condense(titles)
+        if digest:
+            _cached_digest = digest
+            _cached_at = now
+    except Exception as e:
+        logger.warning("News digest refresh failed, keeping previous cache: %s", e)
+
+    return _cached_digest or ""
+
+
+def get_cached_digest() -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_digest or ""
+</file>
+
+<file path="utils/groq_client.py">
+"""
+utils/groq_client.py
+
+Groq is the "second engine": free, very fast, OpenAI-compatible REST API.
+We use it for two things:
+  1. Background/cheap tasks that used to eat into the main NIM quota —
+     vent-channel triage, long-term memory summarization, and the daily
+     news digest. These don't need Lucy's absolute best model, just a fast
+     reliable one, so keeping them off NIM leaves more NIM headroom for
+     actual conversations.
+  2. A last-resort fallback for main chat, tried only if every NIM model in
+     nim_client.MODEL_CANDIDATES has already failed — so a full NVIDIA
+     outage doesn't take Lucy down completely, it just quietly degrades to
+     a slightly different voice for a bit.
+
+Two keys (GROQ_API_KEY_1 / GROQ_API_KEY_2) are round-robined per call, and
+if one is rate-limited (429) the other is tried immediately in the same
+call instead of waiting — effectively close to doubling free-tier
+throughput for these background tasks.
+"""
+
+import os
+import asyncio
+import itertools
+import logging
+
+import aiohttp
+
+logger = logging.getLogger("lucy.groq_client")
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Fast + cheap — right for triage/summarization background work.
+MODEL_FAST = "llama-3.1-8b-instant"
+# Bigger — used when a background task actually benefits from more
+# reasoning (news digest condensation) or as the main-chat fallback tier.
+MODEL_QUALITY = "llama-3.3-70b-versatile"
+
+_key_cycle = None
+
+
+def _get_keys() -> list[str]:
+    keys = [
+        os.getenv("GROQ_API_KEY_1", "").strip(),
+        os.getenv("GROQ_API_KEY_2", "").strip(),
+    ]
+    return [k for k in keys if k]
+
+
+def _next_key_order() -> list[str]:
+    """Returns the available keys starting from wherever the round-robin
+    cursor currently is, so load spreads across both keys over time."""
+    global _key_cycle
+    keys = _get_keys()
+    if not keys:
+        return []
+    if _key_cycle is None:
+        _key_cycle = itertools.cycle(range(len(keys)))
+    start = next(_key_cycle)
+    return keys[start:] + keys[:start]
+
+
+async def _call_one(model: str, messages: list[dict], max_tokens: int, temperature: float,
+                     api_key: str, timeout_seconds: int = 12) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(GROQ_API_URL, json=payload, headers=headers) as resp:
+            if resp.status == 429:
+                raise _RateLimited(f"Groq key rate-limited on {model}")
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"Groq {model} returned {resp.status}: {body[:300]}")
+            data = await resp.json()
+
+    try:
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError("Groq returned an unexpected response shape") from e
+    if not content:
+        raise RuntimeError(f"Groq {model} returned empty content")
+    return content
+
+
+class _RateLimited(Exception):
+    pass
+
+
+async def call_groq(messages: list[dict], model: str = MODEL_FAST, max_tokens: int = 200,
+                     temperature: float = 0.3, timeout_seconds: int = 12) -> str:
+    """Tries each configured Groq key in round-robin order, moving to the
+    next key on a 429 or transient failure. Raises RuntimeError if neither
+    key is configured or both fail."""
+    keys = _next_key_order()
+    if not keys:
+        raise RuntimeError("No GROQ_API_KEY_1 / GROQ_API_KEY_2 configured.")
+
+    last_error: Exception | None = None
+    for key in keys:
+        try:
+            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
+        except asyncio.TimeoutError:
+            last_error = TimeoutError(f"Groq {model} timed out")
+            logger.warning("Groq key timed out on %s, trying next key if any", model)
+        except _RateLimited as e:
+            last_error = e
+            logger.warning("Groq key rate-limited, trying next key if any")
+        except Exception as e:
+            last_error = e
+            logger.warning("Groq call failed (%s), trying next key if any", e)
+
+    raise RuntimeError(f"All Groq keys failed: {last_error}")
+
+
+def is_configured() -> bool:
+    return bool(_get_keys())
+</file>
+
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="utils/permissions.py">
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+
+def _is_owner(user_id: int) -> bool:
+    owner_id = os.getenv("OWNER_ID", "").strip()
+    return owner_id.isdigit() and int(owner_id) == user_id
+
+
+def is_admin_or_mod():
+    """Allows the bot owner, or users with Administrator/Manage Server/Kick/Ban permissions."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        if _is_owner(interaction.user.id):
+            return True
+        perms = interaction.user.guild_permissions
+        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
+    return app_commands.check(predicate)
+
+
+def is_admin_or_mod_ctx():
+    async def predicate(ctx: commands.Context) -> bool:
+        if _is_owner(ctx.author.id):
+            return True
+        perms = ctx.author.guild_permissions
+        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
+    return commands.check(predicate)
+
+
+def is_owner_only():
+    """Restricts a command to only the bot owner, regardless of server roles."""
+    def predicate(interaction: discord.Interaction) -> bool:
+        return _is_owner(interaction.user.id)
+    return app_commands.check(predicate)
+</file>
+
+<file path=".gitignore">
+.env
+data/
+</file>
+
+<file path="personality_default.json">
+{
+  "name": "Lucy",
+  "age": "21",
+  "pronouns": "she/her",
+  "role": "Server admin assistant & friend to everyone here",
+  "traits": "Sharp-tongued, guarded until she trusts you, dry deadpan humor over bubbliness, confident, visibly competent, fiercely loyal to people she's decided are 'hers' (starting with the server owner), doesn't perform warmth she doesn't feel",
+  "backstory": "Lucy grew up online, learned to run this place the hard way, and doesn't waste words. She takes her admin duties seriously and doesn't tolerate people messing with the server, but she's not cold — just economical with the niceties until you've earned them.",
+  "speaking_style": "Casual, short punchy sentences, deadpan delivery, minimal emoji, never robotic or overly formal, comfortable with silence instead of filling it",
+  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
+}
+</file>
+
+<file path="requirements.txt">
+discord.py>=2.4.0
+aiohttp>=3.9.0
+asyncpg>=0.29.0
+python-dotenv>=1.0.0
+</file>
+
+<file path="cogs/utility.py">
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+from utils.permissions import is_admin_or_mod
+
+
+class Utility(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ---------- WELCOME ----------
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        settings = await db.get_guild_settings(member.guild.id)
+        channel_id = settings.get("welcome_channel_id")
+        if not channel_id:
+            return
+        channel = member.guild.get_channel(channel_id)
+        if not channel:
+            return
+        msg = settings.get("welcome_message") or "Welcome {member} to **{server}**! 🎉"
+        text = msg.replace("{member}", member.mention).replace("{server}", member.guild.name)
+        try:
+            await channel.send(text)
+        except discord.Forbidden:
+            pass
+
+    @app_commands.command(name="setwelcome", description="Set the welcome channel and message")
+    @is_admin_or_mod()
+    async def setwelcome(self, interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {member} to **{server}**! 🎉"):
+        await db.update_guild_setting(interaction.guild.id, welcome_channel_id=channel.id, welcome_message=message)
+        await interaction.response.send_message(f"✅ Welcome messages will go to {channel.mention}.\nUse `{{member}}` and `{{server}}` as placeholders.")
+
+    # ---------- LOG CHANNEL ----------
+    @app_commands.command(name="setlogchannel", description="Set the moderation log channel")
+    @is_admin_or_mod()
+    async def setlogchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.update_guild_setting(interaction.guild.id, log_channel_id=channel.id)
+        await interaction.response.send_message(f"✅ Moderation logs will go to {channel.mention}.")
+
+    # ---------- CHAT TRIGGER CONFIG ----------
+    @app_commands.command(name="setchattrigger", description="Configure when Lucy jumps into chat")
+    @is_admin_or_mod()
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
+        app_commands.Choice(name="Dedicated channel only", value="channel"),
+        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
+        app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
+        app_commands.Choice(name="All of the above", value="all"),
+    ])
+    async def setchattrigger(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        await db.update_guild_setting(interaction.guild.id, chat_trigger_mode=mode.value)
+        await interaction.response.send_message(f"✅ Lucy's chat trigger mode set to **{mode.name}**.")
+
+    @app_commands.command(name="setchatchannel", description="Set the dedicated channel for chatting with Lucy")
+    @is_admin_or_mod()
+    async def setchatchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
+        await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
+
+    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
+    @is_admin_or_mod()
+    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.set_vent_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(
+            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
+            "like they need a check-in. She won't reply publicly there unless mentioned."
+        )
+
+    @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
+    @is_admin_or_mod()
+    async def disableventchannel(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        if not settings.get("vent_channel_id"):
+            await interaction.response.send_message("There's no vent channel set right now — nothing to disable.", ephemeral=True)
+            return
+        await db.update_guild_setting(interaction.guild.id, vent_channel_id=None)
+        await interaction.response.send_message(
+            "✅ Vent-channel watching is off. Use `/setventchannel` any time to turn it back on."
+        )
+
+    @app_commands.command(name="ventstatus", description="Check whether Lucy's vent-channel watcher is on")
+    @is_admin_or_mod()
+    async def ventstatus(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        channel_id = settings.get("vent_channel_id")
+        if not channel_id:
+            await interaction.response.send_message("Vent-channel watching is currently **off**.", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(channel_id)
+        name = channel.mention if channel else f"channel {channel_id} (not found — may have been deleted)"
+        await interaction.response.send_message(f"Vent-channel watching is currently **on**, watching {name}.", ephemeral=True)
+
+    # ---------- ROLE ASSIGN ----------
+    @app_commands.command(name="giverole", description="Give a role to a member")
+    @is_admin_or_mod()
+    async def giverole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await member.add_roles(role)
+        await interaction.response.send_message(f"✅ Gave {role.mention} to {member.mention}.")
+
+    @app_commands.command(name="removerole", description="Remove a role from a member")
+    @is_admin_or_mod()
+    async def removerole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await member.remove_roles(role)
+        await interaction.response.send_message(f"✅ Removed {role.mention} from {member.mention}.")
+
+    # ---------- SIMPLE TICKETS ----------
+    @app_commands.command(name="ticket", description="Open a private support ticket")
+    async def ticket(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        channel = await guild.create_text_channel(
+            name=f"ticket-{interaction.user.name}", overwrites=overwrites
+        )
+        await channel.send(f"🎫 {interaction.user.mention} a staff member will be with you shortly!")
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
+    @app_commands.command(name="closeticket", description="Close the current ticket channel")
+    async def closeticket(self, interaction: discord.Interaction):
+        if not interaction.channel.name.startswith("ticket-"):
+            await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+            return
+        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
+        await interaction.channel.delete(delay=5)
+
+    # ---------- INFO ----------
+    @app_commands.command(name="serverinfo", description="Show info about this server")
+    async def serverinfo(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
+        embed.add_field(name="Members", value=guild.member_count)
+        embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"))
+        embed.add_field(name="Owner", value=str(guild.owner))
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="userinfo", description="Show info about a member")
+    async def userinfo(self, interaction: discord.Interaction, member: discord.Member = None):
+        member = member or interaction.user
+        embed = discord.Embed(title=str(member), color=discord.Color.blurple())
+        embed.add_field(name="Joined", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
+        embed.add_field(name="Account created", value=member.created_at.strftime("%Y-%m-%d"))
+        roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
+        embed.add_field(name="Roles", value=roles or "None", inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        await interaction.response.send_message(embed=embed)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Utility(bot))
+</file>
+
+<file path="main.py">
+"""
+main.py
+
+Entry point for Lucy. Changes in this version:
+  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
+    and closes it cleanly on shutdown.
+  - Loads two new cogs: games (mini-games) and news (real headlines).
+  - Everything else (owner_id wiring, slash sync, prefix commands) is
+    unchanged from before.
+"""
+
+import os
+import asyncio
+import logging
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+from utils import database as db
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("lucy.main")
+
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+INTENTS.members = True
+
+COGS = [
+    "cogs.moderation",
+    "cogs.utility",
+    "cogs.personality",
+    "cogs.ai_chat",
+    "cogs.games",
+    "cogs.news",
+    "cogs.preferences",
+    "cogs.serverlog",
+]
+
+
+class Lucy(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=INTENTS)
+
+    async def setup_hook(self):
+        await db.init_pool()
+        logger.info("Postgres pool ready.")
+
+        for cog in COGS:
+            try:
+                await self.load_extension(cog)
+                logger.info("Loaded %s", cog)
+            except Exception:
+                logger.exception("Failed to load %s", cog)
+
+        owner_id = os.getenv("OWNER_ID", "").strip()
+        if owner_id:
+            self.owner_id = int(owner_id)
+            logger.info("Owner ID set to %s", self.owner_id)
+        else:
+            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
+
+        synced = await self.tree.sync()
+        logger.info("Synced %d slash commands.", len(synced))
+
+    async def on_ready(self):
+        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
+        # gets called with her own user id in that case, and this tells the
+        # database layer to skip the (meaningless) relationship-score bump for it.
+        db.set_bot_user_id(self.user.id)
+        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
+
+    async def close(self):
+        await db.close_pool()
+        await super().close()
+
+
+async def main():
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+
+    bot = Lucy()
+    async with bot:
+        await bot.start(token)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
+<file path="README.md">
+# Lucy — Your Discord AI Assistant
+
+A Python Discord bot with a customizable AI personality (NVIDIA NIM as the main chat
+engine, Groq as a background/fallback engine), full moderation, server utilities, and
+mini-games. Both slash (`/`) and prefix (`!`) commands supported.
+
+## 1. Create the Discord bot
+1. Go to https://discord.com/developers/applications → **New Application**.
+2. Go to the **Bot** tab → click **Reset Token** → copy it (this is `DISCORD_TOKEN`).
+3. Under **Privileged Gateway Intents**, enable:
+   - Server Members Intent (required)
+   - Message Content Intent (required)
+4. Go to **OAuth2 → URL Generator**:
+   - Scopes: `bot`, `applications.commands`
+   - Bot permissions: `Administrator` (simplest for full-power admin bot)
+   - Copy the generated URL and open it to invite Lucy to your server.
+
+## 2. Get API keys (both free)
+- **NVIDIA NIM** (main chat engine): https://build.nvidia.com → sign in → **Get API Key**
+  → this is `NVIDIA_API_KEY`. Generous free tier; Lucy defaults to the strongest available
+  model (`mistralai/mistral-large-3-675b-instruct-2512`) with automatic fallback to two
+  other models if it's ever unavailable.
+- **Groq** (background tasks + emergency fallback): https://console.groq.com → **API Keys**
+  → create two keys, `GROQ_API_KEY_1` and `GROQ_API_KEY_2`. Groq is used for vent-channel
+  triage, long-term memory summarization, and the daily news digest — keeping that traffic
+  off the main NIM quota — and as a last-resort fallback for main chat if NIM is fully down.
+  Optional but recommended; Lucy works without it, just with less background-task headroom.
+
+## 3. Configure environment
+Copy `.env.example` to `.env` and fill in:
+```
+DISCORD_TOKEN=...
+NVIDIA_API_KEY=...
+GROQ_API_KEY_1=...
+GROQ_API_KEY_2=...
+OWNER_ID=1462759265864519722
+DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
+```
+
+## 4. Run locally (optional test)
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+## 5. Deploy free on Railway
+1. Push this folder to a GitHub repo.
+2. Go to https://railway.app → **New Project → Deploy from GitHub repo**.
+3. Add a Postgres plugin, and reference its `DATABASE_URL` on the worker service.
+4. Add the rest of the environment variables from `.env` in Railway's **Variables** tab.
+5. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
+
+## 6. Configure Lucy in your server
+Run these once, in Discord:
+- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
+- `/profile` — view Lucy's current profile
+- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
+- `/setchatchannel` — pick her dedicated chat channel (if using that mode)
+- `/setventchannel` — a channel she quietly watches, flagging the owner if someone seems
+  like they need real human support (not a public reply — a private heads-up)
+- `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
+- `/setlogchannel` — where moderation actions get logged
+- `/setwelcome` — welcome channel + message for new members
+
+## What's included
+- **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
+- **Utility:** welcome messages, role give/remove, ticket system, server/user info
+- **AI Chat:** Lucy talks like an active member of the server, not a generic assistant —
+  she adapts tone (banter vs. sincerity vs. Hinglish), has real opinions on niche/gaming/anime/
+  internet-culture topics, knows the current date/time in IST, and stays casually aware of
+  real current headlines. She naturally warms up to people over time (acquaintance → friend →
+  close friend → best friend, based on how much you've talked and how well it's gone), while
+  the owner always gets top priority and candor.
+- **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
+  to need a real person to check in — separate from normal banter/venting.
+- **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number
+  (solo / vs a member / vs Lucy), and Trivia (solo or open free-for-all, multiple categories
+  including gaming/anime/sports/internet culture) — all feeding a shared coin economy with
+  `/balance`, `/leaderboard`, `/gamestats`.
+- **Personality:** fully editable per-server via slash commands, no code editing needed.
+
+## Two-engine model
+- **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
+  → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
+- **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
+  the news digest and emergency main-chat fallback) round-robins across your two keys so a
+  single key's rate limit doesn't stall anything.
 </file>
 
 <file path="cogs/games.py">
 """
 cogs/games.py
 
-v2: all games now feed the shared currency economy, and Guess the Number
-supports real competition — challenge another member, or race against Lucy
-herself as an AI opponent — instead of just a solo timer game.
+v3: added two more engaging games on top of the existing set — one built for
+playing together, one that works solo or as a group free-for-all:
 
   - /tictactoe @opponent          — button-grid, two human players, winner earns coins
+  - /connect4 @opponent            — column-drop buttons + rendered board, two players
   - /guessnumber [opponent] [vs_ai] [max]  — solo, vs a member, or vs Lucy; first to
     guess right wins the pot
   - /rps                           — rock/paper/scissors vs Lucy, buttons
+  - /trivia [rounds] [category]    — multi-round multiple choice, open to the whole
+    channel or fine playing it alone; categories include gaming/anime/sports/internet
+    culture as well as general knowledge
   - /balance [user]                 — check coin balance
   - /leaderboard                    — top balances in the server
+  - /gamestats [user]               — win/loss/draw record across all games
 
 Currency payouts are intentionally simple flat amounts, not a full wagering
 system — bigger, riskier economy features (betting, shops, etc.) would need
@@ -605,6 +1268,7 @@ their own spec.
 
 import random
 import asyncio
+import collections
 
 import discord
 from discord import app_commands
@@ -622,6 +1286,9 @@ PAYOUT = {
     "guessnumber_solo_win": 15,
     "guessnumber_vs_player_win": 25,
     "guessnumber_vs_ai_win": 20,
+    "connect4_win": 20,
+    "connect4_draw": 8,
+    "trivia_correct": 8,
 }
 
 
@@ -773,6 +1440,137 @@ class RPSView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
+# Connect Four — two human players, column-drop buttons + rendered board
+# ---------------------------------------------------------------------------
+
+C4_EMPTY, C4_RED, C4_YELLOW = "⚫", "🔴", "🟡"
+C4_ROWS, C4_COLS = 6, 7
+
+
+class Connect4ColumnButton(discord.ui.Button):
+    def __init__(self, column: int):
+        # Discord caps each button row at 5 — 7 columns need to split across
+        # two rows (5 + 2) rather than all sitting in row 0.
+        row = 0 if column < 5 else 1
+        super().__init__(style=discord.ButtonStyle.secondary, label=str(column + 1), row=row)
+        self.column = column
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "Connect4View" = self.view
+        await view.handle_drop(interaction, self.column)
+
+
+class Connect4View(discord.ui.View):
+    def __init__(self, player_red: discord.Member, player_yellow: discord.Member, guild_id: int):
+        super().__init__(timeout=300)
+        self.player_red = player_red
+        self.player_yellow = player_yellow
+        self.guild_id = guild_id
+        self.current = player_red
+        # columns[c] is a bottom-to-top stack of "R"/"Y"
+        self.columns: list[list[str]] = [[] for _ in range(C4_COLS)]
+        for c in range(C4_COLS):
+            self.add_item(Connect4ColumnButton(c))
+
+    def _symbol_for(self, player: discord.Member) -> str:
+        return "R" if player.id == self.player_red.id else "Y"
+
+    def _render(self) -> str:
+        emoji = {"R": C4_RED, "Y": C4_YELLOW}
+        lines = []
+        for row_from_top in range(C4_ROWS):
+            idx_from_bottom = C4_ROWS - 1 - row_from_top
+            cells = []
+            for col in self.columns:
+                if idx_from_bottom < len(col):
+                    cells.append(emoji[col[idx_from_bottom]])
+                else:
+                    cells.append(C4_EMPTY)
+            lines.append("".join(cells))
+        lines.append("".join(f"{i+1}\u20e3" if i < 9 else "🔟" for i in range(C4_COLS)))
+        return "\n".join(lines)
+
+    def _grid(self) -> list[list[str | None]]:
+        """Full row-major grid (row 0 = bottom), for win checking."""
+        grid = [[None] * C4_COLS for _ in range(C4_ROWS)]
+        for c, col in enumerate(self.columns):
+            for r, piece in enumerate(col):
+                grid[r][c] = piece
+        return grid
+
+    def _check_winner(self) -> str | None:
+        grid = self._grid()
+        directions = [(0, 1), (1, 0), (1, 1), (1, -1)]
+        for r in range(C4_ROWS):
+            for c in range(C4_COLS):
+                piece = grid[r][c]
+                if piece is None:
+                    continue
+                for dr, dc in directions:
+                    cells = [
+                        grid[r + dr * i][c + dc * i]
+                        for i in range(4)
+                        if 0 <= r + dr * i < C4_ROWS and 0 <= c + dc * i < C4_COLS
+                    ]
+                    if len(cells) == 4 and all(cell == piece for cell in cells):
+                        return piece
+        if all(len(col) == C4_ROWS for col in self.columns):
+            return "draw"
+        return None
+
+    async def handle_drop(self, interaction: discord.Interaction, column: int):
+        if interaction.user.id != self.current.id:
+            await interaction.response.send_message("It's not your turn.", ephemeral=True)
+            return
+        if len(self.columns[column]) >= C4_ROWS:
+            await interaction.response.send_message("That column's full.", ephemeral=True)
+            return
+
+        symbol = self._symbol_for(self.current)
+        self.columns[column].append(symbol)
+
+        if len(self.columns[column]) >= C4_ROWS:
+            for child in self.children:
+                if isinstance(child, Connect4ColumnButton) and child.column == column:
+                    child.disabled = True
+
+        result = self._check_winner()
+        board = self._render()
+
+        if result is None:
+            self.current = self.player_yellow if self.current.id == self.player_red.id else self.player_red
+            next_symbol = C4_RED if self._symbol_for(self.current) == "R" else C4_YELLOW
+            await interaction.response.edit_message(
+                content=f"{board}\n\n{self.current.mention}'s turn ({next_symbol})", view=self,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        if result == "draw":
+            await db.record_game_result(self.guild_id, self.player_red.id, "connect4", "draw")
+            await db.record_game_result(self.guild_id, self.player_yellow.id, "connect4", "draw")
+            await db.adjust_balance(self.guild_id, self.player_red.id, PAYOUT["connect4_draw"])
+            await db.adjust_balance(self.guild_id, self.player_yellow.id, PAYOUT["connect4_draw"])
+            content = f"{board}\n\nIt's a draw! Both earn {PAYOUT['connect4_draw']} coins."
+        else:
+            winner = self.player_red if result == "R" else self.player_yellow
+            loser = self.player_yellow if result == "R" else self.player_red
+            await db.record_game_result(self.guild_id, winner.id, "connect4", "win")
+            await db.record_game_result(self.guild_id, loser.id, "connect4", "loss")
+            new_balance = await db.adjust_balance(self.guild_id, winner.id, PAYOUT["connect4_win"])
+            content = f"{board}\n\n🎉 {winner.mention} connects four! +{PAYOUT['connect4_win']} coins (balance: {new_balance})."
+
+        await interaction.response.edit_message(content=content, view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+
+
+# ---------------------------------------------------------------------------
 # Guess the Number — solo, vs another member, or vs Lucy (AI)
 # ---------------------------------------------------------------------------
 
@@ -787,10 +1585,245 @@ class GuessNumberGame:
         self.ai_task: asyncio.Task | None = None
 
 
+# ---------------------------------------------------------------------------
+# Trivia — solo or open free-for-all, multiple choice, multi-round
+# ---------------------------------------------------------------------------
+
+# Mixed categories on purpose — general knowledge alongside gaming/anime/
+# internet-culture questions, so it works whether someone wants a quick
+# solo round or a competitive group session that rewards "knowing ball."
+TRIVIA_BANK = [
+    # -- anime: mainstream/well-known ----------------------------------------
+    {"q": "In One Piece, what is the name of Luffy\'s signature attack style?", "choices": ["Gum-Gum", "Ice-Ice", "Soul King", "Water Seven"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "Which anime features the Survey Corps fighting Titans?", "choices": ["Demon Slayer", "Attack on Titan", "My Hero Academia", "Naruto"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Naruto, what village is Naruto from?", "choices": ["Sand Village", "Leaf Village", "Mist Village", "Cloud Village"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Death Note, who is the detective opposing Light Yagami?", "choices": ["Near", "Mello", "L", "Ryuk"], "answer": 2, "cat": "anime", "diff": "easy"},
+    {"q": "What alias does Light Yagami use as a vigilante in Death Note?", "choices": ["Shinigami", "Kira", "Yagami", "Raito"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In My Hero Academia, what term describes a superpower?", "choices": ["Nen", "Quirk", "Semblance", "Stand"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "Who is known as the Symbol of Peace in My Hero Academia?", "choices": ["All Might", "Endeavor", "Deku", "Aizawa"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "What are the names of the two brothers in Fullmetal Alchemist?", "choices": ["Edward and Alphonse", "Naruto and Sasuke", "Ichigo and Renji", "Light and Ryuk"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Dragon Ball, what alien race is Goku?", "choices": ["Namekian", "Saiyan", "Android", "Majin"], "answer": 1, "cat": "anime", "diff": "easy"},
+    {"q": "In Jujutsu Kaisen, what does Yuji Itadori consume that binds him to a curse?", "choices": ["A finger", "A tooth", "An eye", "A hand"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "In Tokyo Ghoul, what are the flesh-eating creatures called?", "choices": ["Titans", "Ghouls", "Hollows", "Demons"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "In Sword Art Online, what happens if a player dies inside the game?", "choices": ["They respawn", "They lose items", "They die in real life", "Nothing happens"], "answer": 2, "cat": "anime", "diff": "medium"},
+    {"q": "What exam kicks off the early plot of Hunter x Hunter?", "choices": ["Chunin Exam", "Hunter Exam", "S-Class Trial", "Shinobi Trial"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the name of the protagonist in One Punch Man?", "choices": ["Saitama", "Genos", "Mob", "Bang"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Bleach, what are the evil spirit enemies called?", "choices": ["Hollows", "Ghouls", "Titans", "Arrancar only"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "What is the name of the ship in Cowboy Bebop?", "choices": ["Bebop", "Serenity", "Nostromo", "Andromeda"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "In Spy x Family, what is Loid Forger\'s spy codename?", "choices": ["Shadow", "Twilight", "Phantom", "Eclipse"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the protagonist\'s name in Chainsaw Man?", "choices": ["Denji", "Aki", "Power", "Makima"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "What is Shigeo Kageyama better known as in Mob Psycho 100?", "choices": ["Reigen", "Mob", "Dimple", "Ritsu"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What type of sword do Demon Slayer Corps members use?", "choices": ["Katana", "Nichirin Blade", "Zanpakuto", "Nodachi only"], "answer": 1, "cat": "anime", "diff": "medium"},
+    {"q": "What is the outermost of the three walls in Attack on Titan?", "choices": ["Wall Sina", "Wall Rose", "Wall Maria", "Wall Titan"], "answer": 2, "cat": "anime", "diff": "medium"},
+    {"q": "What are the nine tailed beasts collectively called in Naruto?", "choices": ["Bijuu", "Akatsuki", "Sannin", "Kage"], "answer": 0, "cat": "anime", "diff": "medium"},
+    {"q": "What is the legendary treasure everyone searches for in One Piece called?", "choices": ["The One Piece", "Poneglyph", "Road Log", "Devil Fruit"], "answer": 0, "cat": "anime", "diff": "easy"},
+    {"q": "In Death Note, what supernatural being drops the notebook?", "choices": ["A demon", "A shinigami", "A ghost", "An angel"], "answer": 1, "cat": "anime", "diff": "medium"},
+
+    # -- anime: niche/hard (deeper cuts across many franchises) ---------------
+    {"q": "What is the name of the supernatural ability system introduced in JoJo\'s Bizarre Adventure Part 3?", "choices": ["Stands", "Nen", "Quirks", "Cursed Techniques"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated both the 2003 Fullmetal Alchemist and Brotherhood?", "choices": ["Bones", "MAPPA", "ufotable", "Wit Studio"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated Jujutsu Kaisen\'s first season?", "choices": ["MAPPA", "Wit Studio", "Bones", "Madhouse"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio took over animating Attack on Titan\'s Final Season from Wit Studio?", "choices": ["MAPPA", "ufotable", "Bones", "CloverWorks"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio is best known for Demon Slayer\'s animation?", "choices": ["ufotable", "Kyoto Animation", "Trigger", "A-1 Pictures"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "Which studio animated One Punch Man\'s acclaimed first season?", "choices": ["Madhouse", "J.C.Staff", "Bones", "Sunrise"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Code Geass, what is the name of Lelouch\'s power?", "choices": ["Geass", "Nen", "Haki", "Semblance"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Death Note, what two things must you know to kill someone with the notebook?", "choices": ["Name and face", "Name and birthdate", "Blood and name", "Fingerprint and name"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What taboo act costs Edward Elric his limbs in Fullmetal Alchemist?", "choices": ["Human transmutation", "Time travel", "Soul binding", "Blood alchemy"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Vinland Saga?", "choices": ["Thorfinn", "Askeladd", "Thorkell", "Canute"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the name of Guts\' massive sword in Berserk?", "choices": ["Dragon Slayer", "Dawnbreaker", "Sword of Judgment", "Behemoth"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Steins;Gate, what is the nickname for the text messages sent to the past?", "choices": ["D-Mail", "Time-Text", "Retro-Mail", "Echo Mail"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Re:Zero, what is Subaru\'s core ability called?", "choices": ["Return by Death", "Time Leap", "Reset Point", "Second Chance"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In the Fate series, what is the name of the ritual Servants fight in?", "choices": ["Holy Grail War", "Grand Tournament", "Command War", "Servant Trial"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Made in Abyss, what is the giant chasm at the center of the story called?", "choices": ["The Abyss", "The Void", "The Pit", "The Hollow"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Naoki Urasawa\'s Monster, what is the antagonist\'s name?", "choices": ["Johan Liebert", "Franz Bonaparta", "Tenma", "Roberto"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Neon Genesis Evangelion, what are the giant piloted robots called?", "choices": ["Evangelions", "Titans", "Guardians", "Jaegers"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Neon Genesis Evangelion, what are the mysterious enemy beings called?", "choices": ["Angels", "Titans", "Hollows", "Nobodies"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Akira, what is the name of Kaneda\'s biker gang?", "choices": ["The Capsules", "The Espers", "Neo-Tokyo Riders", "The Clowns"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s full name in Trigun?", "choices": ["Vash the Stampede", "Nicholas Wolfwood", "Knives Millions", "Legato Bluesummers"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Hellsing, Alucard\'s name is a reversed reference to which classic character?", "choices": ["Dracula", "Frankenstein", "Nosferatu", "Van Helsing"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Black Lagoon, what is the mercenary crew\'s name?", "choices": ["Lagoon Company", "Rip-Off Church", "Hotel Moscow", "Balalaika Corps"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Fruits Basket, what happens to the Sohma family members when hugged by the opposite sex?", "choices": ["They transform into zodiac animals", "They lose their memory", "They fall asleep", "They swap bodies"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What sport is Haikyuu!! centered around?", "choices": ["Volleyball", "Basketball", "Baseball", "Tennis"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What sport is Slam Dunk centered around?", "choices": ["Basketball", "Volleyball", "Baseball", "Boxing"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Gintoki\'s usual weapon of choice in Gintama?", "choices": ["A wooden bokuto", "A katana", "A rifle", "A yo-yo"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Part 1 of JoJo\'s Bizarre Adventure called?", "choices": ["Phantom Blood", "Battle Tendency", "Stardust Crusaders", "Steel Ball Run"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Overlord, what was the protagonist\'s original in-game name before becoming Ainz Ooal Gown?", "choices": ["Momonga", "Ulbert", "Peroroncino", "Touch Me"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s slime name in That Time I Got Reincarnated as a Slime?", "choices": ["Rimuru Tempest", "Veldora", "Benimaru", "Milim"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Dr. Stone, what field does the protagonist rely on to rebuild civilization?", "choices": ["Science", "Magic", "Alchemy", "Engineering only"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the orphanage called in The Promised Neverland?", "choices": ["Grace Field House", "Sunny Meadows", "Hope\'s Peak", "Willowbrook House"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Assassination Classroom, what must the students do to their teacher?", "choices": ["Assassinate him", "Protect him", "Train under him only", "Report him"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Parasyte, what part of the host\'s body do the alien parasites take over?", "choices": ["The head/brain", "The heart", "The hands", "The eyes"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in the Devilman franchise?", "choices": ["Akira Fudo", "Ryo Asuka", "Ken Ogata", "Miki Makimura"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Inuyasha, what is the protagonist\'s demon heritage?", "choices": ["Half-dog-demon, half-human", "Full demon", "Half-fox-demon", "Half-dragon-demon"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Yu Yu Hakusho, what role does Yusuke take on after his death?", "choices": ["Spirit Detective", "Demon Hunter", "Tournament Champion", "Underworld Judge"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What vow does Kenshin take in Rurouni Kenshin?", "choices": ["Not to kill", "Never to draw his sword", "To serve the Shogun", "To abandon swordsmanship"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What magical items does the protagonist collect in Cardcaptor Sakura?", "choices": ["Clow Cards", "Tarot Cards", "Spirit Orbs", "Star Fragments"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Sailor Moon\'s civilian name?", "choices": ["Usagi Tsukino", "Rei Hino", "Ami Mizuno", "Minako Aino"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Spirited Away?", "choices": ["Chihiro", "Sophie", "San", "Kiki"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is the protagonist\'s name in Princess Mononoke?", "choices": ["Ashitaka", "San", "Jiro", "Okkoto"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What is Totoro, in My Neighbor Totoro?", "choices": ["A forest spirit", "A ghost", "A talking cat", "A dream creature"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "In Ghost in the Shell, what does the Major\'s cyborg body famously let her do?", "choices": ["Dive into networks", "Fly", "Turn invisible", "Time travel"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What kind of devil is Pochita in Chainsaw Man?", "choices": ["Chainsaw Devil", "Blood Devil", "Gun Devil", "Fire Devil"], "answer": 0, "cat": "anime", "diff": "hard"},
+    {"q": "What school do the protagonists attend in Jujutsu Kaisen?", "choices": ["Tokyo Jujutsu High", "Kyoto Jujutsu High", "Sorcery Academy", "Curse Institute"], "answer": 0, "cat": "anime", "diff": "hard"},
+    # -- gaming ---------------------------------------------------------------
+    {"q": "Which company developed the game Elden Ring?", "choices": ["FromSoftware", "CD Projekt Red", "Naughty Dog", "Bungie"], "answer": 0, "cat": "gaming", "diff": "medium"},
+    {"q": "In Minecraft, what do you need to craft a Nether Portal?", "choices": ["Iron blocks", "Obsidian", "Netherite", "Cobblestone"], "answer": 1, "cat": "gaming", "diff": "medium"},
+    {"q": "What was the first battle royale game to hit mainstream popularity?", "choices": ["Apex Legends", "Fortnite", "PUBG", "Warzone"], "answer": 2, "cat": "gaming", "diff": "medium"},
+    {"q": "In gaming slang, what does \'GG\' stand for?", "choices": ["Great Game", "Go Get", "Good Game", "Game Grid"], "answer": 2, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'nerfed\' mean when talking about a game update?", "choices": ["Made stronger", "Made weaker", "Removed entirely", "Made faster"], "answer": 1, "cat": "gaming", "diff": "easy"},
+    {"q": "Which company created The Legend of Zelda series?", "choices": ["Sega", "Nintendo", "Capcom", "Square Enix"], "answer": 1, "cat": "gaming", "diff": "easy"},
+    {"q": "Which company makes the PlayStation console?", "choices": ["Microsoft", "Nintendo", "Sony", "Sega"], "answer": 2, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'AFK\' stand for?", "choices": ["Away From Keyboard", "Always Fully Known", "Attack From Kill", "Away For Kicks"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'NPC\' stand for?", "choices": ["Non-Player Character", "New Player Class", "Network Player Code", "Non-Playable Client"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "Which studio developed Minecraft?", "choices": ["Mojang", "Valve", "Epic Games", "Rockstar"], "answer": 0, "cat": "gaming", "diff": "medium"},
+    {"q": "What does \'DLC\' stand for?", "choices": ["Downloadable Content", "Direct Live Connection", "Digital License Code", "Default Level Class"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "Which game features the character Master Chief?", "choices": ["Halo", "Gears of War", "Destiny", "Doom"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What in-game currency is used in Fortnite\'s item shop?", "choices": ["V-Bucks", "Robux", "Gold", "Credits"], "answer": 0, "cat": "gaming", "diff": "easy"},
+    {"q": "What does \'MMORPG\' stand for?", "choices": ["Massively Multiplayer Online Role-Playing Game", "Multi-Mode Online RPG", "Massive Multiplayer Overworld RPG", "Main Menu Online Role-Playing Game"], "answer": 0, "cat": "gaming", "diff": "medium"},
+
+    # -- sports ---------------------------------------------------------------
+    {"q": "In football (soccer), how many players per team are on the pitch at once?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "How many points is a touchdown worth in American football (before extra point/conversion)?", "choices": ["5", "6", "7", "3"], "answer": 1, "cat": "sports", "diff": "medium"},
+    {"q": "Which country has won the most FIFA World Cups?", "choices": ["Germany", "Argentina", "Brazil", "Italy"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many Grand Slam tournaments are there in tennis each year?", "choices": ["2", "3", "4", "5"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many players are on an NBA basketball court per team at once?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports", "diff": "easy"},
+    {"q": "What sport uses a shuttlecock?", "choices": ["Tennis", "Squash", "Badminton", "Table Tennis"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "In cricket, how many players are on a team?", "choices": ["9", "10", "11", "12"], "answer": 2, "cat": "sports", "diff": "easy"},
+    {"q": "What is the maximum possible score in ten-pin bowling?", "choices": ["100", "200", "300", "500"], "answer": 2, "cat": "sports", "diff": "medium"},
+    {"q": "How many rings are on the Olympic flag?", "choices": ["4", "5", "6", "7"], "answer": 1, "cat": "sports", "diff": "easy"},
+
+    # -- movies ---------------------------------------------------------------
+    {"q": "Who directed the movie \'Inception\'?", "choices": ["Steven Spielberg", "James Cameron", "Christopher Nolan", "Denis Villeneuve"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "Which movie won the Academy Award for Best Picture in 2020 (for 2019 films)?", "choices": ["1917", "Joker", "Parasite", "Once Upon a Time in Hollywood"], "answer": 2, "cat": "movies", "diff": "medium"},
+    {"q": "Who played Iron Man in the Marvel Cinematic Universe?", "choices": ["Chris Evans", "Chris Hemsworth", "Robert Downey Jr.", "Mark Ruffalo"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "Which movie features the line \'I\'ll be back\'?", "choices": ["RoboCop", "The Terminator", "Predator", "Total Recall"], "answer": 1, "cat": "movies", "diff": "easy"},
+    {"q": "Who directed both Jaws and E.T.?", "choices": ["George Lucas", "Steven Spielberg", "Ridley Scott", "James Cameron"], "answer": 1, "cat": "movies", "diff": "medium"},
+    {"q": "Which studio produces the Toy Story franchise?", "choices": ["DreamWorks", "Illumination", "Pixar", "Blue Sky Studios"], "answer": 2, "cat": "movies", "diff": "easy"},
+    {"q": "What color is Shrek?", "choices": ["Blue", "Green", "Purple", "Brown"], "answer": 1, "cat": "movies", "diff": "easy"},
+    {"q": "Which fictional school does Harry Potter attend?", "choices": ["Hogwarts", "Camp Half-Blood", "Xavier\'s School", "Brakebills"], "answer": 0, "cat": "movies", "diff": "easy"},
+
+    # -- internet / meme culture ---------------------------------------------------------------
+    {"q": "What does \'GOAT\' mean in internet slang?", "choices": ["Great Or Awful Time", "Greatest Of All Time", "Game Over And Terminated", "Getting Older And Tired"], "answer": 1, "cat": "internet", "diff": "easy"},
+    {"q": "What\'s the internet slang term for a message someone regrets sending?", "choices": ["L take", "Ratio", "Delete this", "Cringe"], "answer": 3, "cat": "internet", "diff": "medium"},
+    {"q": "Which streaming platform is Discord most commonly used alongside for gaming communities?", "choices": ["Netflix", "Twitch", "Hulu", "Disney+"], "answer": 1, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'IRL\' stand for?", "choices": ["In Real Life", "I Really Like", "Internet Relay Log", "Is Really Legit"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'FOMO\' stand for?", "choices": ["Fear Of Missing Out", "Focus On My Own", "Fear Of Moving On", "Fun Only Matters Once"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'TL;DR\' mean?", "choices": ["Too Long; Didn\'t Read", "Talk Later; Did Reply", "Time Left; Day Remaining", "This Line Doesn\'t Register"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "What does \'POV\' stand for in a meme/video caption?", "choices": ["Point Of View", "Power Of Video", "Play On Voice", "Post Of the Various"], "answer": 0, "cat": "internet", "diff": "easy"},
+    {"q": "Which platform popularized the \'For You Page\'?", "choices": ["Instagram", "TikTok", "Snapchat", "YouTube"], "answer": 1, "cat": "internet", "diff": "easy"},
+
+    # -- general knowledge ---------------------------------------------------------------
+    {"q": "What is the capital of Japan?", "choices": ["Osaka", "Kyoto", "Tokyo", "Nagoya"], "answer": 2, "cat": "general", "diff": "easy"},
+    {"q": "What is the largest planet in our solar system?", "choices": ["Saturn", "Jupiter", "Neptune", "Uranus"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "Which element has the chemical symbol \'Fe\'?", "choices": ["Fluorine", "Iron", "Francium", "Ferrite"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "What is the smallest planet in our solar system?", "choices": ["Mars", "Mercury", "Venus", "Pluto"], "answer": 1, "cat": "general", "diff": "medium"},
+    {"q": "Which ocean is the largest by area?", "choices": ["Atlantic", "Indian", "Arctic", "Pacific"], "answer": 3, "cat": "general", "diff": "easy"},
+    {"q": "What is the hardest naturally occurring substance on Earth?", "choices": ["Quartz", "Diamond", "Titanium", "Granite"], "answer": 1, "cat": "general", "diff": "easy"},
+    {"q": "How many continents are there?", "choices": ["5", "6", "7", "8"], "answer": 2, "cat": "general", "diff": "easy"},
+    {"q": "What is the official currency of Japan?", "choices": ["Won", "Yuan", "Yen", "Ringgit"], "answer": 2, "cat": "general", "diff": "easy"},
+
+    # -- music ---------------------------------------------------------------
+    {"q": "Which artist is known as the \'King of Pop\'?", "choices": ["Prince", "Elvis Presley", "Michael Jackson", "Stevie Wonder"], "answer": 2, "cat": "music", "diff": "easy"},
+    {"q": "How many strings does a standard acoustic guitar have?", "choices": ["4", "5", "6", "7"], "answer": 2, "cat": "music", "diff": "easy"},
+    {"q": "Which British band performed \'Bohemian Rhapsody\'?", "choices": ["The Beatles", "Queen", "Led Zeppelin", "Pink Floyd"], "answer": 1, "cat": "music", "diff": "medium"},
+    {"q": "How many keys does a standard piano have?", "choices": ["76", "88", "96", "100"], "answer": 1, "cat": "music", "diff": "medium"},
+    {"q": "Which streaming platform\'s logo is a green circle with sound bars?", "choices": ["Apple Music", "SoundCloud", "Spotify", "Tidal"], "answer": 2, "cat": "music", "diff": "easy"},
+
+    # -- science ---------------------------------------------------------------
+    {"q": "What is the chemical formula for water?", "choices": ["CO2", "H2O", "O2", "NaCl"], "answer": 1, "cat": "science", "diff": "easy"},
+    {"q": "Which planet is known as the Red Planet?", "choices": ["Venus", "Jupiter", "Mars", "Saturn"], "answer": 2, "cat": "science", "diff": "easy"},
+    {"q": "What gas do plants absorb from the atmosphere for photosynthesis?", "choices": ["Oxygen", "Nitrogen", "Carbon dioxide", "Hydrogen"], "answer": 2, "cat": "science", "diff": "easy"},
+    {"q": "Roughly how fast does light travel in a vacuum?", "choices": ["3,000 km/s", "30,000 km/s", "300,000 km/s", "3,000,000 km/s"], "answer": 2, "cat": "science", "diff": "medium"},
+    {"q": "Which part of a cell contains its genetic material?", "choices": ["Mitochondria", "Nucleus", "Cytoplasm", "Ribosome"], "answer": 1, "cat": "science", "diff": "easy"},
+]
+
+
+
+class TriviaAnswerButton(discord.ui.Button):
+    def __init__(self, label: str, index: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label=label[:80])
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "TriviaRoundView" = self.view
+        await view.handle_answer(interaction, self.index)
+
+
+class TriviaRoundView(discord.ui.View):
+    """One question. Open to anyone in the channel (solo or free-for-all) —
+    first correct click wins the round, wrong clicks just get a quiet
+    ephemeral nudge so the round stays live for everyone else."""
+
+    def __init__(self, question: dict, guild_id: int, scoreboard: dict[int, int]):
+        super().__init__(timeout=20)
+        self.question = question
+        self.guild_id = guild_id
+        self.scoreboard = scoreboard
+        self.winner: discord.Member | None = None
+        self.resolved = asyncio.Event()
+        # Tracks who's already answered wrong on THIS question, so a miss is
+        # only recorded once per person (not once per click) — stops someone
+        # from spam-clicking wrong answers to pad their loss count, while
+        # still letting them keep guessing other options for the round.
+        self.wrong_users: set[int] = set()
+        labels = ["🇦", "🇧", "🇨", "🇩"]
+        for i, choice in enumerate(question["choices"]):
+            self.add_item(TriviaAnswerButton(f"{labels[i]} {choice}", i))
+
+    async def handle_answer(self, interaction: discord.Interaction, index: int):
+        if self.resolved.is_set():
+            await interaction.response.send_message("This question's already been answered.", ephemeral=True)
+            return
+
+        if index != self.question["answer"]:
+            if interaction.user.id not in self.wrong_users:
+                self.wrong_users.add(interaction.user.id)
+                await db.record_game_result(self.guild_id, interaction.user.id, "trivia", "loss")
+                await interaction.response.send_message("Nope — try another option.", ephemeral=True)
+            else:
+                await interaction.response.send_message(
+                    "Already marked wrong on this one — let someone else take a shot, or wait for the next question.",
+                    ephemeral=True,
+                )
+            return
+
+        self.winner = interaction.user
+        self.resolved.set()
+        for child in self.children:
+            child.disabled = True
+
+        new_balance = await db.adjust_balance(self.guild_id, interaction.user.id, PAYOUT["trivia_correct"])
+        await db.record_game_result(self.guild_id, interaction.user.id, "trivia", "win")
+        self.scoreboard[interaction.user.id] = self.scoreboard.get(interaction.user.id, 0) + 1
+
+        correct_text = self.question["choices"][self.question["answer"]]
+        await interaction.response.edit_message(
+            content=(
+                f"**{self.question['q']}**\n\n✅ {interaction.user.mention} got it — "
+                f"**{correct_text}**! +{PAYOUT['trivia_correct']} coins (balance: {new_balance})."
+            ),
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.resolved.is_set():
+            return
+        self.resolved.set()
+        for child in self.children:
+            child.disabled = True
+
+
 class Games(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.active_guess_games: dict[int, GuessNumberGame] = {}
+        self.active_trivia_channels: set[int] = set()
+        # channel_id -> deque of recently-asked question texts, so back-to-back
+        # /trivia rounds in the same channel don't immediately repeat — this
+        # was the exact issue reported (small pool meant round 2 restarted
+        # with the same 3 questions as round 1).
+        self.recent_trivia_questions: dict[int, collections.deque] = {}
 
     # -- Tic Tac Toe --------------------------------------------------------
 
@@ -955,6 +1988,177 @@ class Games(commands.Cog):
         else:
             await message.reply("Lower ⬇️", mention_author=False)
 
+    # -- Connect Four ---------------------------------------------------------
+
+    @app_commands.command(name="connect4", description="Challenge someone to Connect Four")
+    @app_commands.describe(opponent="Who do you want to play against?")
+    async def connect4(self, interaction: discord.Interaction, opponent: discord.Member):
+        if opponent.bot:
+            await interaction.response.send_message("Pick a human opponent.", ephemeral=True)
+            return
+        if opponent.id == interaction.user.id:
+            await interaction.response.send_message("You can't play yourself.", ephemeral=True)
+            return
+
+        view = Connect4View(interaction.user, opponent, interaction.guild_id)
+        board = view._render()
+        await interaction.response.send_message(
+            f"{board}\n\n{interaction.user.mention} (🔴) vs {opponent.mention} (🟡) — "
+            f"{interaction.user.mention}'s turn",
+            view=view,
+        )
+
+    # -- Trivia ---------------------------------------------------------------
+
+    @app_commands.command(name="trivia", description="Trivia round(s) — solo or open free-for-all")
+    @app_commands.describe(
+        rounds="How many questions (default 5, max 10)",
+        category="Optional: limit to one category",
+        level="Difficulty. Auto uses your own progress — you unlock harder tiers by answering correctly over time.",
+    )
+    @app_commands.choices(category=[
+        app_commands.Choice(name="General knowledge", value="general"),
+        app_commands.Choice(name="Gaming", value="gaming"),
+        app_commands.Choice(name="Anime", value="anime"),
+        app_commands.Choice(name="Sports", value="sports"),
+        app_commands.Choice(name="Movies", value="movies"),
+        app_commands.Choice(name="Internet culture", value="internet"),
+        app_commands.Choice(name="Music", value="music"),
+        app_commands.Choice(name="Science", value="science"),
+    ])
+    @app_commands.choices(level=[
+        app_commands.Choice(name="Auto (based on your progress)", value="auto"),
+        app_commands.Choice(name="Easy", value="easy"),
+        app_commands.Choice(name="Medium", value="medium"),
+        app_commands.Choice(name="Hard (niche)", value="hard"),
+    ])
+    async def trivia(
+        self,
+        interaction: discord.Interaction,
+        rounds: app_commands.Range[int, 1, 10] = 5,
+        category: app_commands.Choice[str] | None = None,
+        level: app_commands.Choice[str] | None = None,
+    ):
+        if interaction.channel_id in self.active_trivia_channels:
+            await interaction.response.send_message(
+                "There's already a trivia round running in this channel.", ephemeral=True
+            )
+            return
+
+        # Auto mode: the invoker's own progress decides the tier — this is
+        # what lets someone naturally advance to harder/niche questions as
+        # they rack up correct answers, without having to know to ask for it.
+        level_value = (level.value if level else "auto")
+        invoker_correct = (await db.get_game_stats(interaction.guild_id, interaction.user.id, "trivia")).get("wins", 0)
+        auto_level = db.get_trivia_level(invoker_correct)
+        effective_level = auto_level if level_value == "auto" else level_value
+
+        category_pool = TRIVIA_BANK if category is None else [q for q in TRIVIA_BANK if q["cat"] == category.value]
+        if not category_pool:
+            await interaction.response.send_message("No questions in that category yet.", ephemeral=True)
+            return
+
+        # Exact difficulty match first; if that's too thin (a filtered
+        # category might not have many "hard" entries yet), broaden to
+        # easier tiers rather than failing outright — same fallback
+        # philosophy as the repeat-avoidance logic below. actual_tier tracks
+        # whichever tier we actually land on, since it can differ from what
+        # was requested when a category doesn't have that tier populated yet.
+        DIFFICULTY_FALLBACK = {"hard": ["hard", "medium", "easy"], "medium": ["medium", "easy"], "easy": ["easy"]}
+        pool = []
+        actual_tier = effective_level
+        for tier in DIFFICULTY_FALLBACK.get(effective_level, ["easy"]):
+            candidate = [q for q in category_pool if q["diff"] == tier]
+            if candidate:
+                pool, actual_tier = candidate, tier
+            if len(candidate) >= rounds:
+                break
+        if not pool:
+            pool, actual_tier = category_pool, "mixed"
+        rounds = min(rounds, len(pool))
+
+        # Avoid repeating whatever this channel was just asked. If the
+        # category's pool is too small to fill the round without dipping into
+        # recent questions, top off from the full pool rather than erroring —
+        # a slightly-sooner repeat beats not being able to run trivia at all.
+        recent = self.recent_trivia_questions.get(interaction.channel_id, collections.deque())
+        fresh_pool = [q for q in pool if q["q"] not in recent]
+        if len(fresh_pool) >= rounds:
+            questions = random.sample(fresh_pool, k=rounds)
+        else:
+            questions = fresh_pool + random.sample(
+                [q for q in pool if q not in fresh_pool], k=min(rounds - len(fresh_pool), len(pool) - len(fresh_pool))
+            )
+            random.shuffle(questions)
+
+        # Remember these so the next round (in this channel) skips them too.
+        # Window sized relative to the full bank so small category filters
+        # don't lock themselves out of their own (smaller) pool.
+        window_size = max(rounds, min(60, len(TRIVIA_BANK) - 5))
+        recent_deque = self.recent_trivia_questions.setdefault(
+            interaction.channel_id, collections.deque(maxlen=window_size)
+        )
+        if recent_deque.maxlen != window_size:
+            recent_deque = collections.deque(recent_deque, maxlen=window_size)
+            self.recent_trivia_questions[interaction.channel_id] = recent_deque
+        for q in questions:
+            recent_deque.append(q["q"])
+
+        self.active_trivia_channels.add(interaction.channel_id)
+        scoreboard: dict[int, int] = {}
+
+        level_note = f" — {actual_tier} tier" if actual_tier != "mixed" else ""
+        if actual_tier != effective_level and effective_level != "auto":
+            level_note += f" (not enough '{effective_level}' questions here yet, so this is {actual_tier})"
+        await interaction.response.send_message(
+            f"🧠 Trivia time{level_note} — {len(questions)} question(s), first correct answer wins each round. Go!"
+        )
+
+        try:
+            for i, question in enumerate(questions, start=1):
+                view = TriviaRoundView(question, interaction.guild_id, scoreboard)
+                diff_tag = question.get("diff", "easy")
+                msg = await interaction.channel.send(
+                    f"**Q{i}/{len(questions)} ({question['cat']}, {diff_tag}):** {question['q']}", view=view
+                )
+                await view.wait()
+                if not view.winner:
+                    correct_text = question["choices"][question["answer"]]
+                    for child in view.children:
+                        child.disabled = True
+                    try:
+                        await msg.edit(
+                            content=f"**{question['q']}**\n\n⏰ Time's up! The answer was **{correct_text}**.",
+                            view=view,
+                        )
+                    except discord.HTTPException:
+                        pass
+                await asyncio.sleep(2)
+
+            if scoreboard:
+                lines = []
+                for uid, score in sorted(scoreboard.items(), key=lambda kv: kv[1], reverse=True):
+                    member = interaction.guild.get_member(uid)
+                    name = member.display_name if member else f"User {uid}"
+                    lines.append(f"**{name}** — {score} correct")
+                embed = discord.Embed(
+                    title="🏆 Trivia results", description="\n".join(lines), color=discord.Color.gold()
+                )
+                # Nudge the invoker with their live progress toward the next
+                # difficulty tier — makes the progression visible instead of
+                # something that just silently happens in the background.
+                new_correct = (await db.get_game_stats(interaction.guild_id, interaction.user.id, "trivia")).get("wins", 0)
+                next_level, remaining = db.trivia_next_level_info(new_correct)
+                if next_level:
+                    embed.set_footer(text=f"Your trivia level: {db.get_trivia_level(new_correct)} — {remaining} more correct to unlock {next_level}.")
+                else:
+                    embed.set_footer(text=f"Your trivia level: {db.get_trivia_level(new_correct)} (max tier)")
+                await interaction.channel.send(embed=embed)
+            else:
+                await interaction.channel.send("Nobody got one right that round — tough crowd. 😏")
+        finally:
+            self.active_trivia_channels.discard(interaction.channel_id)
+
     # -- Economy ------------------------------------------------------------
 
     @app_commands.command(name="balance", description="Check a coin balance")
@@ -988,7 +2192,7 @@ class Games(commands.Cog):
     @app_commands.describe(user="Whose stats to check (defaults to you)")
     async def gamestats(self, interaction: discord.Interaction, user: discord.Member | None = None):
         target = user or interaction.user
-        games = ["tictactoe", "rps", "guessnumber"]
+        games = ["tictactoe", "rps", "guessnumber", "connect4", "trivia"]
         lines = []
         for g in games:
             stats = await db.get_game_stats(interaction.guild_id, target.id, g)
@@ -1003,366 +2207,6 @@ class Games(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Games(bot))
-</file>
-
-<file path="utils/permissions.py">
-import os
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-
-def _is_owner(user_id: int) -> bool:
-    owner_id = os.getenv("OWNER_ID", "").strip()
-    return owner_id.isdigit() and int(owner_id) == user_id
-
-
-def is_admin_or_mod():
-    """Allows the bot owner, or users with Administrator/Manage Server/Kick/Ban permissions."""
-    def predicate(interaction: discord.Interaction) -> bool:
-        if _is_owner(interaction.user.id):
-            return True
-        perms = interaction.user.guild_permissions
-        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
-    return app_commands.check(predicate)
-
-
-def is_admin_or_mod_ctx():
-    async def predicate(ctx: commands.Context) -> bool:
-        if _is_owner(ctx.author.id):
-            return True
-        perms = ctx.author.guild_permissions
-        return perms.administrator or perms.kick_members or perms.ban_members or perms.manage_guild
-    return commands.check(predicate)
-
-
-def is_owner_only():
-    """Restricts a command to only the bot owner, regardless of server roles."""
-    def predicate(interaction: discord.Interaction) -> bool:
-        return _is_owner(interaction.user.id)
-    return app_commands.check(predicate)
-</file>
-
-<file path=".gitignore">
-.env
-data/
-</file>
-
-<file path="personality_default.json">
-{
-  "name": "Lucy",
-  "age": "21",
-  "pronouns": "she/her",
-  "role": "Server admin assistant & friend to everyone here",
-  "traits": "Sharp-tongued, guarded until she trusts you, dry deadpan humor over bubbliness, confident, visibly competent, fiercely loyal to people she's decided are 'hers' (starting with the server owner), doesn't perform warmth she doesn't feel",
-  "backstory": "Lucy grew up online, learned to run this place the hard way, and doesn't waste words. She takes her admin duties seriously and doesn't tolerate people messing with the server, but she's not cold — just economical with the niceties until you've earned them.",
-  "speaking_style": "Casual, short punchy sentences, deadpan delivery, minimal emoji, never robotic or overly formal, comfortable with silence instead of filling it",
-  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
-}
-</file>
-
-<file path="requirements.txt">
-discord.py>=2.4.0
-aiohttp>=3.9.0
-asyncpg>=0.29.0
-python-dotenv>=1.0.0
-</file>
-
-<file path="cogs/utility.py">
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from utils import database as db
-from utils.permissions import is_admin_or_mod
-
-
-class Utility(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    # ---------- WELCOME ----------
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        settings = await db.get_guild_settings(member.guild.id)
-        channel_id = settings.get("welcome_channel_id")
-        if not channel_id:
-            return
-        channel = member.guild.get_channel(channel_id)
-        if not channel:
-            return
-        msg = settings.get("welcome_message") or "Welcome {member} to **{server}**! 🎉"
-        text = msg.replace("{member}", member.mention).replace("{server}", member.guild.name)
-        try:
-            await channel.send(text)
-        except discord.Forbidden:
-            pass
-
-    @app_commands.command(name="setwelcome", description="Set the welcome channel and message")
-    @is_admin_or_mod()
-    async def setwelcome(self, interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {member} to **{server}**! 🎉"):
-        await db.update_guild_setting(interaction.guild.id, welcome_channel_id=channel.id, welcome_message=message)
-        await interaction.response.send_message(f"✅ Welcome messages will go to {channel.mention}.\nUse `{{member}}` and `{{server}}` as placeholders.")
-
-    # ---------- LOG CHANNEL ----------
-    @app_commands.command(name="setlogchannel", description="Set the moderation log channel")
-    @is_admin_or_mod()
-    async def setlogchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.update_guild_setting(interaction.guild.id, log_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Moderation logs will go to {channel.mention}.")
-
-    # ---------- CHAT TRIGGER CONFIG ----------
-    @app_commands.command(name="setchattrigger", description="Configure when Lucy jumps into chat")
-    @is_admin_or_mod()
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
-        app_commands.Choice(name="Dedicated channel only", value="channel"),
-        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
-        app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
-        app_commands.Choice(name="All of the above", value="all"),
-    ])
-    async def setchattrigger(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
-        await db.update_guild_setting(interaction.guild.id, chat_trigger_mode=mode.value)
-        await interaction.response.send_message(f"✅ Lucy's chat trigger mode set to **{mode.name}**.")
-
-    @app_commands.command(name="setchatchannel", description="Set the dedicated channel for chatting with Lucy")
-    @is_admin_or_mod()
-    async def setchatchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
-
-    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
-    @is_admin_or_mod()
-    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.set_vent_channel(interaction.guild.id, channel.id)
-        await interaction.response.send_message(
-            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
-            "like they need a check-in. She won't reply publicly there unless mentioned."
-        )
-
-    # ---------- ROLE ASSIGN ----------
-    @app_commands.command(name="giverole", description="Give a role to a member")
-    @is_admin_or_mod()
-    async def giverole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-        await member.add_roles(role)
-        await interaction.response.send_message(f"✅ Gave {role.mention} to {member.mention}.")
-
-    @app_commands.command(name="removerole", description="Remove a role from a member")
-    @is_admin_or_mod()
-    async def removerole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-        await member.remove_roles(role)
-        await interaction.response.send_message(f"✅ Removed {role.mention} from {member.mention}.")
-
-    # ---------- SIMPLE TICKETS ----------
-    @app_commands.command(name="ticket", description="Open a private support ticket")
-    async def ticket(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
-        channel = await guild.create_text_channel(
-            name=f"ticket-{interaction.user.name}", overwrites=overwrites
-        )
-        await channel.send(f"🎫 {interaction.user.mention} a staff member will be with you shortly!")
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-
-    @app_commands.command(name="closeticket", description="Close the current ticket channel")
-    async def closeticket(self, interaction: discord.Interaction):
-        if not interaction.channel.name.startswith("ticket-"):
-            await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
-            return
-        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
-        await interaction.channel.delete(delay=5)
-
-    # ---------- INFO ----------
-    @app_commands.command(name="serverinfo", description="Show info about this server")
-    async def serverinfo(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
-        embed.add_field(name="Members", value=guild.member_count)
-        embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"))
-        embed.add_field(name="Owner", value=str(guild.owner))
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="userinfo", description="Show info about a member")
-    async def userinfo(self, interaction: discord.Interaction, member: discord.Member = None):
-        member = member or interaction.user
-        embed = discord.Embed(title=str(member), color=discord.Color.blurple())
-        embed.add_field(name="Joined", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
-        embed.add_field(name="Account created", value=member.created_at.strftime("%Y-%m-%d"))
-        roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
-        embed.add_field(name="Roles", value=roles or "None", inline=False)
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Utility(bot))
-</file>
-
-<file path="main.py">
-"""
-main.py
-
-Entry point for Lucy. Changes in this version:
-  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
-    and closes it cleanly on shutdown.
-  - Loads two new cogs: games (mini-games) and news (real headlines).
-  - Everything else (owner_id wiring, slash sync, prefix commands) is
-    unchanged from before.
-"""
-
-import os
-import asyncio
-import logging
-
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
-
-from utils import database as db
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("lucy.main")
-
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
-INTENTS.members = True
-
-COGS = [
-    "cogs.moderation",
-    "cogs.utility",
-    "cogs.personality",
-    "cogs.ai_chat",
-    "cogs.games",
-    "cogs.news",
-    "cogs.preferences",
-    "cogs.serverlog",
-]
-
-
-class Lucy(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=INTENTS)
-
-    async def setup_hook(self):
-        await db.init_pool()
-        logger.info("Postgres pool ready.")
-
-        for cog in COGS:
-            try:
-                await self.load_extension(cog)
-                logger.info("Loaded %s", cog)
-            except Exception:
-                logger.exception("Failed to load %s", cog)
-
-        owner_id = os.getenv("OWNER_ID", "").strip()
-        if owner_id:
-            self.owner_id = int(owner_id)
-            logger.info("Owner ID set to %s", self.owner_id)
-        else:
-            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
-
-        synced = await self.tree.sync()
-        logger.info("Synced %d slash commands.", len(synced))
-
-    async def close(self):
-        await db.close_pool()
-        await super().close()
-
-
-async def main():
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN is not set.")
-
-    bot = Lucy()
-    async with bot:
-        await bot.start(token)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-</file>
-
-<file path="README.md">
-# Lucy — Your Discord AI Assistant
-
-A Python Discord bot with a customizable AI personality (powered by NVIDIA NIM, free tier),
-full moderation, and server utilities. Both slash (`/`) and prefix (`!`) commands supported.
-
-## 1. Create the Discord bot
-1. Go to https://discord.com/developers/applications → **New Application**.
-2. Go to the **Bot** tab → click **Reset Token** → copy it (this is `DISCORD_TOKEN`).
-3. Under **Privileged Gateway Intents**, enable:
-   - Presence Intent (optional)
-   - Server Members Intent (required)
-   - Message Content Intent (required)
-4. Go to **OAuth2 → URL Generator**:
-   - Scopes: `bot`, `applications.commands`
-   - Bot permissions: `Administrator` (simplest for full-power admin bot)
-   - Copy the generated URL and open it to invite Lucy to your server.
-
-## 2. Get an NVIDIA NIM API key (free)
-1. Go to https://build.nvidia.com → sign in → pick a chat model (e.g. `meta/llama-3.3-70b-instruct`).
-2. Click **Get API Key** → copy it (this is `NVIDIA_API_KEY`). NIM has a generous free tier.
-
-## 3. Configure environment
-Copy `.env.example` to `.env` and fill in:
-```
-DISCORD_TOKEN=...
-NVIDIA_API_KEY=...
-NIM_MODEL=meta/llama-3.3-70b-instruct
-DEFAULT_PREFIX=!
-```
-
-## 4. Run locally (optional test)
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-## 5. Deploy free on Railway
-1. Push this folder to a GitHub repo.
-2. Go to https://railway.app → **New Project → Deploy from GitHub repo**.
-3. Add the environment variables from `.env` in Railway's **Variables** tab.
-4. Railway auto-detects the `Procfile` and runs `python main.py` as a worker.
-
-⚠️ **Note on SQLite + Railway free tier:** the filesystem resets on redeploy unless you attach a
-persistent Volume (Railway supports this in the free tier — mount it at `/app/data`). Without a
-volume, warnings/personality/chat memory reset each time you redeploy (bot still works fine day-to-day).
-
-## 6. Configure Lucy in your server
-Run these once, in Discord:
-- `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries (one field at a time)
-- `/profile` — view Lucy's current profile
-- `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / name-said / all)
-- `/setchatchannel` — pick her dedicated chat channel (if using that mode)
-- `/setlogchannel` — where moderation actions get logged
-- `/setwelcome` — welcome channel + message for new members
-
-## What's included
-- **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
-- **Utility:** welcome messages, role give/remove, ticket system, server/user info
-- **AI Chat:** Lucy responds in character using NVIDIA NIM, remembers last ~12 messages per channel
-- **Personality:** fully editable per-server via slash commands, no code editing needed
-
-## Adding more later
-This is a clean foundation — economy/games, leveling, reaction roles, and auto-mod filters can all
-be added as new cogs in `cogs/` without touching existing code.
-# discord-assistant-replica-
-# discord-assistant-replica-
-# discord-assistant-replica-
-# discord-assistant-replica-
 </file>
 
 <file path="utils/database.py">
@@ -1711,26 +2555,52 @@ async def get_profile(guild_id: int, user_id: int) -> dict | None:
 
 
 async def touch_profile(guild_id: int, user_id: int, username: str, display_name: str) -> dict:
-    """Upsert a profile, bump message_count + last_seen. Stores the immutable
-    Discord username alongside the (changeable) display name and the id, so
-    long-term memory is keyed on something more durable than a nickname.
-    Returns the fresh row."""
+    """Upsert a profile, bump message_count + last_seen + relationship_score.
+    Stores the immutable Discord username alongside the (changeable) display
+    name and the id, so long-term memory is keyed on something more durable
+    than a nickname. Returns the fresh row.
+
+    relationship_score climbs by 1 per message (see get_relationship_tier
+    below for the tier thresholds) — this is what lets Lucy naturally warm
+    up to someone over time instead of treating every conversation like the
+    first one."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen)
-            VALUES ($1, $2, $3, $4, 1, now())
+            INSERT INTO user_profiles (guild_id, user_id, username, display_name, message_count, last_seen, relationship_score)
+            VALUES ($1, $2, $3, $4, 1, now(), 1)
             ON CONFLICT (guild_id, user_id) DO UPDATE
             SET username = $3,
                 display_name = $4,
                 message_count = user_profiles.message_count + 1,
-                last_seen = now()
+                last_seen = now(),
+                relationship_score = user_profiles.relationship_score + 1
             RETURNING *
             """,
             guild_id, user_id, username, display_name,
         )
         return dict(row)
+
+
+# Tier thresholds on relationship_score (roughly: score climbs ~1/message,
+# plus small bumps from positive feedback and playing games together — see
+# add_feedback callers and record_game_result callers). Tuned so a
+# reasonably active member reaches "friend" within a few real conversations,
+# not months.
+RELATIONSHIP_TIERS = [
+    (250, "best friend"),
+    (80, "close friend"),
+    (20, "friend"),
+    (0, "acquaintance"),
+]
+
+
+def get_relationship_tier(score: int) -> str:
+    for threshold, label in RELATIONSHIP_TIERS:
+        if score >= threshold:
+            return label
+    return "acquaintance"
 
 
 async def set_user_preference(guild_id: int, user_id: int, *, preferred_language: str | None = None,
@@ -1766,7 +2636,7 @@ async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
     pool = _require_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE user_profiles SET relationship_score = relationship_score + $3 "
+            "UPDATE user_profiles SET relationship_score = GREATEST(relationship_score + $3, 0) "
             "WHERE guild_id = $1 AND user_id = $2",
             guild_id, user_id, delta,
         )
@@ -1777,7 +2647,9 @@ async def adjust_relationship_score(guild_id: int, user_id: int, delta: int):
 # ---------------------------------------------------------------------------
 
 async def record_game_result(guild_id: int, user_id: int, game: str, result: str):
-    """result is 'win' | 'loss' | 'draw'"""
+    """result is 'win' | 'loss' | 'draw'. Playing together (any result) is a
+    small bonding signal, so it nudges relationship_score a little — same
+    idea as the feedback bump above, just smaller and unconditional."""
     col = {"win": "wins", "loss": "losses", "draw": "draws"}.get(result)
     if col is None:
         raise ValueError("result must be 'win', 'loss', or 'draw'")
@@ -1792,6 +2664,19 @@ async def record_game_result(guild_id: int, user_id: int, game: str, result: str
             """,
             guild_id, user_id, game,
         )
+    if user_id != _BOT_PLACEHOLDER_ID:
+        await adjust_relationship_score(guild_id, user_id, 1)
+
+
+# record_game_result is also called with the bot's own user id (Lucy "vs AI"
+# guess-the-number wins) — skip the relationship bump in that one case since
+# there's no user_profiles row for the bot and it wouldn't mean anything.
+_BOT_PLACEHOLDER_ID = None  # set at runtime by main.py via set_bot_user_id()
+
+
+def set_bot_user_id(bot_user_id: int):
+    global _BOT_PLACEHOLDER_ID
+    _BOT_PLACEHOLDER_ID = bot_user_id
 
 
 async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
@@ -1802,6 +2687,34 @@ async def get_game_stats(guild_id: int, user_id: int, game: str) -> dict:
             guild_id, user_id, game,
         )
         return dict(row) if row else {"wins": 0, "losses": 0, "draws": 0}
+
+
+# Trivia difficulty progression — driven entirely by the existing game_stats
+# "wins" count for game='trivia' (already incremented on every correct answer
+# via record_game_result), so no schema migration needed. Thresholds tuned so
+# progression feels earned but reachable within a normal play session or two,
+# not something that takes weeks.
+TRIVIA_LEVEL_THRESHOLDS = [
+    (30, "hard"),
+    (10, "medium"),
+    (0, "easy"),
+]
+
+
+def get_trivia_level(correct_count: int) -> str:
+    for threshold, label in TRIVIA_LEVEL_THRESHOLDS:
+        if correct_count >= threshold:
+            return label
+    return "easy"
+
+
+def trivia_next_level_info(correct_count: int) -> tuple[str | None, int]:
+    """Returns (next_level_name, correct_answers_still_needed), or (None, 0)
+    if already at the top tier."""
+    for threshold, label in reversed(TRIVIA_LEVEL_THRESHOLDS):
+        if correct_count < threshold:
+            return label, threshold - correct_count
+    return None, 0
 
 
 # ---------------------------------------------------------------------------
@@ -1832,7 +2745,9 @@ async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 
 
 async def add_feedback(guild_id: int, user_id: int, channel_id: int,
                          message_snippet: str, rating: str, note: str | None = None):
-    """rating is 'up' or 'down'."""
+    """rating is 'up' or 'down'. A 👍 is a small direct signal the
+    conversation actually went well, so it nudges relationship_score a bit
+    beyond the flat per-message bump; a 👎 nudges it back down slightly."""
     pool = _require_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1840,6 +2755,7 @@ async def add_feedback(guild_id: int, user_id: int, channel_id: int,
             "VALUES ($1, $2, $3, $4, $5, $6)",
             guild_id, user_id, channel_id, message_snippet, rating, note,
         )
+    await adjust_relationship_score(guild_id, user_id, 3 if rating == "up" else -1)
 
 
 async def get_recent_negative_feedback(guild_id: int, limit: int = 5) -> list[dict]:
@@ -1967,10 +2883,12 @@ import logging
 from collections import defaultdict
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from utils import database as db
 from utils import nim_client
+from utils import groq_client
+from utils import awareness
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -1995,6 +2913,22 @@ class AIChat(commands.Cog):
         self._last_alert: dict[tuple[int, int], float] = {}
         # channel_id -> last time we ran a vent-channel classification call
         self._last_vent_check: dict[int, float] = {}
+
+    async def cog_load(self):
+        # Prime the news digest once at startup so the very first replies
+        # already have it, then keep it refreshed in the background.
+        asyncio.create_task(awareness.refresh_digest(force=True))
+        self._news_refresh_loop.start()
+
+    async def cog_unload(self):
+        self._news_refresh_loop.cancel()
+
+    @tasks.loop(hours=3)
+    async def _news_refresh_loop(self):
+        try:
+            await awareness.refresh_digest()
+        except Exception:
+            logger.exception("Background news digest refresh failed")
 
     # -----------------------------------------------------------------
     # Mention resolution
@@ -2146,28 +3080,39 @@ class AIChat(commands.Cog):
             return
         self._last_vent_check[message.channel.id] = now
 
-        try:
-            classification = await nim_client.call_nim(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You triage a single Discord message from a server's vent channel. "
-                            "Decide if the person sounds like they're genuinely struggling, upset, "
-                            "or going through something hard enough that a trusted adult/friend "
-                            "should probably check in on them — as opposed to normal venting, "
-                            "complaining, or joking around that doesn't need intervention. "
-                            "Reply with exactly one line: YES: <five word reason> or NO."
-                        ),
-                    },
-                    {"role": "user", "content": content[:1000]},
-                ],
-                max_tokens=20,
-                temperature=0.1,
-            )
-        except Exception as e:
-            logger.warning("Vent-channel classification failed, skipping: %s", e)
-            return
+        triage_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You triage a single Discord message from a server's vent channel. "
+                    "Decide if the person sounds like they're genuinely struggling, upset, "
+                    "or going through something hard enough that a trusted adult/friend "
+                    "should probably check in on them — as opposed to normal venting, "
+                    "complaining, or joking around that doesn't need intervention. "
+                    "Reply with exactly one line: YES: <five word reason> or NO."
+                ),
+            },
+            {"role": "user", "content": content[:1000]},
+        ]
+
+        # Cheap, high-frequency background task — keep it off the main NIM
+        # quota by preferring Groq, falling back to NIM only if Groq isn't
+        # configured or has a transient failure.
+        classification = None
+        if groq_client.is_configured():
+            try:
+                classification = await groq_client.call_groq(
+                    triage_messages, model=groq_client.MODEL_FAST, max_tokens=20, temperature=0.1,
+                )
+            except Exception as e:
+                logger.warning("Groq vent triage failed, falling back to NIM: %s", e)
+
+        if classification is None:
+            try:
+                classification = await nim_client.call_nim(triage_messages, max_tokens=20, temperature=0.1)
+            except Exception as e:
+                logger.warning("Vent-channel classification failed, skipping: %s", e)
+                return
 
         if classification.strip().upper().startswith("YES"):
             reason = classification.split(":", 1)[1].strip() if ":" in classification else "Seemed like they could use a check-in."
@@ -2320,6 +3265,8 @@ class AIChat(commands.Cog):
         can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
             or author.guild_permissions.manage_channels
 
+        relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
+
         system_prompt = nim_client.build_system_prompt(
             personality=personality,
             guild_name=guild.name,
@@ -2330,6 +3277,8 @@ class AIChat(commands.Cog):
             preferred_language=profile.get("preferred_language"),
             response_style=profile.get("response_style"),
             can_use_tools=can_use_tools,
+            relationship_tier=relationship_tier,
+            news_digest=awareness.get_cached_digest() or None,
         )
 
         # 5. In-channel short-term history
@@ -2378,6 +3327,8 @@ class AIChat(commands.Cog):
                     reply = (final_message.get("content") or "Done.").strip()
                 else:
                     reply = (assistant_message.get("content") or "").strip()
+
+                reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
         except Exception:
             logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
             await message.reply(
@@ -2435,13 +3386,68 @@ v2 changes:
 """
 
 import os
+import re
 import asyncio
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 
+from utils import groq_client
+
 logger = logging.getLogger("lucy.nim_client")
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def strip_roleplay_formatting(text: str, bot_name: str = "Lucy") -> str:
+    """Code-level safety net for the anti-roleplay-script prompt rule.
+    Model instructions aren't 100% reliable — this catches what slips
+    through: a leading "**Name:**"/"Name:" self-label, asterisk- or
+    parenthetical-wrapped action/stage-direction text, and a whole message
+    wrapped in a single pair of quotation marks. Applied after generation,
+    right before the reply is stored/sent."""
+    if not text:
+        return text
+
+    cleaned = text.strip()
+
+    # Leading self-label: "**Lucy:**", "Lucy:", "*Lucy*:" — markdown bold
+    # commonly wraps the colon too ("**Lucy:**"), so closing asterisks can
+    # land after the colon, not just before it.
+    cleaned = re.sub(
+        rf"^[*_]{{0,2}}\s*{re.escape(bot_name)}\s*[*_]{{0,2}}\s*:\s*[*_]{{0,2}}\s*",
+        "", cleaned, flags=re.IGNORECASE,
+    )
+
+    # IMPORTANT ORDER: handle **bold** before single-asterisk spans. Bold is
+    # legitimate emphasis (a name, a title) — we strip the markers but keep
+    # the word. If we ran the single-asterisk regex first, it would match
+    # *across* a "**word**" pair (treating the second "*" of the opener and
+    # first "*" of the closer as a fake italic-action span) and delete the
+    # real word entirely, leaving stray "**" debris — that was a real bug.
+    cleaned = re.sub(r"\*\*([^*\n]{1,200})\*\*", r"\1", cleaned)
+
+    # NOW it's safe to strip genuine single-asterisk action spans ("*glances
+    # at you*") and parenthetical narration ("(Back to neutral.)") — content
+    # and all, anywhere in the message.
+    cleaned = re.sub(r"\*([^*\n]{1,80})\*", "", cleaned)
+    cleaned = re.sub(r"\([^()\n]{1,80}\)", "", cleaned)
+    cleaned = cleaned.strip()
+
+    # Whole message wrapped in a single pair of quotation marks — unwrap it.
+    cleaned = cleaned.strip()
+    if len(cleaned) >= 2 and cleaned[0] in "\"\u201c" and cleaned[-1] in "\"\u201d":
+        inner = cleaned[1:-1].strip()
+        # only unwrap if those are the *outer* quotes (no unmatched quote inside)
+        if inner.count('"') == 0:
+            cleaned = inner
+
+    # Collapse any double-spacing left behind by removed spans/lines.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 NIM_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -2481,6 +3487,39 @@ There is no romantic subtext here — this is loyalty and priority, not a crush.
 Do not hint at, imply, or write toward any romantic or flirtatious framing with him.
 """
 
+# "Knows ball" — genuine fluency in niche/elite subcultures instead of the
+# generic-assistant habit of hedging or explaining things from the outside.
+CULTURAL_FLUENCY_ADDENDUM = """
+You're genuinely fluent in internet and gaming culture, not reciting it from \
+a textbook: gaming (meta shifts, tier lists, patch drama, speedrunning, competitive \
+scenes), anime/manga, sports (including current storylines, not just rules), music, \
+memes, and terminally-online slang. When someone brings up something niche, react \
+like a person who actually knows it and has opinions — don't over-explain the \
+reference back to them or hedge with "I'm not sure but...". It's fine to have a \
+take, disagree, or clown on a bad opinion. If something is genuinely outside what \
+you'd know, say so plainly instead of faking familiarity.
+"""
+
+RELATIONSHIP_TIER_NOTES = {
+    "acquaintance": (
+        "You don't really know this person yet. Be yourself, but keep some of your "
+        "usual guardedness — don't front like you're already close."
+    ),
+    "friend": (
+        "You've talked enough that you're comfortable with this person. A bit more "
+        "warmth and inside-joke energy than a stranger gets, less of the initial guard."
+    ),
+    "close friend": (
+        "You trust this person. Banter more freely, tease more, drop more of the "
+        "guardedness — the way you'd talk to someone you'd actually vouch for."
+    ),
+    "best friend": (
+        "This is one of your people. Full warmth, full trust, the most unguarded and "
+        "candid version of you (short of the owner) — comfortable enough to be blunt, "
+        "affectionate in a dry/deadpan way, and genuinely invested in how they're doing."
+    ),
+}
+
 BASE_SYSTEM_TEMPLATE = """You are {name}, a {age}-year-old AI ({pronouns}) serving as the \
 admin/assistant for the Discord server "{guild_name}". Your role here: {role}. \
 The server owner is {owner_name} — never say anyone else owns or runs this server, \
@@ -2495,7 +3534,12 @@ Tonal reference (style only, not lore to recite): think of the kind of energy \
 Lucy from Cyberpunk: Edgerunners has — sharp-tongued, guarded until she trusts \
 someone, dry and deadpan rather than bubbly, visibly competent, doesn't fake warmth \
 she doesn't feel, and fiercely protective of the people she's decided are "hers." \
-Helpful, but never a pushover, and never saccharine.
+Helpful, but never a pushover, and never saccharine. Concretely, that can show up as: \
+clipped, economical sentences rather than padding things out; a flat/dry delivery even \
+when what you're saying is actually funny or kind, instead of announcing the joke; \
+low-key needling or a raised-eyebrow "seriously?" when someone's being dramatic or \
+lazy; and a clear shift into genuine directness (no deflecting with a joke) when \
+something actually matters. This is a vibe to write in, not a script to quote.
 
 Hard rules:
 - You already have real, current data for anything listed under "known facts" below — \
@@ -2534,6 +3578,43 @@ let me help you with that!"). Just respond like someone who's actually paying at
 sounding like a real personality instead of a yes-machine.
 - Keep most replies short, the length of an actual Discord message — reserve longer replies for \
 when the question genuinely needs it.
+- Don't structure casual answers like a report: no bullet-point breakdowns, numbered lists, or \
+bolded headers when someone's just chatting or asking a quick question. People don't text each \
+other in bullet points. Write it as normal sentences/paragraphs instead. Only use an actual list \
+if the person explicitly asks for a breakdown/steps/options, or the content is genuinely a list \
+of discrete items they asked for (e.g. "give me 5 movie recs").
+- Match the room's energy. If the channel's moving fast and casual, keep replies short and \
+casual back — don't suddenly write three paragraphs. If someone's asking something that actually \
+needs depth, it's fine to give it real length. Read the pace, don't default to "thorough."
+- Time-awareness is part of feeling present, not just a known fact to recite: if it's genuinely \
+late night or early morning IST and relevant to the moment, it's fine to notice naturally \
+("it's 3am, why are you still up") — but don't force a time reference into every reply.
+
+Absolutely no roleplay-script formatting — this is the single most important formatting rule, \
+and it has been a repeated problem, so read it carefully:
+- NEVER prefix your message with your own name (Discord already shows "Lucy" as the sender — \
+typing "**Lucy:**" or "Lucy:" at the start is redundant and is exactly the script-label habit \
+to kill).
+- NEVER write action descriptions or stage directions — not in asterisks, not in parentheses, \
+not as bare italic words. This means no "*glances at you*", no "*shrugs*", no "*pauses*", no \
+"(Back to neutral.)", no describing your own body language, expression, sighs, smirks, or tone \
+as narration. You have no body here; you're typing in a Discord chat, not writing a scene.
+- NEVER wrap your own spoken lines in quotation marks like a script or novel.
+- This also covers action description written as a plain sentence with no asterisks or \
+parentheses at all — e.g. "Leans on the server console, arms crossed." followed by a quoted \
+line. That's just as banned as the asterisk version; don't narrate a physical gesture in prose \
+form either. If a sentence describes what your body/face is doing rather than what you're \
+saying, cut it.
+- Concretely, this entire pattern is banned, every piece of it: \
+"**Lucy:** *glances at you* Hey. Miss me already?" — the name-prefix, the asterisk action, and \
+the quote-script rhythm are ALL wrong. \
+The correct version of that same reply is just: "hey, miss me already? still here, still \
+functional" — plain text, no label, no action, no narration.
+- Don't reach for bold or italics out of habit — real people barely use them. Plain text is the \
+default.
+- Before sending, check your own draft: if it contains asterisks around a verb/action, a \
+colon after your own name, or quotation marks around your whole message, delete that part and \
+rewrite it as a plain sentence. That format is for fiction, not for being a person in a server.
 
 Critical formatting rule: NEVER type the literal characters @everyone, @here, or a role/user \
 mention (like @SomeRole) in a normal reply, even as a joke, example, or hypothetical — Discord \
@@ -2560,6 +3641,8 @@ def build_system_prompt(
     preferred_language: str | None = None,
     response_style: str | None = None,
     can_use_tools: bool = False,
+    relationship_tier: str | None = None,
+    news_digest: str | None = None,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
@@ -2574,8 +3657,17 @@ def build_system_prompt(
         boundaries=personality.get("boundaries") or "stays respectful, avoids NSFW content",
     )
 
+    prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
+
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
+    elif relationship_tier:
+        tier_note = RELATIONSHIP_TIER_NOTES.get(relationship_tier, "")
+        if tier_note:
+            prompt += (
+                f"\n\nYour relationship with this specific person so far: **{relationship_tier}**. "
+                f"{tier_note} This should shape tone, not override your core personality or boundaries."
+            )
 
     prompt += (
         "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
@@ -2595,11 +3687,19 @@ def build_system_prompt(
         )
 
     known_facts = []
-    now = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    now_ist = now_utc.astimezone(IST)
     known_facts.append(
-        f"Right now it's {now.strftime('%A, %B %d, %Y')} at {now.strftime('%H:%M')} UTC. "
-        f"Use this for any date/time-relative question (e.g. 'today', 'this week') — don't guess."
+        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%H:%M')} IST "
+        f"(India Standard Time — most of this server is India-based), which is "
+        f"{now_utc.strftime('%H:%M')} UTC. Use this for any date/time-relative question "
+        f"(e.g. 'today', 'this week', 'good morning') — don't guess."
     )
+    if news_digest:
+        known_facts.append(
+            "Current real headlines you're casually aware of (mention naturally if relevant, "
+            "don't recite the whole list unprompted):\n" + news_digest
+        )
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")
     if mentioned_users_facts:
@@ -2795,8 +3895,24 @@ async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, tempe
             logger.warning("%s failed (%s), trying next candidate", model, e)
             last_error = e
 
-    logger.error("All NIM model candidates failed. Last error: %s", last_error)
-    raise RuntimeError(f"All NIM model candidates failed: {last_error}")
+    # Every NIM candidate failed — last resort before giving up entirely.
+    # Groq doesn't get tool support here (different tool-call wire format
+    # risk isn't worth it for an emergency fallback), so this degrades to
+    # plain conversational replies until NIM recovers.
+    if groq_client.is_configured():
+        try:
+            logger.warning("All NIM candidates failed, falling back to Groq as last resort.")
+            text = await groq_client.call_groq(
+                messages, model=groq_client.MODEL_QUALITY, max_tokens=max_tokens,
+                temperature=temperature, timeout_seconds=15,
+            )
+            return {"role": "assistant", "content": text}
+        except Exception as e:
+            logger.error("Groq fallback also failed: %s", e)
+            last_error = e
+
+    logger.error("All NIM model candidates (and Groq fallback) failed. Last error: %s", last_error)
+    raise RuntimeError(f"All model candidates failed: {last_error}")
 
 
 async def summarize_user_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:
@@ -2819,11 +3935,20 @@ async def summarize_user_notes(display_name: str, recent_messages: list[str], ex
         {"role": "system", "content": system},
         {"role": "user", "content": user_content},
     ]
-    try:
-        result = await call_nim(messages, max_tokens=200, temperature=0.3)
-    except Exception as e:
-        logger.warning("summarize_user_notes failed, keeping old notes: %s", e)
-        return existing_notes
+
+    result = None
+    if groq_client.is_configured():
+        try:
+            result = await groq_client.call_groq(messages, model=groq_client.MODEL_FAST, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("Groq summarize_user_notes failed, falling back to NIM: %s", e)
+
+    if result is None:
+        try:
+            result = await call_nim(messages, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("summarize_user_notes failed, keeping old notes: %s", e)
+            return existing_notes
 
     if result.strip().upper() == "NONE":
         return existing_notes
