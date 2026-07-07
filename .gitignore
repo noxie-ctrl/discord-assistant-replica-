@@ -1,2 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .env
+.env.*
+.DS_Store
+tests/__pycache__/
+utils/__pycache__/
+cogs/__pycache__/
+
+# keep the data folder tracked if you want, otherwise uncomment
+# data/
 data/
