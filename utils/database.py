@@ -674,3 +674,8 @@ async def set_image_description(cache_key: str, description: str):
             cache_key,
             description,
         )
+
+
+def _normalize_cache_key(key: str) -> str:
+    """Internal normalizer for cache keys; kept small for future uses."""
+    return key.strip()

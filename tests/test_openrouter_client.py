@@ -17,7 +17,7 @@ class OpenRouterClientTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             # Should raise because no key configured
             import asyncio
-            asyncio.get_event_loop().run_until_complete(openrouter_client.describe_images(["https://example.com/image.png"]))
+            asyncio.run(openrouter_client.describe_images(["https://example.com/image.png"]))
 
 
 if __name__ == "__main__":

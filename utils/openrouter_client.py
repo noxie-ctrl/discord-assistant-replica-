@@ -1,31 +1,42 @@
-"""
-utils/openrouter_client.py
+"""OpenRouter client utilities.
 
-OpenRouter is used for image understanding and as an additional fallback tier
-for main chat when both NVIDIA NIM and Groq are unavailable.
+Provides a thin wrapper around OpenRouter's chat/completions API for two
+purposes used in this project:
+- `call_openrouter`: generic chat-style calls used for fallback text tasks.
+- `describe_images`: a vision-oriented helper that accepts a list of image URLs
+  and returns a short plain-language description. Results are cached in the
+  project's Postgres DB (if configured) to avoid repeated API calls for the
+  same images.
+
+This module is deliberately lightweight and defensive: missing env keys or a
+missing DB do not cause import-time failures; callers must handle runtime
+errors when the external APIs are not available.
 """
 
-import asyncio
+from __future__ import annotations
+
+import hashlib
 import itertools
 import logging
 import os
+from typing import Any, Dict, List
 
 import aiohttp
 
 logger = logging.getLogger("lucy.openrouter")
 
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
-DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openai/gpt-4.1-mini")
+OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", DEFAULT_CHAT_MODEL)
 
 _key_cycle = None
 
 
 class _RateLimited(Exception):
-    pass
+    """Raised when an OpenRouter key returns HTTP 429."""
 
 
-def _get_keys() -> list[str]:
+def _get_keys() -> List[str]:
     keys = [
         os.getenv("OPENROUTER_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY_2", "").strip(),
@@ -33,7 +44,8 @@ def _get_keys() -> list[str]:
     return [k for k in keys if k]
 
 
-def _next_key_order() -> list[str]:
+def _next_key_order() -> List[str]:
+    """Return available keys in round-robin order for load distribution."""
     global _key_cycle
     keys = _get_keys()
     if not keys:
@@ -44,7 +56,7 @@ def _next_key_order() -> list[str]:
     return keys[start:] + keys[:start]
 
 
-async def _call_one(model: str, messages: list[dict], max_tokens: int, temperature: float,
+async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int, temperature: float,
                     api_key: str, timeout_seconds: int = 12) -> str:
     payload = {
         "model": model,
@@ -55,8 +67,6 @@ async def _call_one(model: str, messages: list[dict], max_tokens: int, temperatu
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://localhost"),
-        "X-Title": os.getenv("OPENROUTER_TITLE", "Lucy Bot"),
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -69,6 +79,7 @@ async def _call_one(model: str, messages: list[dict], max_tokens: int, temperatu
             data = await resp.json()
 
     try:
+        # Support typical OpenAI-compatible shape: choices[0].message.content
         content = (data["choices"][0]["message"].get("content") or "").strip()
     except (KeyError, IndexError) as e:
         raise RuntimeError("OpenRouter returned an unexpected response shape") from e
@@ -77,9 +88,13 @@ async def _call_one(model: str, messages: list[dict], max_tokens: int, temperatu
     return content
 
 
-async def call_openrouter(messages: list[dict], model: str = DEFAULT_CHAT_MODEL,
+async def call_openrouter(messages: List[Dict[str, Any]], model: str = DEFAULT_CHAT_MODEL,
                           max_tokens: int = 400, temperature: float = 0.3,
                           timeout_seconds: int = 12) -> str:
+    """Call OpenRouter with round-robin API key handling.
+
+    Raises RuntimeError if no keys configured or all keys fail.
+    """
     keys = _next_key_order()
     if not keys:
         raise RuntimeError("No OPENROUTER_API_KEY configured.")
@@ -101,18 +116,31 @@ async def call_openrouter(messages: list[dict], model: str = DEFAULT_CHAT_MODEL,
     raise RuntimeError(f"All OpenRouter keys failed: {last_error}")
 
 
-async def describe_images(image_urls: list[str], prompt: str = "Describe the image(s) plainly and briefly.") -> str:
+def _make_cache_key(urls: List[str]) -> str:
+    """Create a deterministic short cache key for a list of image URLs."""
+    joined = "|".join(urls)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+async def describe_images(image_urls: List[str], prompt: str = "Describe the image(s) plainly and briefly.") -> str:
+    """Return a short description for the given image URLs.
+
+    Uses the DB cache if available, and stores results back into the cache.
+    Raises RuntimeError if the model signals the content is blocked.
+    """
     if not image_urls:
         return ""
-    # Use simple cache key derived from URLs to avoid re-describing the same images
-    cache_key = "|".join(image_urls)
+
+    cache_key = _make_cache_key(image_urls)
+    # Try cache (best-effort)
     try:
         from utils import database as db
+
         cached = await db.get_image_description(cache_key)
         if cached:
+            logger.debug("OpenRouter: cache hit for %s", cache_key)
             return cached
     except Exception:
-        # DB missing or not initialized; continue without cache
         cached = None
 
     messages = [
@@ -135,17 +163,23 @@ async def describe_images(image_urls: list[str], prompt: str = "Describe the ima
             ],
         },
     ]
+
     result = await call_openrouter(messages, model=DEFAULT_VISION_MODEL, max_tokens=220, temperature=0.2)
     if result.strip().upper() == "SAFETY_BLOCKED":
         raise RuntimeError("OpenRouter safety blocked image description")
     desc = result.strip()
+
+    # Store in cache (best-effort)
     try:
         from utils import database as db
+
         await db.set_image_description(cache_key, desc)
     except Exception:
-        pass
+        logger.debug("OpenRouter: failed to write cache for %s", cache_key)
+
     return desc
 
 
 def is_configured() -> bool:
+    """Return True if any OpenRouter key is configured."""
     return bool(_get_keys())
