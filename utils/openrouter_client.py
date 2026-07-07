@@ -104,6 +104,17 @@ async def call_openrouter(messages: list[dict], model: str = DEFAULT_CHAT_MODEL,
 async def describe_images(image_urls: list[str], prompt: str = "Describe the image(s) plainly and briefly.") -> str:
     if not image_urls:
         return ""
+    # Use simple cache key derived from URLs to avoid re-describing the same images
+    cache_key = "|".join(image_urls)
+    try:
+        from utils import database as db
+        cached = await db.get_image_description(cache_key)
+        if cached:
+            return cached
+    except Exception:
+        # DB missing or not initialized; continue without cache
+        cached = None
+
     messages = [
         {
             "role": "system",
@@ -127,7 +138,13 @@ async def describe_images(image_urls: list[str], prompt: str = "Describe the ima
     result = await call_openrouter(messages, model=DEFAULT_VISION_MODEL, max_tokens=220, temperature=0.2)
     if result.strip().upper() == "SAFETY_BLOCKED":
         raise RuntimeError("OpenRouter safety blocked image description")
-    return result.strip()
+    desc = result.strip()
+    try:
+        from utils import database as db
+        await db.set_image_description(cache_key, desc)
+    except Exception:
+        pass
+    return desc
 
 
 def is_configured() -> bool:

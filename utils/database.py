@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS economy (
 
 CREATE INDEX IF NOT EXISTS idx_chat_memory_guild_channel
     ON chat_memory (guild_id, channel_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS image_descriptions (
+    cache_key TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -139,6 +145,7 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE IF NOT EXISTS image_descriptions ADD COLUMN IF NOT EXISTS description TEXT;
 """
 
 
@@ -642,3 +649,28 @@ async def get_recent_member_events(guild_id: int, limit: int = 15) -> list[dict]
             guild_id, limit,
         )
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Image description cache
+# ---------------------------------------------------------------------------
+
+async def get_image_description(cache_key: str) -> str | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT description FROM image_descriptions WHERE cache_key = $1",
+            cache_key,
+        )
+        return row["description"] if row else None
+
+
+async def set_image_description(cache_key: str, description: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO image_descriptions (cache_key, description) VALUES ($1, $2) "
+            "ON CONFLICT (cache_key) DO UPDATE SET description = EXCLUDED.description, created_at = now()",
+            cache_key,
+            description,
+        )
