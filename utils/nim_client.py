@@ -334,11 +334,27 @@ def build_system_prompt(
     known_facts = []
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(IST)
+    hour = now_ist.hour
+    if 5 <= hour < 12:
+        day_part = "morning"
+    elif 12 <= hour < 17:
+        day_part = "afternoon"
+    elif 17 <= hour < 21:
+        day_part = "evening"
+    else:
+        day_part = "night"
+    # Regression fix: this used to hand the model a bare 24-hour string like
+    # "11:48" with no AM/PM cue, and it would sometimes misread that as PM
+    # (confidently saying "it's 11:50 PM" at 11:48 AM). Giving the 12-hour
+    # clock, the AM/PM, AND a plain-English day-part label — all pointing
+    # the same direction — closes off that misread instead of relying on
+    # the model to correctly parse 24-hour time on its own.
     known_facts.append(
-        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%H:%M')} IST "
-        f"(India Standard Time — most of this server is India-based), which is "
-        f"{now_utc.strftime('%H:%M')} UTC. Use this for any date/time-relative question "
-        f"(e.g. 'today', 'this week', 'good morning') — don't guess."
+        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%I:%M %p')} IST "
+        f"({now_ist.strftime('%H:%M')} in 24-hour time) — that's {day_part} in India (India Standard "
+        f"Time — most of this server is India-based), which is {now_utc.strftime('%H:%M')} UTC. Use "
+        f"this for any date/time-relative question (e.g. 'today', 'this week', 'good morning') — "
+        f"don't guess, and don't contradict the {day_part}/{now_ist.strftime('%p')} given above."
     )
     if news_digest:
         known_facts.append(
