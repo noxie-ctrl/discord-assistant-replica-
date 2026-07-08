@@ -53,7 +53,10 @@ cogs/
 tests/
   test_ai_chat_helpers.py
   test_awareness_vibe.py
+  test_idle_chatter_channels.py
+  test_member_lookup.py
   test_openrouter_client.py
+  test_time_awareness.py
 utils/
   __init__.py
   awareness.py
@@ -684,6 +687,92 @@ if __name__ == "__main__":
     unittest.main()
 </file>
 
+<file path="tests/test_idle_chatter_channels.py">
+import unittest
+
+from cogs.ai_chat import resolve_idle_chatter_channel_ids
+
+
+class IdleChatterChannelResolutionTests(unittest.TestCase):
+    """resolve_idle_chatter_channel_ids is the pure logic behind the
+    idle-chatter multi-channel fix — pulled out so it's directly testable
+    without mocking discord.Guild/TextChannel, same pattern as
+    maybe_suggest_channel_redirection in tests/test_ai_chat_helpers.py."""
+
+    def test_explicit_channels_win_over_legacy_fallback(self):
+        # A guild that's used /addidlechatterchannel should use exactly
+        # those channels — the old chat_channel_id default shouldn't sneak
+        # back in alongside them.
+        result = resolve_idle_chatter_channel_ids([111, 222], fallback_channel_id=999)
+        self.assertEqual(result, [111, 222])
+
+    def test_falls_back_to_legacy_single_channel_when_unconfigured(self):
+        # Regression-guard: a guild that never touches the new commands
+        # shouldn't lose idle chatter entirely on upgrade.
+        result = resolve_idle_chatter_channel_ids([], fallback_channel_id=999)
+        self.assertEqual(result, [999])
+
+    def test_returns_empty_when_nothing_configured_at_all(self):
+        result = resolve_idle_chatter_channel_ids([], fallback_channel_id=None)
+        self.assertEqual(result, [])
+
+    def test_preserves_configured_order(self):
+        result = resolve_idle_chatter_channel_ids([333, 111, 222], fallback_channel_id=999)
+        self.assertEqual(result, [333, 111, 222])
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_time_awareness.py">
+import unittest
+from datetime import datetime, timezone
+from unittest import mock
+
+from utils import nim_client
+
+
+class TimeAwarenessTests(unittest.TestCase):
+    """Regression coverage for the AM/PM misread bug: build_system_prompt()
+    used to hand the model a bare 24-hour string like "11:48" with no AM/PM
+    cue, and it would sometimes misread that as PM (confidently saying
+    "it's 11:50 PM" at 11:48 AM). The fix states the 12-hour clock, the
+    24-hour clock, and a plain-English day-part label, all pointing the
+    same direction — this locks that in so it can't quietly regress."""
+
+    def _build_prompt(self, fixed_utc: datetime) -> str:
+        class FrozenDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_utc
+
+        with mock.patch.object(nim_client, "datetime", FrozenDatetime):
+            return nim_client.build_system_prompt(
+                personality={}, guild_name="NERV-HQ", owner_name="Nox",
+            )
+
+    def test_late_morning_states_am_explicitly(self):
+        # 11:48 IST == 06:18 UTC — the exact case caught live in #bot-commands.
+        fixed_utc = datetime(2026, 7, 8, 6, 18, tzinfo=timezone.utc)
+        prompt = self._build_prompt(fixed_utc)
+        self.assertIn("11:48 AM IST", prompt)
+        self.assertIn("morning", prompt)
+        self.assertNotIn("11:48 PM", prompt)
+
+    def test_late_night_states_pm_explicitly(self):
+        # 23:50 IST == 18:20 UTC — the time Lucy actually (wrongly) said out loud.
+        fixed_utc = datetime(2026, 7, 8, 18, 20, tzinfo=timezone.utc)
+        prompt = self._build_prompt(fixed_utc)
+        self.assertIn("11:50 PM IST", prompt)
+        self.assertIn("night", prompt)
+        self.assertNotIn("11:50 AM", prompt)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
 <file path="utils/__init__.py">
 
 </file>
@@ -818,6 +907,96 @@ def is_configured() -> bool:
 
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="tests/test_member_lookup.py">
+import unittest
+
+from cogs.ai_chat import format_member_lookup
+
+
+class MemberLookupFormatterTests(unittest.TestCase):
+    def test_bot_account_short_circuits(self):
+        # Regression-guard: the bot check has to come first and win over
+        # everything else, or a bot could get formatted as if it were a
+        # real member with roles/notes — easy to get backwards by accident.
+        result = format_member_lookup({
+            "display_name": "MEE6",
+            "username": "mee6",
+            "is_bot": True,
+            "joined": "January 01, 2024",
+            "created": "January 01, 2020",
+            "roles": "Bots",
+            "notes": "should never appear",
+        })
+        self.assertIn("bot account", result)
+        self.assertNotIn("should never appear", result)
+
+    def test_normal_member_includes_roles_and_join_date(self):
+        result = format_member_lookup({
+            "display_name": "Nox",
+            "username": "nox",
+            "is_bot": False,
+            "joined": "March 03, 2023",
+            "created": "June 06, 2019",
+            "roles": "Owner, Admin",
+        })
+        self.assertIn("Nox", result)
+        self.assertIn("March 03, 2023", result)
+        self.assertIn("Owner, Admin", result)
+
+    def test_notes_appended_when_present(self):
+        result = format_member_lookup({
+            "display_name": "Sam",
+            "is_bot": False,
+            "roles": "none",
+            "notes": "Plays a lot of Valorant, prefers Hinglish replies.",
+        })
+        self.assertIn("Known notes: Plays a lot of Valorant", result)
+
+    def test_notes_omitted_when_absent(self):
+        result = format_member_lookup({
+            "display_name": "Sam",
+            "is_bot": False,
+            "roles": "none",
+        })
+        self.assertNotIn("Known notes", result)
+
+    def test_missing_optional_fields_fall_back_to_unknown(self):
+        # A member with no joined_at (shouldn't really happen, but joined_at
+        # can legitimately be None for some cache states) shouldn't crash
+        # the formatter or produce a blank field.
+        result = format_member_lookup({"display_name": "Ghost", "is_bot": False})
+        self.assertIn("unknown", result)
+        self.assertIn("none", result)
+
+    def test_never_mentions_status_or_activity(self):
+        # Regression-guard for a real bug caught in live testing: with no
+        # status/activity keys in the data dict at all, Lucy still recited
+        # a "Status: Offline" line back to a user — invented, not real data
+        # (lookup_member doesn't return status yet; see INFO_TOOLS). The
+        # formatter itself was never the source of that line, but this
+        # locks in that it's structurally impossible for it to be: the
+        # word "status" (or "activity"/"online"/"offline") should never
+        # appear in this formatter's output no matter what's passed in,
+        # so if it ever does, it's coming from the model paraphrasing
+        # loosely rather than this function.
+        result = format_member_lookup({
+            "display_name": "Nox",
+            "username": "nox",
+            "is_bot": False,
+            "joined": "January 2024",
+            "created": "2018",
+            "roles": "Owner, @everyone",
+            "notes": "The one who actually runs this place.",
+        })
+        lowered = result.lower()
+        for banned in ("status", "activity", "online", "offline"):
+            self.assertNotIn(banned, lowered)
+
+
+if __name__ == "__main__":
+    unittest.main()
 </file>
 
 <file path="utils/awareness.py">
@@ -1337,103 +1516,6 @@ async def describe_images(image_urls: List[str], prompt: str = "Describe the ima
 def is_configured() -> bool:
     """Return True if any OpenRouter key is configured."""
     return bool(_get_keys())
-</file>
-
-<file path="main.py">
-"""
-main.py
-
-Entry point for Lucy. Changes in this version:
-  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
-    and closes it cleanly on shutdown.
-  - Loads two new cogs: games (mini-games) and news (real headlines).
-  - Everything else (owner_id wiring, slash sync, prefix commands) is
-    unchanged from before.
-"""
-
-import os
-import asyncio
-import logging
-
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
-
-from utils import database as db
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("lucy.main")
-
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
-INTENTS.members = True
-
-COGS = [
-    "cogs.moderation",
-    "cogs.utility",
-    "cogs.personality",
-    "cogs.ai_chat",
-    "cogs.games",
-    "cogs.news",
-    "cogs.preferences",
-    "cogs.serverlog",
-]
-
-
-class Lucy(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=INTENTS)
-
-    async def setup_hook(self):
-        await db.init_pool()
-        logger.info("Postgres pool ready.")
-
-        for cog in COGS:
-            try:
-                await self.load_extension(cog)
-                logger.info("Loaded %s", cog)
-            except Exception:
-                logger.exception("Failed to load %s", cog)
-
-        owner_id = os.getenv("OWNER_ID", "").strip()
-        if owner_id:
-            self.owner_id = int(owner_id)
-            logger.info("Owner ID set to %s", self.owner_id)
-        else:
-            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
-
-        synced = await self.tree.sync()
-        logger.info("Synced %d slash commands.", len(synced))
-
-    async def on_ready(self):
-        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
-        # gets called with her own user id in that case, and this tells the
-        # database layer to skip the (meaningless) relationship-score bump for it.
-        db.set_bot_user_id(self.user.id)
-        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
-
-    async def close(self):
-        await db.close_pool()
-        await super().close()
-
-
-async def main():
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN is not set.")
-
-    bot = Lucy()
-    async with bot:
-        await bot.start(token)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 </file>
 
 <file path="cogs/games.py">
@@ -2403,6 +2485,109 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Games(bot))
 </file>
 
+<file path="main.py">
+"""
+main.py
+
+Entry point for Lucy. Changes in this version:
+  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
+    and closes it cleanly on shutdown.
+  - Loads two new cogs: games (mini-games) and news (real headlines).
+  - Everything else (owner_id wiring, slash sync, prefix commands) is
+    unchanged from before.
+"""
+
+import os
+import asyncio
+import logging
+
+import discord
+from discord.ext import commands
+from dotenv import load_dotenv
+
+from utils import database as db
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("lucy.main")
+
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+INTENTS.members = True
+# NOT yet added: INTENTS.presences = True — this needs Nox to first enable
+# "Presence Intent" in the Discord Developer Portal (Bot tab, alongside the
+# two intents above). Required for Max Awareness's status/activity lookup.
+# See MAX_AWARENESS_HANDOFF.md, Phase 0. Once that's confirmed done, flip
+# this on and INFO_TOOLS' lookup_member (utils/nim_client.py) can start
+# returning real status/activity instead of omitting it.
+
+COGS = [
+    "cogs.moderation",
+    "cogs.utility",
+    "cogs.personality",
+    "cogs.ai_chat",
+    "cogs.games",
+    "cogs.news",
+    "cogs.preferences",
+    "cogs.serverlog",
+]
+
+
+class Lucy(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=INTENTS)
+
+    async def setup_hook(self):
+        await db.init_pool()
+        logger.info("Postgres pool ready.")
+
+        for cog in COGS:
+            try:
+                await self.load_extension(cog)
+                logger.info("Loaded %s", cog)
+            except Exception:
+                logger.exception("Failed to load %s", cog)
+
+        owner_id = os.getenv("OWNER_ID", "").strip()
+        if owner_id:
+            self.owner_id = int(owner_id)
+            logger.info("Owner ID set to %s", self.owner_id)
+        else:
+            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
+
+        synced = await self.tree.sync()
+        logger.info("Synced %d slash commands.", len(synced))
+
+    async def on_ready(self):
+        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
+        # gets called with her own user id in that case, and this tells the
+        # database layer to skip the (meaningless) relationship-score bump for it.
+        db.set_bot_user_id(self.user.id)
+        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
+
+    async def close(self):
+        await db.close_pool()
+        await super().close()
+
+
+async def main():
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+
+    bot = Lucy()
+    async with bot:
+        await bot.start(token)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
 <file path="cogs/utility.py">
 import discord
 from discord import app_commands
@@ -2489,6 +2674,48 @@ class Utility(commands.Cog):
         await db.update_guild_setting(interaction.guild.id, idle_chatter_enabled=enabled)
         await interaction.response.send_message(
             f"✅ Idle chatter is now {'on' if enabled else 'off'}."
+        )
+
+    @app_commands.command(name="addidlechatterchannel", description="Add a channel Lucy can idle-chatter in (in addition to the main chat channel)")
+    @is_admin_or_mod()
+    async def addidlechatterchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.add_idle_chatter_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Added {channel.mention} to Lucy's idle-chatter channels.")
+
+    @app_commands.command(name="removeidlechatterchannel", description="Remove a channel from Lucy's idle-chatter list")
+    @is_admin_or_mod()
+    async def removeidlechatterchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.remove_idle_chatter_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Removed {channel.mention} from Lucy's idle-chatter channels.")
+
+    @app_commands.command(name="listidlechatterchannels", description="List the channels Lucy currently idle-chatters in")
+    @is_admin_or_mod()
+    async def listidlechatterchannels(self, interaction: discord.Interaction):
+        channel_ids = await db.get_idle_chatter_channels(interaction.guild.id)
+        if not channel_ids:
+            settings = await db.get_guild_settings(interaction.guild.id)
+            fallback_id = settings.get("chat_channel_id")
+            if fallback_id:
+                channel = interaction.guild.get_channel(fallback_id)
+                name = channel.mention if channel else f"channel {fallback_id} (not found)"
+                await interaction.response.send_message(
+                    f"No channels explicitly added yet — falling back to the main chat channel, {name}. "
+                    "Use `/addidlechatterchannel` to add more.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "No idle-chatter channels configured, and no main chat channel set either — "
+                    "idle chatter has nowhere to post right now.",
+                    ephemeral=True,
+                )
+            return
+        mentions = []
+        for cid in channel_ids:
+            channel = interaction.guild.get_channel(cid)
+            mentions.append(channel.mention if channel else f"channel {cid} (not found)")
+        await interaction.response.send_message(
+            "Idle-chatter channels: " + ", ".join(mentions), ephemeral=True
         )
 
     @app_commands.command(name="setservervibe", description="Toggle Lucy's background read of this server's chat vibe/energy")
@@ -2874,6 +3101,17 @@ CREATE TABLE IF NOT EXISTS image_descriptions (
     description TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Idle chatter fix (this session): idle chatter used to be hardcoded to
+-- whatever single channel /setchatchannel pointed at. This is a new table,
+-- not a new column, so no MIGRATIONS entry is needed — a guild with no rows
+-- here yet just falls back to the old chat_channel_id behavior (see
+-- resolve_idle_chatter_channel_ids() in cogs/ai_chat.py).
+CREATE TABLE IF NOT EXISTS idle_chatter_channels (
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -2959,6 +3197,39 @@ async def update_guild_setting(guild_id: int, **kwargs):
             f"UPDATE guild_settings SET {set_clause} WHERE guild_id = $1",
             guild_id, *values,
         )
+
+
+# ---------------------------------------------------------------------------
+# Idle chatter channels (multi-channel, this session's fix)
+# ---------------------------------------------------------------------------
+
+async def add_idle_chatter_channel(guild_id: int, channel_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO idle_chatter_channels (guild_id, channel_id) VALUES ($1, $2) "
+            "ON CONFLICT (guild_id, channel_id) DO NOTHING",
+            guild_id, channel_id,
+        )
+
+
+async def remove_idle_chatter_channel(guild_id: int, channel_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM idle_chatter_channels WHERE guild_id = $1 AND channel_id = $2",
+            guild_id, channel_id,
+        )
+
+
+async def get_idle_chatter_channels(guild_id: int) -> list[int]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT channel_id FROM idle_chatter_channels WHERE guild_id = $1",
+            guild_id,
+        )
+        return [r["channel_id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -3490,6 +3761,17 @@ v3 changes:
     display name), matching the DB schema update.
   - Reaction-based feedback: 👍/👎 on one of Lucy's replies (by the person she
     was replying to) logs to the feedback table.
+
+Max Awareness, Phase 1 (this session): new lookup_member tool (see
+MAX_AWARENESS_HANDOFF.md) — on-demand info about any guild member, not just
+ones who've chatted with her, merged into every tool list unconditionally
+(no permission gate, same treatment as CONCERN_TOOLS). format_member_lookup()
+is the pure formatter, next to maybe_suggest_channel_redirection above.
+
+Idle chatter (this session): now fans out to a per-guild list of channels
+(idle_chatter_channels table) instead of a single hardcoded chat_channel_id,
+via resolve_idle_chatter_channel_ids() below — a guild that hasn't added any
+channels explicitly still falls back to the old chat_channel_id behavior.
 """
 
 import re
@@ -3544,6 +3826,65 @@ def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str
         if "announcement" in (channel_topic or "").lower() or "news" in (channel_topic or "").lower():
             return "This looks more like a discussion topic than an announcement post."
     return None
+
+
+def resolve_idle_chatter_channel_ids(
+    configured_channel_ids: list[int], fallback_channel_id: Optional[int]
+) -> list[int]:
+    """Pure helper (unit-testable without mocking discord.Guild): given a
+    guild's explicitly-configured idle-chatter channels (idle_chatter_channels
+    table, set via /addidlechatterchannel) and the legacy single
+    chat_channel_id, return the channel ids idle chatter should actually
+    consider this pass.
+
+    If the admin has explicitly configured one or more channels, use only
+    those — an explicit list means they've taken over channel selection, so
+    we don't also silently include the old single-channel default. If
+    nothing's been explicitly configured yet, fall back to the old
+    chat_channel_id behavior so a guild that hasn't touched the new commands
+    doesn't lose idle chatter on upgrade."""
+    if configured_channel_ids:
+        return list(configured_channel_ids)
+    if fallback_channel_id:
+        return [fallback_channel_id]
+    return []
+
+
+def format_member_lookup(data: dict) -> str:
+    """Pure formatter for the lookup_member tool (Max Awareness, Phase 1) —
+    takes a plain dict of already-extracted fields so it's unit-testable
+    without mocking discord.Member/discord.Guild objects. The discord-object
+    extraction that builds this dict lives in _execute_tool_call, same as
+    the rest of that function (thin, not unit tested directly).
+
+    Expected keys: display_name, username, is_bot, joined, created, roles,
+    notes (all optional except display_name/is_bot).
+
+    Deliberately no status/activity fields yet — see INFO_TOOLS in
+    utils/nim_client.py for why (Presence intent not enabled yet)."""
+    display_name = data.get("display_name") or "that member"
+    username = data.get("username")
+    handle = f" (@{username})" if username else ""
+
+    # Bot check comes first and short-circuits everything else — this is
+    # the cheap, reliable half of "distinguish bot vs. member" that Max
+    # Awareness asked for, and it's easy to get backwards by accident if
+    # this isn't the very first thing checked.
+    if data.get("is_bot"):
+        return f"{display_name}{handle} is a bot account, not a person."
+
+    joined = data.get("joined") or "unknown"
+    created = data.get("created") or "unknown"
+    roles = data.get("roles") or "none"
+
+    parts = [
+        f"{display_name}{handle} — joined this server on {joined}, Discord "
+        f"account created {created}, roles: {roles}."
+    ]
+    notes = data.get("notes")
+    if notes:
+        parts.append(f"Known notes: {notes}")
+    return " ".join(parts)
 
 
 class AIChat(commands.Cog):
@@ -3762,28 +4103,32 @@ class AIChat(commands.Cog):
             settings = await db.get_guild_settings(guild.id)
             if not settings.get("idle_chatter_enabled"):
                 continue
-            channel_id = settings.get("chat_channel_id")
-            if not channel_id:
-                continue
-            channel = guild.get_channel(int(channel_id))
-            if not isinstance(channel, discord.TextChannel):
-                continue
-            if not channel.permissions_for(guild.me).send_messages:
-                continue
 
-            now_ts = asyncio.get_event_loop().time()
-            last_activity = self._last_activity_at.get(channel.id, 0.0)
-            last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
-            if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
-                continue
-            if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
-                continue
+            configured = await db.get_idle_chatter_channels(guild.id)
+            channel_ids = resolve_idle_chatter_channel_ids(
+                configured, settings.get("chat_channel_id")
+            )
 
-            try:
-                await channel.send("it's quiet in here today — how's everyone doing?")
-                self._last_idle_chatter_at[channel.id] = now_ts
-            except discord.HTTPException:
-                logger.debug("Idle chatter failed for %s", channel.id)
+            for channel_id in channel_ids:
+                channel = guild.get_channel(int(channel_id))
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                if not channel.permissions_for(guild.me).send_messages:
+                    continue
+
+                now_ts = asyncio.get_event_loop().time()
+                last_activity = self._last_activity_at.get(channel.id, 0.0)
+                last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
+                if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
+                    continue
+                if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
+                    continue
+
+                try:
+                    await channel.send("it's quiet in here today — how's everyone doing?")
+                    self._last_idle_chatter_at[channel.id] = now_ts
+                except discord.HTTPException:
+                    logger.debug("Idle chatter failed for %s", channel.id)
 
     async def _maybe_redirect_channel(self, message: discord.Message, suggestion: str):
         try:
@@ -3949,6 +4294,35 @@ class AIChat(commands.Cog):
             await target_member.add_roles(target_role, reason=f"Requested by {author}")
             return f"Success: gave {target_member.display_name} the '{target_role.name}' role."
 
+        if name == "lookup_member":
+            # Unlike assign_role/create_role above, this has no permission
+            # gate — it's always in the tool list (see INFO_TOOLS in
+            # nim_client.py) because it only surfaces info any member could
+            # already see by clicking a profile.
+            member_name = (args.get("member_name") or "").strip().lower()
+            if not member_name:
+                return "Error: no member name given."
+            target = discord.utils.find(
+                lambda m: m.display_name.lower() == member_name or m.name.lower() == member_name,
+                guild.members,
+            )
+            if target is None:
+                return f"Error: no member named '{member_name}' found."
+
+            profile = await db.get_profile(guild.id, target.id)
+            notes = profile.get("notes") if profile else None
+
+            data = {
+                "display_name": target.display_name,
+                "username": target.name,
+                "is_bot": target.bot,
+                "joined": target.joined_at.strftime("%B %d, %Y") if target.joined_at else None,
+                "created": target.created_at.strftime("%B %d, %Y") if target.created_at else None,
+                "roles": ", ".join(r.name for r in target.roles if r.name != "@everyone") or "none",
+                "notes": notes,
+            }
+            return format_member_lookup(data)
+
         return f"Error: unknown tool '{name}'."
 
     # -----------------------------------------------------------------
@@ -4068,7 +4442,7 @@ class AIChat(commands.Cog):
         # 6. Call the model (semaphore-capped), with tool support
         try:
             async with self._nim_semaphore:
-                tools = nim_client.CONCERN_TOOLS + (nim_client.TOOLS if can_use_tools else [])
+                tools = nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + (nim_client.TOOLS if can_use_tools else [])
                 assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
 
                 if assistant_message.get("tool_calls"):
@@ -4148,6 +4522,11 @@ the current source of truth for voice, not this comment block.
 Day 4 addition: build_system_prompt() takes an optional server_vibe string
 (utils/awareness.py's per-guild digest) alongside the existing news_digest,
 folded into known_facts the same way.
+
+Max Awareness, Phase 1 (this session): added INFO_TOOLS (the on-demand
+lookup_member tool — see MAX_AWARENESS_HANDOFF.md) and BOT_AWARENESS_ADDENDUM,
+folded into build_system_prompt() unconditionally. Status/activity are NOT
+part of this yet — that's Phase 0's blocker (Presence intent), still pending.
 """
 
 import os
@@ -4264,6 +4643,35 @@ like a person who actually knows it and has opinions — don't over-explain the 
 reference back to them or hedge with "I'm not sure but...". It's fine to have a \
 take, disagree, or clown on a bad opinion. If something is genuinely outside what \
 you'd know, say so plainly instead of faking familiarity.
+"""
+
+# Max Awareness, Phase 3 — general framing so bot-vs-member recognition isn't
+# only true when the lookup_member tool gets called. Deliberately short:
+# the heavy lifting (actually telling bots apart) happens in code, this is
+# just making sure her *voice* doesn't imply otherwise in passing chat.
+BOT_AWARENESS_ADDENDUM = """
+You can tell bot accounts from real members. If another bot's message ever shows up in \
+this server's chat history, treat it as a bot's output, not something a person said or \
+felt — don't respond to it with the same emotional weight you'd give a member, and don't \
+assume it can perceive or reply the way a person would.
+"""
+
+# Added after live testing surfaced a real failure mode: asked to relay a
+# lookup_member result, the model invented a plausible-looking "Status:
+# Offline" line that the tool never returned (it doesn't return status at
+# all yet — see INFO_TOOLS below), AND recited the result as a labeled
+# field list instead of a normal sentence. Both are covered in spirit by
+# the "Honesty about memory" paragraph and the "sound like a person"
+# section further down, but neither mentions tool results specifically, so
+# this closes that gap directly rather than trusting the model to
+# generalize from the closest-but-not-quite rule.
+TOOL_RESULT_HONESTY_ADDENDUM = """
+When a tool gives you a result — like looking someone up — say only what that result \
+actually told you. If it didn't include a piece of information (like whether they're online, \
+or what they're doing right now), you don't have that, full stop — don't add it just because \
+a "complete" answer feels like it should include it. And don't recite the result as a labeled \
+list ("Field: value, Field: value, ...") — say it in normal sentences, the way you'd tell a \
+friend what you found out, same voice as everywhere else in this prompt.
 """
 
 RELATIONSHIP_TIER_NOTES = {
@@ -4429,6 +4837,8 @@ def build_system_prompt(
     )
 
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
+    prompt += "\n" + BOT_AWARENESS_ADDENDUM
+    prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
 
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
@@ -4603,6 +5013,47 @@ CONCERN_TOOLS = [
                     },
                 },
                 "required": ["reason"],
+            },
+        },
+    },
+]
+
+# Max Awareness, Phase 1. Like CONCERN_TOOLS, this is always available
+# regardless of the requester's permission level — unlike create_role/
+# assign_role, this is public server info any member could already see by
+# clicking someone's profile, so it isn't gated the way TOOLS above is.
+#
+# Deliberately does NOT expose online/idle/dnd/offline status or current
+# activity yet. Discord gates that behind the privileged Presence intent,
+# which main.py doesn't request yet (needs a Developer Portal toggle first
+# — see MAX_AWARENESS_HANDOFF.md, Phase 0). Shipping status wording before
+# that's confirmed on would just have Lucy confidently state stale/false
+# presence info, which is worse than not answering it. Add it here once
+# Nox confirms the portal toggle + `INTENTS.presences = True` are both live.
+INFO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_member",
+            "description": (
+                "Look up a specific member of this server — their roles, when they "
+                "joined, when their account was created, any notes you have on them, "
+                "and whether they're a bot account rather than a real person. Use this "
+                "when someone asks about a specific person (\"who is X\", \"what do you "
+                "know about Y\") — don't call this speculatively or for every message. "
+                "This does NOT tell you whether they're online or what they're doing "
+                "right now — it has no status/activity data at all, so don't state or "
+                "imply either when relaying this tool's result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_name": {
+                        "type": "string",
+                        "description": "Display name or username of the member to look up.",
+                    },
+                },
+                "required": ["member_name"],
             },
         },
     },
