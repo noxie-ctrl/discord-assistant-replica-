@@ -9,13 +9,19 @@ v2 changes:
   - Dropped the "secret crush" persona entirely. Talking to the owner now
     just means genuine priority: faster to comply, more candid, more willing
     to go off-script for him specifically, no romantic subtext.
-  - Base personality flavor is now closer to Lucy from Cyberpunk: Edgerunners
-    — sharp, guarded-but-loyal, dry/deadpan humor, competent and a little
-    dangerous-feeling under the helpfulness, doesn't perform warmth she
-    doesn't mean, protective of people she's decided are "hers." This is a
-    stylistic reference for tone only, not any copyrighted dialogue or
-    biography — it's just flavor for a Discord bot's voice.
   - summarize_user_notes() unchanged.
+
+Persona rework (post-v2, current): base voice is warm, patient, and
+listens-first rather than sharp/guarded — she's still confident, competent,
+and dry-funny, and still protective of people she's decided are "hers," but
+that reads as care rather than an edge. The earlier "closer to Lucy from
+Cyberpunk: Edgerunners — sharp, guarded-but-loyal" framing (and the tonal
+anchor itself) was dropped at your request; BASE_SYSTEM_TEMPLATE below is
+the current source of truth for voice, not this comment block.
+
+Day 4 addition: build_system_prompt() takes an optional server_vibe string
+(utils/awareness.py's per-guild digest) alongside the existing news_digest,
+folded into known_facts the same way.
 """
 
 import os
@@ -281,6 +287,7 @@ def build_system_prompt(
     can_use_tools: bool = False,
     relationship_tier: str | None = None,
     news_digest: str | None = None,
+    server_vibe: str | None = None,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
@@ -337,6 +344,12 @@ def build_system_prompt(
         known_facts.append(
             "Current real headlines you're casually aware of (mention naturally if relevant, "
             "don't recite the whole list unprompted):\n" + news_digest
+        )
+    if server_vibe:
+        known_facts.append(
+            "The general conversational vibe of this server lately: " + server_vibe + " "
+            "Let this inform your comfort with slang/banter here — don't recite it or call "
+            "it out directly, just let it shape tone."
         )
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")

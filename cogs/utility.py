@@ -85,6 +85,16 @@ class Utility(commands.Cog):
             f"✅ Idle chatter is now {'on' if enabled else 'off'}."
         )
 
+    @app_commands.command(name="setservervibe", description="Toggle Lucy's background read of this server's chat vibe/energy")
+    @is_admin_or_mod()
+    async def setservervibe(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, server_vibe_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Server-vibe awareness is now {'on' if enabled else 'off'}. "
+            "When on, Lucy periodically distills the general tone of recent chat here "
+            "(never specific messages or names) to inform how casual/bantery she is."
+        )
+
     @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
     @is_admin_or_mod()
     async def disableventchannel(self, interaction: discord.Interaction):

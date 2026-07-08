@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     welcome_message TEXT,
     vent_channel_id BIGINT,
     channel_redirection_enabled BOOLEAN DEFAULT TRUE,
-    idle_chatter_enabled BOOLEAN DEFAULT TRUE
+    idle_chatter_enabled BOOLEAN DEFAULT TRUE,
+    server_vibe_enabled BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS member_events (
@@ -145,6 +146,7 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
 """
 
 
@@ -561,6 +563,24 @@ async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 
             LIMIT $3
             """,
             guild_id, user_id, limit,
+        )
+        return [dict(r) for r in reversed(rows)]
+
+
+async def get_recent_guild_messages(guild_id: int, limit: int = 60) -> list[dict]:
+    """Recent user messages across ALL channels in a guild, most recent
+    last. Used only to build the sample for the server-vibe digest
+    (utils/awareness.py) — not tied to any one user or channel."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM chat_memory
+            WHERE guild_id = $1 AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            guild_id, limit,
         )
         return [dict(r) for r in reversed(rows)]
 

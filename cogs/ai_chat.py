@@ -98,10 +98,15 @@ class AIChat(commands.Cog):
         asyncio.create_task(awareness.refresh_digest(force=True))
         self._news_refresh_loop.start()
         self._idle_chatter_loop.start()
+        # Same idea, but per-guild and reading the guild's own recent chat
+        # instead of RSS (Day 4: server-vibe digest).
+        asyncio.create_task(self._refresh_all_guild_vibes(force=True))
+        self._server_vibe_refresh_loop.start()
 
     async def cog_unload(self):
         self._news_refresh_loop.cancel()
         self._idle_chatter_loop.cancel()
+        self._server_vibe_refresh_loop.cancel()
 
     @tasks.loop(hours=3)
     async def _news_refresh_loop(self):
@@ -109,6 +114,27 @@ class AIChat(commands.Cog):
             await awareness.refresh_digest()
         except Exception:
             logger.exception("Background news digest refresh failed")
+
+    @tasks.loop(hours=6)
+    async def _server_vibe_refresh_loop(self):
+        try:
+            await self._refresh_all_guild_vibes()
+        except Exception:
+            logger.exception("Background server-vibe refresh failed")
+
+    async def _refresh_all_guild_vibes(self, force: bool = False):
+        for guild in self.bot.guilds:
+            try:
+                settings = await db.get_guild_settings(guild.id)
+                if not settings.get("server_vibe_enabled"):
+                    continue
+                recent = await db.get_recent_guild_messages(
+                    guild.id, limit=awareness.SERVER_VIBE_SAMPLE_SIZE
+                )
+                sample = [r["content"] for r in recent if r.get("content")]
+                await awareness.refresh_server_vibe(guild.id, sample, force=force)
+            except Exception:
+                logger.exception("Server-vibe refresh failed for guild %s", guild.id)
 
     @tasks.loop(minutes=15)
     async def _idle_chatter_loop(self):
@@ -539,6 +565,7 @@ class AIChat(commands.Cog):
             can_use_tools=can_use_tools,
             relationship_tier=relationship_tier,
             news_digest=awareness.get_cached_digest() or None,
+            server_vibe=awareness.get_cached_server_vibe(guild.id) or None,
         )
 
         # 5. In-channel short-term history

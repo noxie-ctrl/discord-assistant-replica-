@@ -11,6 +11,13 @@ just re-read (no network/model call) every time a chat reply is built.
 
 If Groq isn't configured, we fall back to a plain title list — still
 correct, just less conversationally condensed.
+
+Day 4 addition: a server-vibe digest, same shape as the news digest above,
+but per-guild instead of global and reading the guild's own recent chat
+instead of RSS. Deliberately doesn't fall back to a raw-message dump when
+Groq isn't configured (unlike the news digest) — echoing members' actual
+messages back into a system prompt with no condensation is a real privacy
+smell, whereas raw headlines are public wire copy anyway.
 """
 
 import time
@@ -114,3 +121,80 @@ def get_cached_digest() -> str:
     """Non-blocking read for use while building a system prompt — never
     does network/model work itself."""
     return _cached_digest or ""
+
+
+# ---------------------------------------------------------------------------
+# Server-vibe digest (Day 4) — per-guild, reads the guild's own recent chat
+# instead of RSS, distills tone/slang/energy rather than facts.
+# ---------------------------------------------------------------------------
+
+SERVER_VIBE_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60  # refresh every 6 hours
+SERVER_VIBE_SAMPLE_SIZE = 60  # recent messages sampled per guild
+
+_cached_vibe: dict[int, str] = {}
+_cached_vibe_at: dict[int, float] = {}
+
+_VIBE_SYSTEM_PROMPT = (
+    "You read a sample of recent Discord messages from one server and describe "
+    "the general conversational vibe in 1-2 short sentences: how casual/formal "
+    "it is, general energy (chill, chaotic, meme-heavy, supportive, competitive, "
+    "etc.), and any recurring slang or in-jokes worth knowing. Do NOT quote "
+    "specific messages, do NOT name specific users, and do NOT reference any "
+    "specific incident, drama, or sensitive topic mentioned — describe only the "
+    "general tone/style, nothing traceable back to one message or person. If "
+    "the sample is too thin or mixed to say anything meaningful, output exactly: NONE."
+)
+
+
+async def _condense_vibe(sample_messages: list[str]) -> str:
+    if not sample_messages:
+        return ""
+    # No non-model fallback here on purpose (unlike _condense above) — with
+    # no Groq to distill it, the only honest options are silence or echoing
+    # members' raw messages into a system prompt, and the latter isn't okay.
+    if not groq_client.is_configured():
+        return ""
+
+    raw = "\n".join(f"- {m}" for m in sample_messages[-SERVER_VIBE_SAMPLE_SIZE:])
+    try:
+        return await groq_client.call_groq(
+            [
+                {"role": "system", "content": _VIBE_SYSTEM_PROMPT},
+                {"role": "user", "content": raw},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=120,
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning("Server vibe condensation failed: %s", e)
+        return ""
+
+
+async def refresh_server_vibe(guild_id: int, sample_messages: list[str], force: bool = False) -> str:
+    """Condenses a sample of one guild's own recent chat into a short
+    tone/vibe descriptor and updates that guild's cache entry. Safe to call
+    often — no-ops if that guild's cache is still fresh, unless force=True.
+    A thin/mixed sample (model returns NONE) or a failed call leaves the
+    previous cached value in place rather than clearing it."""
+    now = time.time()
+    if not force:
+        last_at = _cached_vibe_at.get(guild_id, 0.0)
+        if guild_id in _cached_vibe and (now - last_at) < SERVER_VIBE_REFRESH_INTERVAL_SECONDS:
+            return _cached_vibe[guild_id]
+
+    try:
+        digest = await _condense_vibe(sample_messages)
+        if digest and digest.strip().upper() != "NONE":
+            _cached_vibe[guild_id] = digest.strip()
+            _cached_vibe_at[guild_id] = now
+    except Exception as e:
+        logger.warning("Server vibe refresh failed for guild %s, keeping previous cache: %s", guild_id, e)
+
+    return _cached_vibe.get(guild_id, "")
+
+
+def get_cached_server_vibe(guild_id: int) -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_vibe.get(guild_id, "")

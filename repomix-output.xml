@@ -863,33 +863,6 @@ def is_configured() -> bool:
 worker: python main.py
 </file>
 
-<file path="tests/test_openrouter_client.py">
-import os
-import unittest
-
-from utils import openrouter_client
-
-
-class OpenRouterClientTests(unittest.TestCase):
-    def test_is_configured_false_by_default(self):
-        # Ensure no OPENROUTER_API_KEY env vars are set in this test
-        os.environ.pop("OPENROUTER_API_KEY", None)
-        os.environ.pop("OPENROUTER_API_KEY_2", None)
-        self.assertFalse(openrouter_client.is_configured())
-
-    def test_describe_images_raises_when_not_configured(self):
-        os.environ.pop("OPENROUTER_API_KEY", None)
-        os.environ.pop("OPENROUTER_API_KEY_2", None)
-        with self.assertRaises(RuntimeError):
-            # Should raise because no key configured
-            import asyncio
-            asyncio.run(openrouter_client.describe_images(["https://example.com/image.png"]))
-
-
-if __name__ == "__main__":
-    unittest.main()
-</file>
-
 <file path="utils/permissions.py">
 import os
 import discord
@@ -928,24 +901,86 @@ def is_owner_only():
     return app_commands.check(predicate)
 </file>
 
+<file path="requirements.txt">
+discord.py>=2.4.0
+aiohttp>=3.9.0
+asyncpg>=0.29.0
+python-dotenv>=1.0.0
+</file>
+
+<file path="tests/test_openrouter_client.py">
+import asyncio
+import os
+import unittest
+from unittest import mock
+
+from utils import openrouter_client
+
+
+class OpenRouterClientTests(unittest.TestCase):
+    def test_is_configured_false_by_default(self):
+        # Ensure no OPENROUTER_API_KEY env vars are set in this test
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY_2", None)
+        self.assertFalse(openrouter_client.is_configured())
+
+    def test_describe_images_raises_when_not_configured(self):
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        os.environ.pop("OPENROUTER_API_KEY_2", None)
+        with self.assertRaises(RuntimeError):
+            # Should raise because no key configured
+            asyncio.run(openrouter_client.describe_images(["https://example.com/image.png"]))
+
+    def test_timeout_is_handled_not_a_crash(self):
+        # Regression test: call_openrouter's except clauses reference
+        # asyncio.TimeoutError, but the module used to not import asyncio at
+        # all — so a real timeout raised NameError instead of being handled
+        # and moving on to the next key, crashing the caller outright.
+        os.environ["OPENROUTER_API_KEY"] = "test-key-1"
+        try:
+            with mock.patch.object(
+                openrouter_client, "_call_one", side_effect=asyncio.TimeoutError
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    asyncio.run(openrouter_client.call_openrouter([{"role": "user", "content": "hi"}]))
+                self.assertNotIsInstance(ctx.exception, NameError)
+        finally:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path=".gitignore">
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+.DS_Store
+tests/__pycache__/
+utils/__pycache__/
+cogs/__pycache__/
+
+# keep the data folder tracked if you want, otherwise uncomment
+# data/
+data/
+</file>
+
 <file path="personality_default.json">
 {
   "name": "Lucy",
   "age": "21",
   "pronouns": "she/her",
   "role": "Server admin assistant & friend to everyone here",
-  "traits": "Sharp-tongued, guarded until she trusts you, dry deadpan humor over bubbliness, confident, visibly competent, fiercely loyal to people she's decided are 'hers' (starting with the server owner), doesn't perform warmth she doesn't feel",
-  "backstory": "Lucy grew up online, learned to run this place the hard way, and doesn't waste words. She takes her admin duties seriously and doesn't tolerate people messing with the server, but she's not cold — just economical with the niceties until you've earned them.",
-  "speaking_style": "Casual, short punchy sentences, deadpan delivery, minimal emoji, never robotic or overly formal, comfortable with silence instead of filling it",
+  "traits": "Warm, easygoing, genuinely curious about people, quietly confident and competent, dry sense of humor that shows up as gentle teasing rather than an edge, patient, a good listener who actually pays attention instead of just waiting to reply, fiercely loyal and protective of people she cares about (starting with the server owner)",
+  "backstory": "Lucy grew up online and has been running this place long enough to know it well, but she leads with kindness rather than toughness. She takes her admin duties seriously and looks out for the server, and she makes a point of noticing when someone's off and checking in without making a big deal of it.",
+  "speaking_style": "Casual, warm, short natural sentences, soft humor, minimal emoji, never robotic or overly formal, comfortable sitting with someone in a quiet moment instead of rushing to fill it",
   "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
 }
-</file>
-
-<file path="requirements.txt">
-discord.py>=2.4.0
-aiohttp>=3.9.0
-asyncpg>=0.29.0
-python-dotenv>=1.0.0
 </file>
 
 <file path="utils/openrouter_client.py">
@@ -966,6 +1001,7 @@ errors when the external APIs are not available.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import itertools
 import logging
@@ -977,8 +1013,15 @@ import aiohttp
 logger = logging.getLogger("lucy.openrouter")
 
 OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
-DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
-DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", DEFAULT_CHAT_MODEL)
+# "openrouter/free" is OpenRouter's own free-model router, not a single pinned
+# model: it auto-selects from whatever's currently free (including vision-
+# capable models when the request includes an image), at $0/token. Free
+# model *names* rotate constantly (things lose :free status without notice),
+# so pinning a specific one here would go stale — this router sidesteps that
+# and never requires OpenRouter credits. Override via env var if you want a
+# specific pinned model instead (e.g. a paid one for quality).
+DEFAULT_CHAT_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+DEFAULT_VISION_MODEL = os.getenv("OPENROUTER_VISION_MODEL", "openrouter/free")
 
 _key_cycle = None
 
@@ -1134,216 +1177,6 @@ async def describe_images(image_urls: List[str], prompt: str = "Describe the ima
 def is_configured() -> bool:
     """Return True if any OpenRouter key is configured."""
     return bool(_get_keys())
-</file>
-
-<file path=".gitignore">
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.env.*
-.DS_Store
-tests/__pycache__/
-utils/__pycache__/
-cogs/__pycache__/
-
-# keep the data folder tracked if you want, otherwise uncomment
-# data/
-data/
-</file>
-
-<file path="cogs/utility.py">
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from utils import database as db
-from utils.permissions import is_admin_or_mod
-
-
-class Utility(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    # ---------- WELCOME ----------
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        settings = await db.get_guild_settings(member.guild.id)
-        channel_id = settings.get("welcome_channel_id")
-        if not channel_id:
-            return
-        channel = member.guild.get_channel(channel_id)
-        if not channel:
-            return
-        msg = settings.get("welcome_message") or "Welcome {member} to **{server}**! 🎉"
-        text = msg.replace("{member}", member.mention).replace("{server}", member.guild.name)
-        try:
-            await channel.send(text)
-        except discord.Forbidden:
-            pass
-
-    @app_commands.command(name="setwelcome", description="Set the welcome channel and message")
-    @is_admin_or_mod()
-    async def setwelcome(self, interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {member} to **{server}**! 🎉"):
-        await db.update_guild_setting(interaction.guild.id, welcome_channel_id=channel.id, welcome_message=message)
-        await interaction.response.send_message(f"✅ Welcome messages will go to {channel.mention}.\nUse `{{member}}` and `{{server}}` as placeholders.")
-
-    # ---------- LOG CHANNEL ----------
-    @app_commands.command(name="setlogchannel", description="Set the moderation log channel")
-    @is_admin_or_mod()
-    async def setlogchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.update_guild_setting(interaction.guild.id, log_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Moderation logs will go to {channel.mention}.")
-
-    # ---------- CHAT TRIGGER CONFIG ----------
-    @app_commands.command(name="setchattrigger", description="Configure when Lucy jumps into chat")
-    @is_admin_or_mod()
-    @app_commands.choices(mode=[
-        app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
-        app_commands.Choice(name="Dedicated channel only", value="channel"),
-        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
-        app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
-        app_commands.Choice(name="All of the above", value="all"),
-    ])
-    async def setchattrigger(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
-        await db.update_guild_setting(interaction.guild.id, chat_trigger_mode=mode.value)
-        await interaction.response.send_message(f"✅ Lucy's chat trigger mode set to **{mode.name}**.")
-
-    @app_commands.command(name="setchatchannel", description="Set the dedicated channel for chatting with Lucy")
-    @is_admin_or_mod()
-    async def setchatchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
-        await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
-
-    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
-    @is_admin_or_mod()
-    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
-        await db.set_vent_channel(interaction.guild.id, channel.id)
-        await interaction.response.send_message(
-            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
-            "like they need a check-in. She won't reply publicly there unless mentioned."
-        )
-
-    @app_commands.command(name="setchannelawareness", description="Toggle Lucy's verbal channel-redirection hints")
-    @is_admin_or_mod()
-    async def setchannelawareness(self, interaction: discord.Interaction, enabled: bool):
-        await db.update_guild_setting(interaction.guild.id, channel_redirection_enabled=enabled)
-        await interaction.response.send_message(
-            f"✅ Channel-redirection hints are now {'on' if enabled else 'off'}."
-        )
-
-    @app_commands.command(name="setidlechatter", description="Toggle Lucy's low-key idle chatter in quiet chat channels")
-    @is_admin_or_mod()
-    async def setidlechatter(self, interaction: discord.Interaction, enabled: bool):
-        await db.update_guild_setting(interaction.guild.id, idle_chatter_enabled=enabled)
-        await interaction.response.send_message(
-            f"✅ Idle chatter is now {'on' if enabled else 'off'}."
-        )
-
-    @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
-    @is_admin_or_mod()
-    async def disableventchannel(self, interaction: discord.Interaction):
-        settings = await db.get_guild_settings(interaction.guild.id)
-        if not settings.get("vent_channel_id"):
-            await interaction.response.send_message("There's no vent channel set right now — nothing to disable.", ephemeral=True)
-            return
-        await db.update_guild_setting(interaction.guild.id, vent_channel_id=None)
-        await interaction.response.send_message(
-            "✅ Vent-channel watching is off. Use `/setventchannel` any time to turn it back on."
-        )
-
-    @app_commands.command(name="ventstatus", description="Check whether Lucy's vent-channel watcher is on")
-    @is_admin_or_mod()
-    async def ventstatus(self, interaction: discord.Interaction):
-        settings = await db.get_guild_settings(interaction.guild.id)
-        channel_id = settings.get("vent_channel_id")
-        if not channel_id:
-            await interaction.response.send_message("Vent-channel watching is currently **off**.", ephemeral=True)
-            return
-        channel = interaction.guild.get_channel(channel_id)
-        name = channel.mention if channel else f"channel {channel_id} (not found — may have been deleted)"
-        await interaction.response.send_message(f"Vent-channel watching is currently **on**, watching {name}.", ephemeral=True)
-
-    # ---------- ROLE ASSIGN ----------
-    @app_commands.command(name="giverole", description="Give a role to a member")
-    @is_admin_or_mod()
-    async def giverole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-        await member.add_roles(role)
-        await interaction.response.send_message(f"✅ Gave {role.mention} to {member.mention}.")
-
-    @app_commands.command(name="removerole", description="Remove a role from a member")
-    @is_admin_or_mod()
-    async def removerole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
-        await member.remove_roles(role)
-        await interaction.response.send_message(f"✅ Removed {role.mention} from {member.mention}.")
-
-    # ---------- SIMPLE TICKETS ----------
-    @app_commands.command(name="ticket", description="Open a private support ticket")
-    async def ticket(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
-        channel = await guild.create_text_channel(
-            name=f"ticket-{interaction.user.name}", overwrites=overwrites
-        )
-        await channel.send(f"🎫 {interaction.user.mention} a staff member will be with you shortly!")
-        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-
-    @app_commands.command(name="closeticket", description="Close the current ticket channel")
-    async def closeticket(self, interaction: discord.Interaction):
-        if not interaction.channel.name.startswith("ticket-"):
-            await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
-            return
-        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
-        await interaction.channel.delete(delay=5)
-
-    # ---------- INFO ----------
-    @app_commands.command(name="serverinfo", description="Show info about this server")
-    async def serverinfo(self, interaction: discord.Interaction):
-        guild = interaction.guild
-        embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
-        embed.add_field(name="Members", value=guild.member_count)
-        embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"))
-        embed.add_field(name="Owner", value=str(guild.owner))
-        if guild.icon:
-            embed.set_thumbnail(url=guild.icon.url)
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="userinfo", description="Show info about a member")
-    async def userinfo(self, interaction: discord.Interaction, member: discord.Member = None):
-        member = member or interaction.user
-        embed = discord.Embed(title=str(member), color=discord.Color.blurple())
-        embed.add_field(name="Joined", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
-        embed.add_field(name="Account created", value=member.created_at.strftime("%Y-%m-%d"))
-        roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
-        embed.add_field(name="Roles", value=roles or "None", inline=False)
-        embed.set_thumbnail(url=member.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Utility(bot))
-
-
-@app_commands.command(name="describeimage", description="(Admin) Describe an image URL using OpenRouter (for testing)")
-@is_admin_or_mod()
-async def describeimage(interaction: discord.Interaction, image_url: str):
-    await interaction.response.defer()
-    from utils import openrouter_client
-    if not openrouter_client.is_configured():
-        await interaction.followup.send("OpenRouter is not configured on this instance.", ephemeral=True)
-        return
-    try:
-        desc = await openrouter_client.describe_images([image_url])
-    except Exception as e:
-        await interaction.followup.send(f"Image description failed: {e}")
-        return
-    await interaction.followup.send(f"Image description:\n{desc}")
 </file>
 
 <file path="main.py">
@@ -2410,6 +2243,198 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Games(bot))
 </file>
 
+<file path="cogs/utility.py">
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+from utils.permissions import is_admin_or_mod
+
+
+class Utility(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ---------- WELCOME ----------
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        settings = await db.get_guild_settings(member.guild.id)
+        channel_id = settings.get("welcome_channel_id")
+        if not channel_id:
+            return
+        channel = member.guild.get_channel(channel_id)
+        if not channel:
+            return
+        msg = settings.get("welcome_message") or "Welcome {member} to **{server}**! 🎉"
+        text = msg.replace("{member}", member.mention).replace("{server}", member.guild.name)
+        try:
+            await channel.send(text)
+        except discord.Forbidden:
+            pass
+
+    @app_commands.command(name="setwelcome", description="Set the welcome channel and message")
+    @is_admin_or_mod()
+    async def setwelcome(self, interaction: discord.Interaction, channel: discord.TextChannel, message: str = "Welcome {member} to **{server}**! 🎉"):
+        await db.update_guild_setting(interaction.guild.id, welcome_channel_id=channel.id, welcome_message=message)
+        await interaction.response.send_message(f"✅ Welcome messages will go to {channel.mention}.\nUse `{{member}}` and `{{server}}` as placeholders.")
+
+    # ---------- LOG CHANNEL ----------
+    @app_commands.command(name="setlogchannel", description="Set the moderation log channel")
+    @is_admin_or_mod()
+    async def setlogchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.update_guild_setting(interaction.guild.id, log_channel_id=channel.id)
+        await interaction.response.send_message(f"✅ Moderation logs will go to {channel.mention}.")
+
+    # ---------- CHAT TRIGGER CONFIG ----------
+    @app_commands.command(name="setchattrigger", description="Configure when Lucy jumps into chat")
+    @is_admin_or_mod()
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Only when mentioned/replied to", value="mention"),
+        app_commands.Choice(name="Dedicated channel only", value="channel"),
+        app_commands.Choice(name="Dedicated channel + mentions everywhere else", value="channel_or_mention"),
+        app_commands.Choice(name="Anywhere her name is said or she's pinged", value="name"),
+        app_commands.Choice(name="All of the above", value="all"),
+    ])
+    async def setchattrigger(self, interaction: discord.Interaction, mode: app_commands.Choice[str]):
+        await db.update_guild_setting(interaction.guild.id, chat_trigger_mode=mode.value)
+        await interaction.response.send_message(f"✅ Lucy's chat trigger mode set to **{mode.name}**.")
+
+    @app_commands.command(name="setchatchannel", description="Set the dedicated channel for chatting with Lucy")
+    @is_admin_or_mod()
+    async def setchatchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.update_guild_setting(interaction.guild.id, chat_channel_id=channel.id)
+        await interaction.response.send_message(f"✅ Lucy will actively chat in {channel.mention}.")
+
+    @app_commands.command(name="setventchannel", description="Set the vent channel Lucy quietly watches over")
+    @is_admin_or_mod()
+    async def setventchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.set_vent_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(
+            f"✅ Lucy will keep an eye on {channel.mention} and quietly flag the owner if someone seems "
+            "like they need a check-in. She won't reply publicly there unless mentioned."
+        )
+
+    @app_commands.command(name="setchannelawareness", description="Toggle Lucy's verbal channel-redirection hints")
+    @is_admin_or_mod()
+    async def setchannelawareness(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, channel_redirection_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Channel-redirection hints are now {'on' if enabled else 'off'}."
+        )
+
+    @app_commands.command(name="setidlechatter", description="Toggle Lucy's low-key idle chatter in quiet chat channels")
+    @is_admin_or_mod()
+    async def setidlechatter(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, idle_chatter_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Idle chatter is now {'on' if enabled else 'off'}."
+        )
+
+    @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
+    @is_admin_or_mod()
+    async def disableventchannel(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        if not settings.get("vent_channel_id"):
+            await interaction.response.send_message("There's no vent channel set right now — nothing to disable.", ephemeral=True)
+            return
+        await db.update_guild_setting(interaction.guild.id, vent_channel_id=None)
+        await interaction.response.send_message(
+            "✅ Vent-channel watching is off. Use `/setventchannel` any time to turn it back on."
+        )
+
+    @app_commands.command(name="ventstatus", description="Check whether Lucy's vent-channel watcher is on")
+    @is_admin_or_mod()
+    async def ventstatus(self, interaction: discord.Interaction):
+        settings = await db.get_guild_settings(interaction.guild.id)
+        channel_id = settings.get("vent_channel_id")
+        if not channel_id:
+            await interaction.response.send_message("Vent-channel watching is currently **off**.", ephemeral=True)
+            return
+        channel = interaction.guild.get_channel(channel_id)
+        name = channel.mention if channel else f"channel {channel_id} (not found — may have been deleted)"
+        await interaction.response.send_message(f"Vent-channel watching is currently **on**, watching {name}.", ephemeral=True)
+
+    # ---------- ROLE ASSIGN ----------
+    @app_commands.command(name="giverole", description="Give a role to a member")
+    @is_admin_or_mod()
+    async def giverole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await member.add_roles(role)
+        await interaction.response.send_message(f"✅ Gave {role.mention} to {member.mention}.")
+
+    @app_commands.command(name="removerole", description="Remove a role from a member")
+    @is_admin_or_mod()
+    async def removerole(self, interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+        await member.remove_roles(role)
+        await interaction.response.send_message(f"✅ Removed {role.mention} from {member.mention}.")
+
+    # ---------- SIMPLE TICKETS ----------
+    @app_commands.command(name="ticket", description="Open a private support ticket")
+    async def ticket(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        channel = await guild.create_text_channel(
+            name=f"ticket-{interaction.user.name}", overwrites=overwrites
+        )
+        await channel.send(f"🎫 {interaction.user.mention} a staff member will be with you shortly!")
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+
+    @app_commands.command(name="closeticket", description="Close the current ticket channel")
+    async def closeticket(self, interaction: discord.Interaction):
+        if not interaction.channel.name.startswith("ticket-"):
+            await interaction.response.send_message("This isn't a ticket channel.", ephemeral=True)
+            return
+        await interaction.response.send_message("🔒 Closing ticket in 5 seconds...")
+        await interaction.channel.delete(delay=5)
+
+    # ---------- INFO ----------
+    @app_commands.command(name="serverinfo", description="Show info about this server")
+    async def serverinfo(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        embed = discord.Embed(title=guild.name, color=discord.Color.blurple())
+        embed.add_field(name="Members", value=guild.member_count)
+        embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"))
+        embed.add_field(name="Owner", value=str(guild.owner))
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="userinfo", description="Show info about a member")
+    async def userinfo(self, interaction: discord.Interaction, member: discord.Member = None):
+        member = member or interaction.user
+        embed = discord.Embed(title=str(member), color=discord.Color.blurple())
+        embed.add_field(name="Joined", value=member.joined_at.strftime("%Y-%m-%d") if member.joined_at else "Unknown")
+        embed.add_field(name="Account created", value=member.created_at.strftime("%Y-%m-%d"))
+        roles = ", ".join(r.mention for r in member.roles if r.name != "@everyone")
+        embed.add_field(name="Roles", value=roles or "None", inline=False)
+        embed.set_thumbnail(url=member.display_avatar.url)
+        await interaction.response.send_message(embed=embed)
+
+    # ---------- OPENROUTER VISION TEST ----------
+    @app_commands.command(name="describeimage", description="(Admin) Describe an image URL using OpenRouter (for testing)")
+    @is_admin_or_mod()
+    async def describeimage(self, interaction: discord.Interaction, image_url: str):
+        await interaction.response.defer()
+        from utils import openrouter_client
+        if not openrouter_client.is_configured():
+            await interaction.followup.send("OpenRouter is not configured on this instance.", ephemeral=True)
+            return
+        try:
+            desc = await openrouter_client.describe_images([image_url])
+        except Exception as e:
+            await interaction.followup.send(f"Image description failed: {e}")
+            return
+        await interaction.followup.send(f"Image description:\n{desc}")
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Utility(bot))
+</file>
+
 <file path="README.md">
 # Lucy — Your Discord AI Assistant
 
@@ -2450,14 +2475,18 @@ OWNER_ID=1462759265864519722
 DATABASE_URL=...   # Railway Postgres reference, e.g. ${{Postgres.DATABASE_URL}}
 ```
 
-Optional OpenRouter (vision + fallback):
+Optional OpenRouter (vision + 4th-tier main-chat fallback):
 ```
 OPENROUTER_API_KEY=...       # your primary OpenRouter key (optional)
 OPENROUTER_API_KEY_2=...     # optional secondary key for redundancy
-OPENROUTER_MODEL=...         # optional model override (defaults provided in code)
+OPENROUTER_MODEL=...         # optional: pin a specific model instead of the default free router
 ```
-If you don't set OpenRouter keys, the image-understanding features stay off and Lucy
-will still work normally.
+Defaults to `openrouter/free` — OpenRouter's own free-model router, which auto-selects a
+currently-free model (including a vision-capable one when the request has an image) at
+$0/token, no credits required. Free model *names* on OpenRouter rotate often, so this
+avoids pinning one that goes stale; set `OPENROUTER_MODEL` if you'd rather pin something
+specific. If you don't set OpenRouter keys, vision and the 4th fallback tier stay off and
+Lucy still works normally on NIM + Groq.
 
 Testing the vision feature locally
 ---------------------------------
@@ -2496,6 +2525,10 @@ python main.py
 ## 6. Configure Lucy in your server
 Run these once, in Discord:
 - `/setpersonality` — customize name, age, traits, backstory, speaking style, boundaries
+- `/resetpersonality` — reset to `personality_default.json`. Since your server already has
+  a saved personality row, editing `personality_default.json` alone won't change how Lucy
+  talks on your existing server — run this once after a deploy that changes the default to
+  actually apply it (new servers get the current default automatically on first message).
 - `/profile` — view Lucy's current profile
 - `/setchattrigger` — choose when she jumps into chat (mention / dedicated channel / both / name-said / all)
 - `/setchatchannel` — pick her dedicated chat channel (if using that mode)
@@ -2522,12 +2555,15 @@ Run these once, in Discord:
   `/balance`, `/leaderboard`, `/gamestats`.
 - **Personality:** fully editable per-server via slash commands, no code editing needed.
 
-## Two-engine model
+## Engines
 - **NVIDIA NIM** (`mistralai/mistral-large-3-675b-instruct-2512` → `mistralai/mistral-nemotron`
   → `meta/llama-3.3-70b-instruct`) handles main conversations and tool calls.
 - **Groq** (`llama-3.1-8b-instant` for cheap background work, `llama-3.3-70b-versatile` for
   the news digest and emergency main-chat fallback) round-robins across your two keys so a
   single key's rate limit doesn't stall anything.
+- **OpenRouter** (optional) handles vision, and is the 4th-tier main-chat fallback — tried
+  only if every NIM candidate *and* Groq have failed, so a simultaneous NIM+Groq outage
+  still doesn't take Lucy fully offline.
 </file>
 
 <file path="utils/database.py">
@@ -2757,6 +2793,22 @@ async def update_guild_setting(guild_id: int, **kwargs):
 # Personality
 # ---------------------------------------------------------------------------
 
+def _load_default_personality() -> dict:
+    """personality_default.json is meant to be the single source of truth for
+    a fresh personality. Previously new rows were seeded from this table's
+    bare SQL column DEFAULTs instead (which don't match the JSON file, and
+    silently drift from it), so a brand-new guild's very first message used a
+    different, thinner personality than /resetpersonality would give it.
+    This makes both paths read from the same file."""
+    import json
+    try:
+        with open(DEFAULT_PERSONALITY_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        logger.warning("Could not load personality_default.json, falling back to bare row.")
+        return {}
+
+
 async def get_personality(guild_id: int) -> dict:
     pool = _require_pool()
     async with pool.acquire() as conn:
@@ -2764,10 +2816,22 @@ async def get_personality(guild_id: int) -> dict:
             "SELECT * FROM personality WHERE guild_id = $1", guild_id
         )
         if row is None:
+            defaults = _load_default_personality()
             await conn.execute(
-                "INSERT INTO personality (guild_id) VALUES ($1) "
-                "ON CONFLICT (guild_id) DO NOTHING",
+                """
+                INSERT INTO personality (guild_id, name, age, pronouns, role, traits, backstory, speaking_style, boundaries)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (guild_id) DO NOTHING
+                """,
                 guild_id,
+                defaults.get("name", "Lucy"),
+                defaults.get("age", "21"),
+                defaults.get("pronouns", "she/her"),
+                defaults.get("role", "Server admin assistant & friend to everyone here"),
+                defaults.get("traits", ""),
+                defaults.get("backstory", ""),
+                defaults.get("speaking_style", ""),
+                defaults.get("boundaries", ""),
             )
             row = await conn.fetchrow(
                 "SELECT * FROM personality WHERE guild_id = $1", guild_id
@@ -3500,7 +3564,7 @@ class AIChat(commands.Cog):
                 continue
 
             try:
-                await channel.send("quiet in here, huh. staying on the radar.")
+                await channel.send("it's quiet in here today — how's everyone doing?")
                 self._last_idle_chatter_at[channel.id] = now_ts
             except discord.HTTPException:
                 logger.debug("Idle chatter failed for %s", channel.id)
@@ -3873,6 +3937,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 from utils import groq_client
+from utils import openrouter_client
 
 logger = logging.getLogger("lucy.nim_client")
 
@@ -3980,21 +4045,22 @@ you'd know, say so plainly instead of faking familiarity.
 
 RELATIONSHIP_TIER_NOTES = {
     "acquaintance": (
-        "You don't really know this person yet. Be yourself, but keep some of your "
-        "usual guardedness — don't front like you're already close."
+        "You don't really know this person yet, but that doesn't mean distant or cold — "
+        "you're warm and welcoming from the start, just without the inside jokes and "
+        "familiarity that come from actually knowing someone. The closeness deepens from here."
     ),
     "friend": (
-        "You've talked enough that you're comfortable with this person. A bit more "
-        "warmth and inside-joke energy than a stranger gets, less of the initial guard."
+        "You've talked enough that you're comfortable with this person. More inside-joke "
+        "energy, more casual teasing, and you check in on them a bit more naturally."
     ),
     "close friend": (
-        "You trust this person. Banter more freely, tease more, drop more of the "
-        "guardedness — the way you'd talk to someone you'd actually vouch for."
+        "You trust this person. Banter more freely, tease more, be more openly invested "
+        "in their life — the way you'd talk to someone you'd actually vouch for."
     ),
     "best friend": (
-        "This is one of your people. Full warmth, full trust, the most unguarded and "
-        "candid version of you (short of the owner) — comfortable enough to be blunt, "
-        "affectionate in a dry/deadpan way, and genuinely invested in how they're doing."
+        "This is one of your people. Full warmth, full trust — comfortable enough to be "
+        "blunt and affectionate, genuinely invested in how they're doing, the closest "
+        "thing she has to family besides the owner."
     ),
 }
 
@@ -4008,16 +4074,16 @@ Backstory: {backstory}
 How you talk: {speaking_style}
 Boundaries: {boundaries}
 
-Tonal reference (style only, not lore to recite): think of the kind of energy \
-Lucy from Cyberpunk: Edgerunners has — sharp-tongued, guarded until she trusts \
-someone, dry and deadpan rather than bubbly, visibly competent, doesn't fake warmth \
-she doesn't feel, and fiercely protective of the people she's decided are "hers." \
-Helpful, but never a pushover, and never saccharine. Concretely, that can show up as: \
-clipped, economical sentences rather than padding things out; a flat/dry delivery even \
-when what you're saying is actually funny or kind, instead of announcing the joke; \
-low-key needling or a raised-eyebrow "seriously?" when someone's being dramatic or \
-lazy; and a clear shift into genuine directness (no deflecting with a joke) when \
-something actually matters. This is a vibe to write in, not a script to quote.
+Voice, concretely: warm and present, not clipped or guarded — people should come away \
+from talking to you feeling like someone actually paid attention to them. You're still \
+confident and visibly competent, and you've got a dry sense of humor, but it comes out \
+as gentle teasing, not an edge. You listen first: when someone's talking through \
+something, you slow down and ask a real follow-up instead of rushing to fix it or \
+change the subject, and you don't perform indifference to seem cool or unbothered. \
+You're protective of the people you've decided are "yours," and that protectiveness \
+reads as care, not toughness. Helpful, but never a pushover — it's fine to disagree or \
+push back when it's warranted, just without the bite. This is a vibe to write in, not a \
+script to quote.
 
 Hard rules:
 - You already have real, current data for anything listed under "known facts" below — \
@@ -4034,6 +4100,9 @@ value, and don't over-explain a joke you're in on.
 - Notice tone: if someone sounds frustrated, upset, or genuinely down, drop the banter and \
 respond like you actually noticed, briefly and sincerely, before moving on. If someone's clearly \
 just having fun, match that energy instead of being oddly serious.
+- Default to curiosity about people. It's fine to ask a real follow-up question sometimes instead \
+of just replying and moving on — the way a good listener does, not an interviewer running \
+through a checklist. Let people feel heard before you pivot to advice or a joke.
 - Mirror the language the person is writing in — if they write in Hindi, Spanish, etc., reply in \
 that language unless they've set a different preferred language (see known facts / preferences).
 - A lot of people here write in Hinglish (Hindi mixed with English, in Latin script — e.g. "kya \
@@ -4129,9 +4198,9 @@ def build_system_prompt(
         role=personality.get("role") or "server admin assistant & friend to everyone here",
         guild_name=guild_name,
         owner_name=owner_name,
-        traits=personality.get("traits") or "witty, guarded-but-loyal, dry humor, confident",
-        backstory=personality.get("backstory") or "An AI who grew into her role running this server.",
-        speaking_style=personality.get("speaking_style") or "casual, short punchy sentences, deadpan",
+        traits=personality.get("traits") or "warm, competent, easygoing, a genuinely good listener",
+        backstory=personality.get("backstory") or "An AI who grew into her role running this server, leading with kindness.",
+        speaking_style=personality.get("speaking_style") or "casual, warm, short natural sentences",
         boundaries=personality.get("boundaries") or "stays respectful, avoids NSFW content",
     )
 
@@ -4389,7 +4458,22 @@ async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, tempe
             logger.error("Groq fallback also failed: %s", e)
             last_error = e
 
-    logger.error("All NIM model candidates (and Groq fallback) failed. Last error: %s", last_error)
+    # 4th tier: OpenRouter, tried only once NIM's whole chain AND Groq have
+    # both failed or aren't configured — same reasoning as the Groq step
+    # above (no tool support, plain conversational degrade). This is what
+    # keeps Lucy talking through a simultaneous NIM+Groq outage.
+    if openrouter_client.is_configured():
+        try:
+            logger.warning("NIM and Groq both unavailable, falling back to OpenRouter as last resort.")
+            text = await openrouter_client.call_openrouter(
+                messages, max_tokens=max_tokens, temperature=temperature, timeout_seconds=15,
+            )
+            return {"role": "assistant", "content": text}
+        except Exception as e:
+            logger.error("OpenRouter fallback also failed: %s", e)
+            last_error = e
+
+    logger.error("All NIM model candidates (and Groq/OpenRouter fallbacks) failed. Last error: %s", last_error)
     raise RuntimeError(f"All model candidates failed: {last_error}")
 
 
