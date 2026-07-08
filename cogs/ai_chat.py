@@ -20,6 +20,17 @@ v3 changes:
     display name), matching the DB schema update.
   - Reaction-based feedback: 👍/👎 on one of Lucy's replies (by the person she
     was replying to) logs to the feedback table.
+
+Max Awareness, Phase 1 (this session): new lookup_member tool (see
+MAX_AWARENESS_HANDOFF.md) — on-demand info about any guild member, not just
+ones who've chatted with her, merged into every tool list unconditionally
+(no permission gate, same treatment as CONCERN_TOOLS). format_member_lookup()
+is the pure formatter, next to maybe_suggest_channel_redirection above.
+
+Idle chatter (this session): now fans out to a per-guild list of channels
+(idle_chatter_channels table) instead of a single hardcoded chat_channel_id,
+via resolve_idle_chatter_channel_ids() below — a guild that hasn't added any
+channels explicitly still falls back to the old chat_channel_id behavior.
 """
 
 import re
@@ -74,6 +85,65 @@ def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str
         if "announcement" in (channel_topic or "").lower() or "news" in (channel_topic or "").lower():
             return "This looks more like a discussion topic than an announcement post."
     return None
+
+
+def resolve_idle_chatter_channel_ids(
+    configured_channel_ids: list[int], fallback_channel_id: Optional[int]
+) -> list[int]:
+    """Pure helper (unit-testable without mocking discord.Guild): given a
+    guild's explicitly-configured idle-chatter channels (idle_chatter_channels
+    table, set via /addidlechatterchannel) and the legacy single
+    chat_channel_id, return the channel ids idle chatter should actually
+    consider this pass.
+
+    If the admin has explicitly configured one or more channels, use only
+    those — an explicit list means they've taken over channel selection, so
+    we don't also silently include the old single-channel default. If
+    nothing's been explicitly configured yet, fall back to the old
+    chat_channel_id behavior so a guild that hasn't touched the new commands
+    doesn't lose idle chatter on upgrade."""
+    if configured_channel_ids:
+        return list(configured_channel_ids)
+    if fallback_channel_id:
+        return [fallback_channel_id]
+    return []
+
+
+def format_member_lookup(data: dict) -> str:
+    """Pure formatter for the lookup_member tool (Max Awareness, Phase 1) —
+    takes a plain dict of already-extracted fields so it's unit-testable
+    without mocking discord.Member/discord.Guild objects. The discord-object
+    extraction that builds this dict lives in _execute_tool_call, same as
+    the rest of that function (thin, not unit tested directly).
+
+    Expected keys: display_name, username, is_bot, joined, created, roles,
+    notes (all optional except display_name/is_bot).
+
+    Deliberately no status/activity fields yet — see INFO_TOOLS in
+    utils/nim_client.py for why (Presence intent not enabled yet)."""
+    display_name = data.get("display_name") or "that member"
+    username = data.get("username")
+    handle = f" (@{username})" if username else ""
+
+    # Bot check comes first and short-circuits everything else — this is
+    # the cheap, reliable half of "distinguish bot vs. member" that Max
+    # Awareness asked for, and it's easy to get backwards by accident if
+    # this isn't the very first thing checked.
+    if data.get("is_bot"):
+        return f"{display_name}{handle} is a bot account, not a person."
+
+    joined = data.get("joined") or "unknown"
+    created = data.get("created") or "unknown"
+    roles = data.get("roles") or "none"
+
+    parts = [
+        f"{display_name}{handle} — joined this server on {joined}, Discord "
+        f"account created {created}, roles: {roles}."
+    ]
+    notes = data.get("notes")
+    if notes:
+        parts.append(f"Known notes: {notes}")
+    return " ".join(parts)
 
 
 class AIChat(commands.Cog):
@@ -292,28 +362,32 @@ class AIChat(commands.Cog):
             settings = await db.get_guild_settings(guild.id)
             if not settings.get("idle_chatter_enabled"):
                 continue
-            channel_id = settings.get("chat_channel_id")
-            if not channel_id:
-                continue
-            channel = guild.get_channel(int(channel_id))
-            if not isinstance(channel, discord.TextChannel):
-                continue
-            if not channel.permissions_for(guild.me).send_messages:
-                continue
 
-            now_ts = asyncio.get_event_loop().time()
-            last_activity = self._last_activity_at.get(channel.id, 0.0)
-            last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
-            if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
-                continue
-            if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
-                continue
+            configured = await db.get_idle_chatter_channels(guild.id)
+            channel_ids = resolve_idle_chatter_channel_ids(
+                configured, settings.get("chat_channel_id")
+            )
 
-            try:
-                await channel.send("it's quiet in here today — how's everyone doing?")
-                self._last_idle_chatter_at[channel.id] = now_ts
-            except discord.HTTPException:
-                logger.debug("Idle chatter failed for %s", channel.id)
+            for channel_id in channel_ids:
+                channel = guild.get_channel(int(channel_id))
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                if not channel.permissions_for(guild.me).send_messages:
+                    continue
+
+                now_ts = asyncio.get_event_loop().time()
+                last_activity = self._last_activity_at.get(channel.id, 0.0)
+                last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
+                if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
+                    continue
+                if last_sent and (now_ts - last_sent) < IDLE_CHATTER_INTERVAL_SECONDS:
+                    continue
+
+                try:
+                    await channel.send("it's quiet in here today — how's everyone doing?")
+                    self._last_idle_chatter_at[channel.id] = now_ts
+                except discord.HTTPException:
+                    logger.debug("Idle chatter failed for %s", channel.id)
 
     async def _maybe_redirect_channel(self, message: discord.Message, suggestion: str):
         try:
@@ -479,6 +553,35 @@ class AIChat(commands.Cog):
             await target_member.add_roles(target_role, reason=f"Requested by {author}")
             return f"Success: gave {target_member.display_name} the '{target_role.name}' role."
 
+        if name == "lookup_member":
+            # Unlike assign_role/create_role above, this has no permission
+            # gate — it's always in the tool list (see INFO_TOOLS in
+            # nim_client.py) because it only surfaces info any member could
+            # already see by clicking a profile.
+            member_name = (args.get("member_name") or "").strip().lower()
+            if not member_name:
+                return "Error: no member name given."
+            target = discord.utils.find(
+                lambda m: m.display_name.lower() == member_name or m.name.lower() == member_name,
+                guild.members,
+            )
+            if target is None:
+                return f"Error: no member named '{member_name}' found."
+
+            profile = await db.get_profile(guild.id, target.id)
+            notes = profile.get("notes") if profile else None
+
+            data = {
+                "display_name": target.display_name,
+                "username": target.name,
+                "is_bot": target.bot,
+                "joined": target.joined_at.strftime("%B %d, %Y") if target.joined_at else None,
+                "created": target.created_at.strftime("%B %d, %Y") if target.created_at else None,
+                "roles": ", ".join(r.name for r in target.roles if r.name != "@everyone") or "none",
+                "notes": notes,
+            }
+            return format_member_lookup(data)
+
         return f"Error: unknown tool '{name}'."
 
     # -----------------------------------------------------------------
@@ -598,7 +701,7 @@ class AIChat(commands.Cog):
         # 6. Call the model (semaphore-capped), with tool support
         try:
             async with self._nim_semaphore:
-                tools = nim_client.CONCERN_TOOLS + (nim_client.TOOLS if can_use_tools else [])
+                tools = nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + (nim_client.TOOLS if can_use_tools else [])
                 assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
 
                 if assistant_message.get("tool_calls"):

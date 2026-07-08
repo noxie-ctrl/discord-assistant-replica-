@@ -135,6 +135,17 @@ CREATE TABLE IF NOT EXISTS image_descriptions (
     description TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- Idle chatter fix (this session): idle chatter used to be hardcoded to
+-- whatever single channel /setchatchannel pointed at. This is a new table,
+-- not a new column, so no MIGRATIONS entry is needed — a guild with no rows
+-- here yet just falls back to the old chat_channel_id behavior (see
+-- resolve_idle_chatter_channel_ids() in cogs/ai_chat.py).
+CREATE TABLE IF NOT EXISTS idle_chatter_channels (
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    PRIMARY KEY (guild_id, channel_id)
+);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -220,6 +231,39 @@ async def update_guild_setting(guild_id: int, **kwargs):
             f"UPDATE guild_settings SET {set_clause} WHERE guild_id = $1",
             guild_id, *values,
         )
+
+
+# ---------------------------------------------------------------------------
+# Idle chatter channels (multi-channel, this session's fix)
+# ---------------------------------------------------------------------------
+
+async def add_idle_chatter_channel(guild_id: int, channel_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO idle_chatter_channels (guild_id, channel_id) VALUES ($1, $2) "
+            "ON CONFLICT (guild_id, channel_id) DO NOTHING",
+            guild_id, channel_id,
+        )
+
+
+async def remove_idle_chatter_channel(guild_id: int, channel_id: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM idle_chatter_channels WHERE guild_id = $1 AND channel_id = $2",
+            guild_id, channel_id,
+        )
+
+
+async def get_idle_chatter_channels(guild_id: int) -> list[int]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT channel_id FROM idle_chatter_channels WHERE guild_id = $1",
+            guild_id,
+        )
+        return [r["channel_id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------

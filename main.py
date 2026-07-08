@@ -30,6 +30,12 @@ logger = logging.getLogger("lucy.main")
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
+# NOT yet added: INTENTS.presences = True — this needs Nox to first enable
+# "Presence Intent" in the Discord Developer Portal (Bot tab, alongside the
+# two intents above). Required for Max Awareness's status/activity lookup.
+# See MAX_AWARENESS_HANDOFF.md, Phase 0. Once that's confirmed done, flip
+# this on and INFO_TOOLS' lookup_member (utils/nim_client.py) can start
+# returning real status/activity instead of omitting it.
 
 COGS = [
     "cogs.moderation",

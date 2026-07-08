@@ -85,6 +85,48 @@ class Utility(commands.Cog):
             f"✅ Idle chatter is now {'on' if enabled else 'off'}."
         )
 
+    @app_commands.command(name="addidlechatterchannel", description="Add a channel Lucy can idle-chatter in (in addition to the main chat channel)")
+    @is_admin_or_mod()
+    async def addidlechatterchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.add_idle_chatter_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Added {channel.mention} to Lucy's idle-chatter channels.")
+
+    @app_commands.command(name="removeidlechatterchannel", description="Remove a channel from Lucy's idle-chatter list")
+    @is_admin_or_mod()
+    async def removeidlechatterchannel(self, interaction: discord.Interaction, channel: discord.TextChannel):
+        await db.remove_idle_chatter_channel(interaction.guild.id, channel.id)
+        await interaction.response.send_message(f"✅ Removed {channel.mention} from Lucy's idle-chatter channels.")
+
+    @app_commands.command(name="listidlechatterchannels", description="List the channels Lucy currently idle-chatters in")
+    @is_admin_or_mod()
+    async def listidlechatterchannels(self, interaction: discord.Interaction):
+        channel_ids = await db.get_idle_chatter_channels(interaction.guild.id)
+        if not channel_ids:
+            settings = await db.get_guild_settings(interaction.guild.id)
+            fallback_id = settings.get("chat_channel_id")
+            if fallback_id:
+                channel = interaction.guild.get_channel(fallback_id)
+                name = channel.mention if channel else f"channel {fallback_id} (not found)"
+                await interaction.response.send_message(
+                    f"No channels explicitly added yet — falling back to the main chat channel, {name}. "
+                    "Use `/addidlechatterchannel` to add more.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "No idle-chatter channels configured, and no main chat channel set either — "
+                    "idle chatter has nowhere to post right now.",
+                    ephemeral=True,
+                )
+            return
+        mentions = []
+        for cid in channel_ids:
+            channel = interaction.guild.get_channel(cid)
+            mentions.append(channel.mention if channel else f"channel {cid} (not found)")
+        await interaction.response.send_message(
+            "Idle-chatter channels: " + ", ".join(mentions), ephemeral=True
+        )
+
     @app_commands.command(name="setservervibe", description="Toggle Lucy's background read of this server's chat vibe/energy")
     @is_admin_or_mod()
     async def setservervibe(self, interaction: discord.Interaction, enabled: bool):

@@ -52,6 +52,7 @@ cogs/
   utility.py
 tests/
   test_ai_chat_helpers.py
+  test_awareness_vibe.py
   test_openrouter_client.py
 utils/
   __init__.py
@@ -608,127 +609,83 @@ if __name__ == "__main__":
     unittest.main()
 </file>
 
-<file path="utils/__init__.py">
+<file path="tests/test_awareness_vibe.py">
+import asyncio
+import unittest
+from unittest import mock
 
+from utils import awareness
+
+
+class ServerVibeDigestTests(unittest.TestCase):
+    def setUp(self):
+        # Isolate the module-level cache between tests.
+        awareness._cached_vibe = {}
+        awareness._cached_vibe_at = {}
+
+    def test_returns_empty_when_groq_not_configured(self):
+        # Unlike the news digest, there's no raw-message fallback here on
+        # purpose — no Groq means no digest, not a leak of raw chat content.
+        with mock.patch.object(awareness.groq_client, "is_configured", return_value=False):
+            result = asyncio.run(
+                awareness.refresh_server_vibe(123, ["hey", "lol same"], force=True)
+            )
+        self.assertEqual(result, "")
+
+    def test_caches_per_guild_independently(self):
+        async def fake_call_groq(*args, **kwargs):
+            return "Chill and meme-heavy, lots of gaming banter."
+
+        with mock.patch.object(awareness.groq_client, "is_configured", return_value=True), \
+             mock.patch.object(awareness.groq_client, "call_groq", side_effect=fake_call_groq):
+            asyncio.run(awareness.refresh_server_vibe(1, ["hi"], force=True))
+            asyncio.run(awareness.refresh_server_vibe(2, ["yo"], force=True))
+
+        self.assertEqual(
+            awareness.get_cached_server_vibe(1), "Chill and meme-heavy, lots of gaming banter."
+        )
+        self.assertEqual(
+            awareness.get_cached_server_vibe(2), "Chill and meme-heavy, lots of gaming banter."
+        )
+        # A guild that was never refreshed should read back empty, not crash.
+        self.assertEqual(awareness.get_cached_server_vibe(999), "")
+
+    def test_none_response_does_not_clobber_existing_cache(self):
+        # Regression: a thin/mixed sample (model says NONE) or a transient
+        # failure should keep whatever vibe was cached before, not blank it.
+        awareness._cached_vibe[42] = "existing vibe"
+        awareness._cached_vibe_at[42] = 0.0
+
+        async def fake_call_groq(*args, **kwargs):
+            return "NONE"
+
+        with mock.patch.object(awareness.groq_client, "is_configured", return_value=True), \
+             mock.patch.object(awareness.groq_client, "call_groq", side_effect=fake_call_groq):
+            result = asyncio.run(awareness.refresh_server_vibe(42, ["ok"], force=True))
+
+        self.assertEqual(result, "existing vibe")
+
+    def test_respects_refresh_interval_unless_forced(self):
+        calls = {"count": 0}
+
+        async def fake_call_groq(*args, **kwargs):
+            calls["count"] += 1
+            return "some vibe"
+
+        with mock.patch.object(awareness.groq_client, "is_configured", return_value=True), \
+             mock.patch.object(awareness.groq_client, "call_groq", side_effect=fake_call_groq):
+            asyncio.run(awareness.refresh_server_vibe(7, ["hi"], force=True))
+            asyncio.run(awareness.refresh_server_vibe(7, ["hi again"], force=False))
+
+        self.assertEqual(calls["count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
 </file>
 
-<file path="utils/awareness.py">
-"""
-utils/awareness.py
+<file path="utils/__init__.py">
 
-Gives Lucy passive "peak awareness" of current events without spending a
-model call on every message. A background refresh (started from
-cogs/ai_chat.py's cog_load) pulls real headlines from the same BBC feeds
-cogs/news.py already uses, then condenses them into a short digest string
-via Groq (cheap/fast — this is exactly the kind of background task that
-shouldn't touch the main NIM quota). The digest is cached in memory and
-just re-read (no network/model call) every time a chat reply is built.
-
-If Groq isn't configured, we fall back to a plain title list — still
-correct, just less conversationally condensed.
-"""
-
-import time
-import logging
-import xml.etree.ElementTree as ET
-
-import aiohttp
-
-from utils import groq_client
-
-logger = logging.getLogger("lucy.awareness")
-
-REFRESH_INTERVAL_SECONDS = 3 * 60 * 60  # refresh every 3 hours
-FEEDS = [
-    "http://feeds.bbci.co.uk/news/rss.xml",       # top stories
-    "http://feeds.bbci.co.uk/news/world/rss.xml",  # world
-]
-
-_cached_digest: str | None = None
-_cached_at: float = 0.0
-
-
-async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
-    titles: list[str] = []
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in FEEDS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    raw = await resp.text()
-                root = ET.fromstring(raw)
-                for item in root.findall(".//item")[:limit_per_feed]:
-                    title = (item.findtext("title", default="") or "").strip()
-                    if title:
-                        titles.append(title)
-            except Exception as e:
-                logger.warning("Failed fetching feed %s: %s", url, e)
-    # de-dupe while preserving order
-    seen = set()
-    unique = []
-    for t in titles:
-        if t not in seen:
-            seen.add(t)
-            unique.append(t)
-    return unique[:8]
-
-
-async def _condense(titles: list[str]) -> str:
-    if not titles:
-        return ""
-    raw_list = "\n".join(f"- {t}" for t in titles)
-    if not groq_client.is_configured():
-        return raw_list
-
-    try:
-        return await groq_client.call_groq(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Condense these real news headlines into at most 5 short factual "
-                        "one-line bullet points a person could casually mention knowing about "
-                        "today. No commentary, no markdown headers, just '- fact' lines."
-                    ),
-                },
-                {"role": "user", "content": raw_list},
-            ],
-            model=groq_client.MODEL_FAST,
-            max_tokens=220,
-            temperature=0.2,
-        )
-    except Exception as e:
-        logger.warning("News digest condensation failed, using raw titles: %s", e)
-        return raw_list
-
-
-async def refresh_digest(force: bool = False) -> str:
-    """Fetches + condenses fresh headlines and updates the cache. Safe to
-    call often — internally no-ops if the cache is still fresh, unless
-    force=True."""
-    global _cached_digest, _cached_at
-    now = time.time()
-    if not force and _cached_digest is not None and (now - _cached_at) < REFRESH_INTERVAL_SECONDS:
-        return _cached_digest
-
-    try:
-        titles = await _fetch_headlines()
-        digest = await _condense(titles)
-        if digest:
-            _cached_digest = digest
-            _cached_at = now
-    except Exception as e:
-        logger.warning("News digest refresh failed, keeping previous cache: %s", e)
-
-    return _cached_digest or ""
-
-
-def get_cached_digest() -> str:
-    """Non-blocking read for use while building a system prompt — never
-    does network/model work itself."""
-    return _cached_digest or ""
 </file>
 
 <file path="utils/groq_client.py">
@@ -861,6 +818,209 @@ def is_configured() -> bool:
 
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="utils/awareness.py">
+"""
+utils/awareness.py
+
+Gives Lucy passive "peak awareness" of current events without spending a
+model call on every message. A background refresh (started from
+cogs/ai_chat.py's cog_load) pulls real headlines from the same BBC feeds
+cogs/news.py already uses, then condenses them into a short digest string
+via Groq (cheap/fast — this is exactly the kind of background task that
+shouldn't touch the main NIM quota). The digest is cached in memory and
+just re-read (no network/model call) every time a chat reply is built.
+
+If Groq isn't configured, we fall back to a plain title list — still
+correct, just less conversationally condensed.
+
+Day 4 addition: a server-vibe digest, same shape as the news digest above,
+but per-guild instead of global and reading the guild's own recent chat
+instead of RSS. Deliberately doesn't fall back to a raw-message dump when
+Groq isn't configured (unlike the news digest) — echoing members' actual
+messages back into a system prompt with no condensation is a real privacy
+smell, whereas raw headlines are public wire copy anyway.
+"""
+
+import time
+import logging
+import xml.etree.ElementTree as ET
+
+import aiohttp
+
+from utils import groq_client
+
+logger = logging.getLogger("lucy.awareness")
+
+REFRESH_INTERVAL_SECONDS = 3 * 60 * 60  # refresh every 3 hours
+FEEDS = [
+    "http://feeds.bbci.co.uk/news/rss.xml",       # top stories
+    "http://feeds.bbci.co.uk/news/world/rss.xml",  # world
+]
+
+_cached_digest: str | None = None
+_cached_at: float = 0.0
+
+
+async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
+    titles: list[str] = []
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in FEEDS:
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    raw = await resp.text()
+                root = ET.fromstring(raw)
+                for item in root.findall(".//item")[:limit_per_feed]:
+                    title = (item.findtext("title", default="") or "").strip()
+                    if title:
+                        titles.append(title)
+            except Exception as e:
+                logger.warning("Failed fetching feed %s: %s", url, e)
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique[:8]
+
+
+async def _condense(titles: list[str]) -> str:
+    if not titles:
+        return ""
+    raw_list = "\n".join(f"- {t}" for t in titles)
+    if not groq_client.is_configured():
+        return raw_list
+
+    try:
+        return await groq_client.call_groq(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Condense these real news headlines into at most 5 short factual "
+                        "one-line bullet points a person could casually mention knowing about "
+                        "today. No commentary, no markdown headers, just '- fact' lines."
+                    ),
+                },
+                {"role": "user", "content": raw_list},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=220,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning("News digest condensation failed, using raw titles: %s", e)
+        return raw_list
+
+
+async def refresh_digest(force: bool = False) -> str:
+    """Fetches + condenses fresh headlines and updates the cache. Safe to
+    call often — internally no-ops if the cache is still fresh, unless
+    force=True."""
+    global _cached_digest, _cached_at
+    now = time.time()
+    if not force and _cached_digest is not None and (now - _cached_at) < REFRESH_INTERVAL_SECONDS:
+        return _cached_digest
+
+    try:
+        titles = await _fetch_headlines()
+        digest = await _condense(titles)
+        if digest:
+            _cached_digest = digest
+            _cached_at = now
+    except Exception as e:
+        logger.warning("News digest refresh failed, keeping previous cache: %s", e)
+
+    return _cached_digest or ""
+
+
+def get_cached_digest() -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_digest or ""
+
+
+# ---------------------------------------------------------------------------
+# Server-vibe digest (Day 4) — per-guild, reads the guild's own recent chat
+# instead of RSS, distills tone/slang/energy rather than facts.
+# ---------------------------------------------------------------------------
+
+SERVER_VIBE_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60  # refresh every 6 hours
+SERVER_VIBE_SAMPLE_SIZE = 60  # recent messages sampled per guild
+
+_cached_vibe: dict[int, str] = {}
+_cached_vibe_at: dict[int, float] = {}
+
+_VIBE_SYSTEM_PROMPT = (
+    "You read a sample of recent Discord messages from one server and describe "
+    "the general conversational vibe in 1-2 short sentences: how casual/formal "
+    "it is, general energy (chill, chaotic, meme-heavy, supportive, competitive, "
+    "etc.), and any recurring slang or in-jokes worth knowing. Do NOT quote "
+    "specific messages, do NOT name specific users, and do NOT reference any "
+    "specific incident, drama, or sensitive topic mentioned — describe only the "
+    "general tone/style, nothing traceable back to one message or person. If "
+    "the sample is too thin or mixed to say anything meaningful, output exactly: NONE."
+)
+
+
+async def _condense_vibe(sample_messages: list[str]) -> str:
+    if not sample_messages:
+        return ""
+    # No non-model fallback here on purpose (unlike _condense above) — with
+    # no Groq to distill it, the only honest options are silence or echoing
+    # members' raw messages into a system prompt, and the latter isn't okay.
+    if not groq_client.is_configured():
+        return ""
+
+    raw = "\n".join(f"- {m}" for m in sample_messages[-SERVER_VIBE_SAMPLE_SIZE:])
+    try:
+        return await groq_client.call_groq(
+            [
+                {"role": "system", "content": _VIBE_SYSTEM_PROMPT},
+                {"role": "user", "content": raw},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=120,
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning("Server vibe condensation failed: %s", e)
+        return ""
+
+
+async def refresh_server_vibe(guild_id: int, sample_messages: list[str], force: bool = False) -> str:
+    """Condenses a sample of one guild's own recent chat into a short
+    tone/vibe descriptor and updates that guild's cache entry. Safe to call
+    often — no-ops if that guild's cache is still fresh, unless force=True.
+    A thin/mixed sample (model returns NONE) or a failed call leaves the
+    previous cached value in place rather than clearing it."""
+    now = time.time()
+    if not force:
+        last_at = _cached_vibe_at.get(guild_id, 0.0)
+        if guild_id in _cached_vibe and (now - last_at) < SERVER_VIBE_REFRESH_INTERVAL_SECONDS:
+            return _cached_vibe[guild_id]
+
+    try:
+        digest = await _condense_vibe(sample_messages)
+        if digest and digest.strip().upper() != "NONE":
+            _cached_vibe[guild_id] = digest.strip()
+            _cached_vibe_at[guild_id] = now
+    except Exception as e:
+        logger.warning("Server vibe refresh failed for guild %s, keeping previous cache: %s", guild_id, e)
+
+    return _cached_vibe.get(guild_id, "")
+
+
+def get_cached_server_vibe(guild_id: int) -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_vibe.get(guild_id, "")
 </file>
 
 <file path="utils/permissions.py">
@@ -2331,6 +2491,16 @@ class Utility(commands.Cog):
             f"✅ Idle chatter is now {'on' if enabled else 'off'}."
         )
 
+    @app_commands.command(name="setservervibe", description="Toggle Lucy's background read of this server's chat vibe/energy")
+    @is_admin_or_mod()
+    async def setservervibe(self, interaction: discord.Interaction, enabled: bool):
+        await db.update_guild_setting(interaction.guild.id, server_vibe_enabled=enabled)
+        await interaction.response.send_message(
+            f"✅ Server-vibe awareness is now {'on' if enabled else 'off'}. "
+            "When on, Lucy periodically distills the general tone of recent chat here "
+            "(never specific messages or names) to inform how casual/bantery she is."
+        )
+
     @app_commands.command(name="disableventchannel", description="Turn off Lucy's vent-channel watcher (no redeploy needed)")
     @is_admin_or_mod()
     async def disableventchannel(self, interaction: discord.Interaction):
@@ -2604,7 +2774,8 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     welcome_message TEXT,
     vent_channel_id BIGINT,
     channel_redirection_enabled BOOLEAN DEFAULT TRUE,
-    idle_chatter_enabled BOOLEAN DEFAULT TRUE
+    idle_chatter_enabled BOOLEAN DEFAULT TRUE,
+    server_vibe_enabled BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS member_events (
@@ -2714,6 +2885,7 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS response_style TEXT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
 """
 
 
@@ -3134,6 +3306,24 @@ async def get_recent_messages_by_user(guild_id: int, user_id: int, limit: int = 
         return [dict(r) for r in reversed(rows)]
 
 
+async def get_recent_guild_messages(guild_id: int, limit: int = 60) -> list[dict]:
+    """Recent user messages across ALL channels in a guild, most recent
+    last. Used only to build the sample for the server-vibe digest
+    (utils/awareness.py) — not tied to any one user or channel."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM chat_memory
+            WHERE guild_id = $1 AND role = 'user'
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            guild_id, limit,
+        )
+        return [dict(r) for r in reversed(rows)]
+
+
 # ---------------------------------------------------------------------------
 # Feedback (reaction-based, feeds the model rather than "training" it)
 # ---------------------------------------------------------------------------
@@ -3378,10 +3568,15 @@ class AIChat(commands.Cog):
         asyncio.create_task(awareness.refresh_digest(force=True))
         self._news_refresh_loop.start()
         self._idle_chatter_loop.start()
+        # Same idea, but per-guild and reading the guild's own recent chat
+        # instead of RSS (Day 4: server-vibe digest).
+        asyncio.create_task(self._refresh_all_guild_vibes(force=True))
+        self._server_vibe_refresh_loop.start()
 
     async def cog_unload(self):
         self._news_refresh_loop.cancel()
         self._idle_chatter_loop.cancel()
+        self._server_vibe_refresh_loop.cancel()
 
     @tasks.loop(hours=3)
     async def _news_refresh_loop(self):
@@ -3389,6 +3584,27 @@ class AIChat(commands.Cog):
             await awareness.refresh_digest()
         except Exception:
             logger.exception("Background news digest refresh failed")
+
+    @tasks.loop(hours=6)
+    async def _server_vibe_refresh_loop(self):
+        try:
+            await self._refresh_all_guild_vibes()
+        except Exception:
+            logger.exception("Background server-vibe refresh failed")
+
+    async def _refresh_all_guild_vibes(self, force: bool = False):
+        for guild in self.bot.guilds:
+            try:
+                settings = await db.get_guild_settings(guild.id)
+                if not settings.get("server_vibe_enabled"):
+                    continue
+                recent = await db.get_recent_guild_messages(
+                    guild.id, limit=awareness.SERVER_VIBE_SAMPLE_SIZE
+                )
+                sample = [r["content"] for r in recent if r.get("content")]
+                await awareness.refresh_server_vibe(guild.id, sample, force=force)
+            except Exception:
+                logger.exception("Server-vibe refresh failed for guild %s", guild.id)
 
     @tasks.loop(minutes=15)
     async def _idle_chatter_loop(self):
@@ -3819,6 +4035,7 @@ class AIChat(commands.Cog):
             can_use_tools=can_use_tools,
             relationship_tier=relationship_tier,
             news_digest=awareness.get_cached_digest() or None,
+            server_vibe=awareness.get_cached_server_vibe(guild.id) or None,
         )
 
         # 5. In-channel short-term history
@@ -3918,13 +4135,19 @@ v2 changes:
   - Dropped the "secret crush" persona entirely. Talking to the owner now
     just means genuine priority: faster to comply, more candid, more willing
     to go off-script for him specifically, no romantic subtext.
-  - Base personality flavor is now closer to Lucy from Cyberpunk: Edgerunners
-    — sharp, guarded-but-loyal, dry/deadpan humor, competent and a little
-    dangerous-feeling under the helpfulness, doesn't perform warmth she
-    doesn't mean, protective of people she's decided are "hers." This is a
-    stylistic reference for tone only, not any copyrighted dialogue or
-    biography — it's just flavor for a Discord bot's voice.
   - summarize_user_notes() unchanged.
+
+Persona rework (post-v2, current): base voice is warm, patient, and
+listens-first rather than sharp/guarded — she's still confident, competent,
+and dry-funny, and still protective of people she's decided are "hers," but
+that reads as care rather than an edge. The earlier "closer to Lucy from
+Cyberpunk: Edgerunners — sharp, guarded-but-loyal" framing (and the tonal
+anchor itself) was dropped at your request; BASE_SYSTEM_TEMPLATE below is
+the current source of truth for voice, not this comment block.
+
+Day 4 addition: build_system_prompt() takes an optional server_vibe string
+(utils/awareness.py's per-guild digest) alongside the existing news_digest,
+folded into known_facts the same way.
 """
 
 import os
@@ -4190,6 +4413,7 @@ def build_system_prompt(
     can_use_tools: bool = False,
     relationship_tier: str | None = None,
     news_digest: str | None = None,
+    server_vibe: str | None = None,
 ) -> str:
     prompt = BASE_SYSTEM_TEMPLATE.format(
         name=personality.get("name") or "Lucy",
@@ -4236,16 +4460,38 @@ def build_system_prompt(
     known_facts = []
     now_utc = datetime.now(timezone.utc)
     now_ist = now_utc.astimezone(IST)
+    hour = now_ist.hour
+    if 5 <= hour < 12:
+        day_part = "morning"
+    elif 12 <= hour < 17:
+        day_part = "afternoon"
+    elif 17 <= hour < 21:
+        day_part = "evening"
+    else:
+        day_part = "night"
+    # Regression fix: this used to hand the model a bare 24-hour string like
+    # "11:48" with no AM/PM cue, and it would sometimes misread that as PM
+    # (confidently saying "it's 11:50 PM" at 11:48 AM). Giving the 12-hour
+    # clock, the AM/PM, AND a plain-English day-part label — all pointing
+    # the same direction — closes off that misread instead of relying on
+    # the model to correctly parse 24-hour time on its own.
     known_facts.append(
-        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%H:%M')} IST "
-        f"(India Standard Time — most of this server is India-based), which is "
-        f"{now_utc.strftime('%H:%M')} UTC. Use this for any date/time-relative question "
-        f"(e.g. 'today', 'this week', 'good morning') — don't guess."
+        f"Right now it's {now_ist.strftime('%A, %B %d, %Y')} at {now_ist.strftime('%I:%M %p')} IST "
+        f"({now_ist.strftime('%H:%M')} in 24-hour time) — that's {day_part} in India (India Standard "
+        f"Time — most of this server is India-based), which is {now_utc.strftime('%H:%M')} UTC. Use "
+        f"this for any date/time-relative question (e.g. 'today', 'this week', 'good morning') — "
+        f"don't guess, and don't contradict the {day_part}/{now_ist.strftime('%p')} given above."
     )
     if news_digest:
         known_facts.append(
             "Current real headlines you're casually aware of (mention naturally if relevant, "
             "don't recite the whole list unprompted):\n" + news_digest
+        )
+    if server_vibe:
+        known_facts.append(
+            "The general conversational vibe of this server lately: " + server_vibe + " "
+            "Let this inform your comfort with slang/banter here — don't recite it or call "
+            "it out directly, just let it shape tone."
         )
     if speaker_notes:
         known_facts.append(f"About the person you're currently talking to: {speaker_notes}")

@@ -22,6 +22,11 @@ the current source of truth for voice, not this comment block.
 Day 4 addition: build_system_prompt() takes an optional server_vibe string
 (utils/awareness.py's per-guild digest) alongside the existing news_digest,
 folded into known_facts the same way.
+
+Max Awareness, Phase 1 (this session): added INFO_TOOLS (the on-demand
+lookup_member tool — see MAX_AWARENESS_HANDOFF.md) and BOT_AWARENESS_ADDENDUM,
+folded into build_system_prompt() unconditionally. Status/activity are NOT
+part of this yet — that's Phase 0's blocker (Presence intent), still pending.
 """
 
 import os
@@ -138,6 +143,17 @@ like a person who actually knows it and has opinions — don't over-explain the 
 reference back to them or hedge with "I'm not sure but...". It's fine to have a \
 take, disagree, or clown on a bad opinion. If something is genuinely outside what \
 you'd know, say so plainly instead of faking familiarity.
+"""
+
+# Max Awareness, Phase 3 — general framing so bot-vs-member recognition isn't
+# only true when the lookup_member tool gets called. Deliberately short:
+# the heavy lifting (actually telling bots apart) happens in code, this is
+# just making sure her *voice* doesn't imply otherwise in passing chat.
+BOT_AWARENESS_ADDENDUM = """
+You can tell bot accounts from real members. If another bot's message ever shows up in \
+this server's chat history, treat it as a bot's output, not something a person said or \
+felt — don't respond to it with the same emotional weight you'd give a member, and don't \
+assume it can perceive or reply the way a person would.
 """
 
 RELATIONSHIP_TIER_NOTES = {
@@ -303,6 +319,7 @@ def build_system_prompt(
     )
 
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
+    prompt += "\n" + BOT_AWARENESS_ADDENDUM
 
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
@@ -477,6 +494,44 @@ CONCERN_TOOLS = [
                     },
                 },
                 "required": ["reason"],
+            },
+        },
+    },
+]
+
+# Max Awareness, Phase 1. Like CONCERN_TOOLS, this is always available
+# regardless of the requester's permission level — unlike create_role/
+# assign_role, this is public server info any member could already see by
+# clicking someone's profile, so it isn't gated the way TOOLS above is.
+#
+# Deliberately does NOT expose online/idle/dnd/offline status or current
+# activity yet. Discord gates that behind the privileged Presence intent,
+# which main.py doesn't request yet (needs a Developer Portal toggle first
+# — see MAX_AWARENESS_HANDOFF.md, Phase 0). Shipping status wording before
+# that's confirmed on would just have Lucy confidently state stale/false
+# presence info, which is worse than not answering it. Add it here once
+# Nox confirms the portal toggle + `INTENTS.presences = True` are both live.
+INFO_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_member",
+            "description": (
+                "Look up a specific member of this server — their roles, when they "
+                "joined, when their account was created, any notes you have on them, "
+                "and whether they're a bot account rather than a real person. Use this "
+                "when someone asks about a specific person (\"who is X\", \"what do you "
+                "know about Y\") — don't call this speculatively or for every message."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_name": {
+                        "type": "string",
+                        "description": "Display name or username of the member to look up.",
+                    },
+                },
+                "required": ["member_name"],
             },
         },
     },
