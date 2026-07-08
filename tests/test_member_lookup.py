@@ -58,6 +58,30 @@ class MemberLookupFormatterTests(unittest.TestCase):
         self.assertIn("unknown", result)
         self.assertIn("none", result)
 
+    def test_never_mentions_status_or_activity(self):
+        # Regression-guard for a real bug caught in live testing: with no
+        # status/activity keys in the data dict at all, Lucy still recited
+        # a "Status: Offline" line back to a user — invented, not real data
+        # (lookup_member doesn't return status yet; see INFO_TOOLS). The
+        # formatter itself was never the source of that line, but this
+        # locks in that it's structurally impossible for it to be: the
+        # word "status" (or "activity"/"online"/"offline") should never
+        # appear in this formatter's output no matter what's passed in,
+        # so if it ever does, it's coming from the model paraphrasing
+        # loosely rather than this function.
+        result = format_member_lookup({
+            "display_name": "Nox",
+            "username": "nox",
+            "is_bot": False,
+            "joined": "January 2024",
+            "created": "2018",
+            "roles": "Owner, @everyone",
+            "notes": "The one who actually runs this place.",
+        })
+        lowered = result.lower()
+        for banned in ("status", "activity", "online", "offline"):
+            self.assertNotIn(banned, lowered)
+
 
 if __name__ == "__main__":
     unittest.main()

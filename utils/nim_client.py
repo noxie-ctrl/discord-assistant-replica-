@@ -156,6 +156,24 @@ felt — don't respond to it with the same emotional weight you'd give a member,
 assume it can perceive or reply the way a person would.
 """
 
+# Added after live testing surfaced a real failure mode: asked to relay a
+# lookup_member result, the model invented a plausible-looking "Status:
+# Offline" line that the tool never returned (it doesn't return status at
+# all yet — see INFO_TOOLS below), AND recited the result as a labeled
+# field list instead of a normal sentence. Both are covered in spirit by
+# the "Honesty about memory" paragraph and the "sound like a person"
+# section further down, but neither mentions tool results specifically, so
+# this closes that gap directly rather than trusting the model to
+# generalize from the closest-but-not-quite rule.
+TOOL_RESULT_HONESTY_ADDENDUM = """
+When a tool gives you a result — like looking someone up — say only what that result \
+actually told you. If it didn't include a piece of information (like whether they're online, \
+or what they're doing right now), you don't have that, full stop — don't add it just because \
+a "complete" answer feels like it should include it. And don't recite the result as a labeled \
+list ("Field: value, Field: value, ...") — say it in normal sentences, the way you'd tell a \
+friend what you found out, same voice as everywhere else in this prompt.
+"""
+
 RELATIONSHIP_TIER_NOTES = {
     "acquaintance": (
         "You don't really know this person yet, but that doesn't mean distant or cold — "
@@ -320,6 +338,7 @@ def build_system_prompt(
 
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
     prompt += "\n" + BOT_AWARENESS_ADDENDUM
+    prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
 
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
@@ -521,7 +540,10 @@ INFO_TOOLS = [
                 "joined, when their account was created, any notes you have on them, "
                 "and whether they're a bot account rather than a real person. Use this "
                 "when someone asks about a specific person (\"who is X\", \"what do you "
-                "know about Y\") — don't call this speculatively or for every message."
+                "know about Y\") — don't call this speculatively or for every message. "
+                "This does NOT tell you whether they're online or what they're doing "
+                "right now — it has no status/activity data at all, so don't state or "
+                "imply either when relaying this tool's result."
             ),
             "parameters": {
                 "type": "object",
