@@ -50,6 +50,27 @@ avoids pinning one that goes stale; set `OPENROUTER_MODEL` if you'd rather pin s
 specific. If you don't set OpenRouter keys, vision and the 4th fallback tier stay off and
 Lucy still works normally on NIM + Groq.
 
+Optional GitHub repo updates (commits + PRs posted to a channel):
+```
+GITHUB_TOKEN=...                    # optional but recommended, see below
+GITHUB_POLL_INTERVAL_MINUTES=5      # optional, defaults to 5
+```
+Works with no token at all for public repos (GitHub allows 60 unauthenticated
+requests/hour, shared across every repo linked on every server this bot is in — fine for
+a repo or two, tight beyond that). Create a token at
+https://github.com/settings/tokens (a classic token with the `repo` scope works for
+private repos; no scopes are needed for public-repo read access) to raise that to
+5,000 requests/hour and to let Lucy see private repos. Then in Discord:
+```
+/githublink repo:owner/repo [channel:#dev-updates]   # admin/mod only
+/githubunlink repo:owner/repo                        # admin/mod only
+/githublinks                                         # anyone — lists what's linked
+```
+Lucy checks every linked repo on a timer (`GITHUB_POLL_INTERVAL_MINUTES`) and posts an
+embed to the linked channel for new commits on the default branch and for PRs being
+opened, merged, or closed. Linking a repo baselines it at the current HEAD, so you get
+updates going forward rather than a dump of the whole commit history.
+
 Testing the vision feature locally
 ---------------------------------
 If you set `OPENROUTER_API_KEY` (and optionally `OPENROUTER_API_KEY_2`), you can test

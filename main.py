@@ -46,6 +46,7 @@ COGS = [
     "cogs.news",
     "cogs.preferences",
     "cogs.serverlog",
+    "cogs.github",
 ]
 
 

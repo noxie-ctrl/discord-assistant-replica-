@@ -53,6 +53,7 @@ cogs/
 tests/
   test_ai_chat_helpers.py
   test_awareness_vibe.py
+  test_facts.py
   test_idle_chatter_channels.py
   test_member_lookup.py
   test_openrouter_client.py
@@ -61,6 +62,7 @@ utils/
   __init__.py
   awareness.py
   database.py
+  facts.py
   groq_client.py
   nim_client.py
   openrouter_client.py
@@ -585,33 +587,6 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(ServerLog(bot))
 </file>
 
-<file path="tests/test_ai_chat_helpers.py">
-import unittest
-
-from cogs.ai_chat import maybe_suggest_channel_redirection
-
-
-class ChannelAwarenessTests(unittest.TestCase):
-    def test_detects_off_topic_vent_in_memes_channel(self):
-        suggestion = maybe_suggest_channel_redirection(
-            channel_topic="Memes and random fun",
-            content="I feel like I am falling apart and need someone to talk to",
-        )
-        self.assertIsNotNone(suggestion)
-        self.assertIn("vent", suggestion.lower())
-
-    def test_ignores_on_topic_content(self):
-        suggestion = maybe_suggest_channel_redirection(
-            channel_topic="General chat and casual conversation",
-            content="How was your day?",
-        )
-        self.assertIsNone(suggestion)
-
-
-if __name__ == "__main__":
-    unittest.main()
-</file>
-
 <file path="tests/test_awareness_vibe.py">
 import asyncio
 import unittest
@@ -685,6 +660,10 @@ class ServerVibeDigestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+</file>
+
+<file path="tests/test_facts.py">
+
 </file>
 
 <file path="tests/test_idle_chatter_channels.py">
@@ -775,6 +754,192 @@ if __name__ == "__main__":
 
 <file path="utils/__init__.py">
 
+</file>
+
+<file path="utils/facts.py">
+"""
+utils/facts.py
+
+Grounding tools for Lucy's "don't hallucinate specific facts" problem.
+Both of these are genuinely free — no API key, no signup, no rate-limit
+surprise waiting to bite us on Railway's free tier:
+
+- get_weather(location):   Open-Meteo (geocoding + forecast). No key ever.
+- search_fact(query):      Wikipedia's public REST API. No key ever.
+
+Both are deliberately defensive in the same style as groq_client.py /
+openrouter_client.py: network/parse failures return a short, honest
+"couldn't find that" string rather than raising all the way up into the
+chat pipeline — a failed lookup should degrade to "I couldn't check that
+right now," never to a crash that drops the whole reply.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import aiohttp
+
+logger = logging.getLogger("lucy.facts")
+
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php"
+WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+
+REQUEST_TIMEOUT_SECONDS = 8
+
+# https://open-meteo.com/en/docs — WMO weather interpretation codes, condensed
+# to plain language. Grouped rather than exhaustive; good enough for "what's
+# it doing outside" conversational use, not an aviation briefing.
+_WEATHER_CODE_DESCRIPTIONS = {
+    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy with frost",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "light freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "light snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
+}
+
+
+def _describe_weather_code(code: Optional[int]) -> str:
+    if code is None:
+        return "conditions unclear"
+    return _WEATHER_CODE_DESCRIPTIONS.get(int(code), "conditions unclear")
+
+
+async def get_weather(location: str) -> str:
+    """Look up current weather for a place name. Returns a short plain-English
+    sentence, or a short honest failure message — never raises to the caller,
+    since this runs as a tool result that gets handed straight back to the
+    model to paraphrase."""
+    location = (location or "").strip()
+    if not location:
+        return "No location was given, so I couldn't check the weather."
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                GEOCODE_URL, params={"name": location, "count": 1, "format": "json"}
+            ) as resp:
+                if resp.status != 200:
+                    return f"Couldn't look up '{location}' right now (geocoding service returned {resp.status})."
+                geo = await resp.json()
+
+            results = geo.get("results") or []
+            if not results:
+                return f"Couldn't find a place called '{location}' to check the weather for."
+
+            place = results[0]
+            lat, lon = place.get("latitude"), place.get("longitude")
+            resolved_name = place.get("name") or location
+            admin = place.get("admin1")
+            country = place.get("country")
+            display_name = ", ".join(p for p in [resolved_name, admin, country] if p)
+
+            if lat is None or lon is None:
+                return f"Couldn't resolve coordinates for '{location}'."
+
+            async with session.get(
+                FORECAST_URL,
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                    "timezone": "auto",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    return f"Couldn't fetch a forecast for {display_name} right now (status {resp.status})."
+                data = await resp.json()
+
+        current = data.get("current") or {}
+        temp = current.get("temperature_2m")
+        feels_like = current.get("apparent_temperature")
+        humidity = current.get("relative_humidity_2m")
+        wind = current.get("wind_speed_10m")
+        condition = _describe_weather_code(current.get("weather_code"))
+
+        if temp is None:
+            return f"Got a response for {display_name} but it didn't include current conditions — try again shortly."
+
+        parts = [f"In {display_name}, it's currently {condition}, {temp}°C"]
+        if feels_like is not None:
+            parts.append(f"(feels like {feels_like}°C)")
+        line = " ".join(parts) + "."
+        extras = []
+        if humidity is not None:
+            extras.append(f"{humidity}% humidity")
+        if wind is not None:
+            extras.append(f"wind at {wind} km/h")
+        if extras:
+            line += " " + ", ".join(extras).capitalize() + "."
+        return line
+
+    except Exception as e:
+        logger.warning("get_weather failed for '%s': %s", location, e)
+        return f"Couldn't check the weather for '{location}' right now — the weather service didn't respond in time."
+
+
+async def search_fact(query: str) -> str:
+    """Quick factual lookup for things like 'when did X happen', 'who is Y',
+    'what is Z' — backed by Wikipedia's public API (no key required). Returns
+    a short summary, or a short honest failure message. This is meant for
+    grounding general-knowledge/date/identity questions, not for anything
+    live/real-time (use get_weather for weather, the news digest for current
+    headlines)."""
+    query = (query or "").strip()
+    if not query:
+        return "No question was given to look up."
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                WIKI_SEARCH_URL,
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": query,
+                    "srlimit": 1,
+                    "format": "json",
+                },
+                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            ) as resp:
+                if resp.status != 200:
+                    return f"Couldn't search for that right now (status {resp.status})."
+                search_data = await resp.json()
+
+            hits = ((search_data.get("query") or {}).get("search")) or []
+            if not hits:
+                return f"Couldn't find anything reliable on '{query}'."
+
+            title = hits[0].get("title")
+            if not title:
+                return f"Couldn't find anything reliable on '{query}'."
+
+            async with session.get(
+                WIKI_SUMMARY_URL.format(title=title.replace(" ", "_")),
+                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            ) as resp:
+                if resp.status != 200:
+                    return f"Found a matching topic ('{title}') but couldn't load details right now."
+                summary_data = await resp.json()
+
+        extract = (summary_data.get("extract") or "").strip()
+        if not extract:
+            return f"Found '{title}' but there's no summary available for it."
+        return f"{title}: {extract}"
+
+    except Exception as e:
+        logger.warning("search_fact failed for '%s': %s", query, e)
+        return f"Couldn't look that up right now — the fact-check service didn't respond in time."
 </file>
 
 <file path="utils/groq_client.py">
@@ -907,6 +1072,99 @@ def is_configured() -> bool:
 
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="tests/test_ai_chat_helpers.py">
+import unittest
+from types import SimpleNamespace
+
+from cogs.ai_chat import (
+    maybe_suggest_channel_redirection,
+    classify_reply_depth,
+    extract_image_urls_from_attachments,
+    extract_image_urls_from_embeds,
+)
+
+
+class ChannelAwarenessTests(unittest.TestCase):
+    def test_detects_off_topic_vent_in_memes_channel(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="Memes and random fun",
+            content="I feel like I am falling apart and need someone to talk to",
+        )
+        self.assertIsNotNone(suggestion)
+        self.assertIn("vent", suggestion.lower())
+
+    def test_ignores_on_topic_content(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="General chat and casual conversation",
+            content="How was your day?",
+        )
+        self.assertIsNone(suggestion)
+
+
+class ReplyDepthClassificationTests(unittest.TestCase):
+    """Regression coverage for the 'stop sending paragraphs for casual chat'
+    fix — classify_reply_depth() drives both max_tokens and the per-turn
+    steering note in AIChat._handle_chat."""
+
+    def test_short_casual_message_is_casual(self):
+        self.assertEqual(classify_reply_depth("lol same"), "casual")
+
+    def test_greeting_is_casual(self):
+        self.assertEqual(classify_reply_depth("wassup"), "casual")
+
+    def test_explicit_explain_request_is_deep(self):
+        self.assertEqual(classify_reply_depth("then explain me abt the work"), "deep")
+
+    def test_breakdown_request_is_deep(self):
+        self.assertEqual(classify_reply_depth("can you give me a breakdown of this"), "deep")
+
+    def test_long_message_is_deep_even_without_keywords(self):
+        long_msg = "so today was a whole thing, basically everything that could go wrong did " * 2
+        self.assertEqual(classify_reply_depth(long_msg), "deep")
+
+    def test_empty_message_is_casual(self):
+        self.assertEqual(classify_reply_depth(""), "casual")
+        self.assertEqual(classify_reply_depth(None), "casual")
+
+
+class ImageUrlExtractionTests(unittest.TestCase):
+    """Regression coverage for the vision fix — these pure helpers feed
+    AIChat._collect_image_urls, which now also checks the replied-to
+    message and a short history fallback, not just the current message."""
+
+    def test_extracts_image_by_content_type(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.bin", content_type="image/png", filename="a.bin")
+        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.bin"])
+
+    def test_extracts_image_by_extension_when_content_type_missing(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.jpg", content_type=None, filename="a.jpg")
+        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.jpg"])
+
+    def test_ignores_non_image_attachments(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.pdf", content_type="application/pdf", filename="a.pdf")
+        self.assertEqual(extract_image_urls_from_attachments([att]), [])
+
+    def test_handles_no_attachments(self):
+        self.assertEqual(extract_image_urls_from_attachments([]), [])
+        self.assertEqual(extract_image_urls_from_attachments(None), [])
+
+    def test_extracts_from_embed_image(self):
+        embed = SimpleNamespace(image=SimpleNamespace(url="https://cdn.example.com/e.png"), thumbnail=None)
+        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/e.png"])
+
+    def test_extracts_from_embed_thumbnail_when_no_image(self):
+        embed = SimpleNamespace(image=None, thumbnail=SimpleNamespace(url="https://cdn.example.com/t.png"))
+        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/t.png"])
+
+    def test_handles_no_embeds(self):
+        self.assertEqual(extract_image_urls_from_embeds([]), [])
+        self.assertEqual(extract_image_urls_from_embeds(None), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
 </file>
 
 <file path="tests/test_member_lookup.py">
@@ -1423,28 +1681,47 @@ async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int,
 
 async def call_openrouter(messages: List[Dict[str, Any]], model: str = DEFAULT_CHAT_MODEL,
                           max_tokens: int = 400, temperature: float = 0.3,
-                          timeout_seconds: int = 12) -> str:
+                          timeout_seconds: int = 12, max_rounds: int = 2) -> str:
     """Call OpenRouter with round-robin API key handling.
 
-    Raises RuntimeError if no keys configured or all keys fail.
+    Live testing surfaced a real gap: free-tier vision calls hitting a 429
+    or a timeout had exactly one shot per key, then gave up outright — no
+    room for a transient blip to clear. `max_rounds` re-cycles through all
+    keys again (with a short backoff) specifically when the failures seen
+    were transient (rate limit / timeout); a hard error (bad request, model
+    rejected the content, etc.) still only gets one pass since retrying
+    those wouldn't change the outcome.
+
+    Raises RuntimeError if no keys configured or all keys/rounds fail.
     """
     keys = _next_key_order()
     if not keys:
         raise RuntimeError("No OPENROUTER_API_KEY configured.")
 
     last_error: Exception | None = None
-    for key in keys:
-        try:
-            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
-        except asyncio.TimeoutError:
-            last_error = TimeoutError(f"OpenRouter {model} timed out")
-            logger.warning("OpenRouter key timed out on %s, trying next key if any", model)
-        except _RateLimited as e:
-            last_error = e
-            logger.warning("OpenRouter key rate-limited, trying next key if any")
-        except Exception as e:
-            last_error = e
-            logger.warning("OpenRouter call failed (%s), trying next key if any", e)
+    for round_num in range(max_rounds):
+        if round_num > 0:
+            logger.warning("Retrying OpenRouter after transient failures (round %d)", round_num + 1)
+            await asyncio.sleep(1.5 * round_num)
+
+        saw_transient_failure = False
+        for key in keys:
+            try:
+                return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
+            except asyncio.TimeoutError:
+                last_error = TimeoutError(f"OpenRouter {model} timed out")
+                saw_transient_failure = True
+                logger.warning("OpenRouter key timed out on %s, trying next key if any", model)
+            except _RateLimited as e:
+                last_error = e
+                saw_transient_failure = True
+                logger.warning("OpenRouter key rate-limited, trying next key if any")
+            except Exception as e:
+                last_error = e
+                logger.warning("OpenRouter call failed (%s), trying next key if any", e)
+
+        if not saw_transient_failure:
+            break  # failures were hard errors — another round won't help
 
     raise RuntimeError(f"All OpenRouter keys failed: {last_error}")
 
@@ -3790,6 +4067,7 @@ from utils import nim_client
 from utils import groq_client
 from utils import awareness
 from utils import openrouter_client
+from utils import facts
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -3811,6 +4089,107 @@ VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
+
+# -----------------------------------------------------------------
+# Reply-length fix: a hard, code-level ceiling on top of the prompt's own
+# "match the room's energy" guidance, same belt-and-suspenders pattern as
+# strip_roleplay_formatting() in nim_client.py for formatting. Prompt-only
+# guidance was getting ignored often enough (casual messages coming back as
+# full paragraphs) that this adds a real cap, not just an instruction.
+# -----------------------------------------------------------------
+CASUAL_MAX_TOKENS = 220
+DEEP_MAX_TOKENS = 700
+_DEPTH_LONG_MESSAGE_CHAR_THRESHOLD = 140
+_DEPTH_SIGNAL_PHRASES = [
+    "explain", "why does", "why is", "why do", "why did", "how does", "how do",
+    "how did", "breakdown", "break down", "in detail", "elaborate",
+    "difference between", "walk me through", "what do you think about",
+    "thoughts on", "critique", "review", "feedback on", "advice", "advise",
+    "help me understand", "compare", "pros and cons", "step by step",
+    "steps to", "tutorial", "guide to", "analysis", "opinion on", "recommend",
+    "what's the best way", "whats the best way", "kaise hota", "kyu hota",
+    "kaise kare", "samjha do", "samjhao",
+]
+DEPTH_STEERING_NOTES = {
+    "casual": (
+        "This message reads as ordinary casual chat — reply the way a person would text back: "
+        "1-2 short sentences, no paragraph breaks, no multi-part breakdown, unless what they're "
+        "actually asking genuinely can't be answered that briefly."
+    ),
+    "deep": (
+        "This message is actually asking for real depth (an explanation, critique, breakdown, or "
+        "advice) — it's fine to write a fuller, multi-paragraph reply here since the topic "
+        "genuinely needs the space. Still write it as normal human paragraphs, not bullet points "
+        "or bolded headers, unless they explicitly asked for a list."
+    ),
+}
+
+
+def classify_reply_depth(content: str) -> str:
+    """Pure classifier (unit-testable, no discord mocking needed): decide
+    whether an incoming message is asking for real depth (explanation,
+    critique, breakdown, advice) or is ordinary casual chat. Drives both
+    max_tokens (see CASUAL_MAX_TOKENS/DEEP_MAX_TOKENS) and a steering note
+    folded into the prompt for this turn. Returns "deep" or "casual"."""
+    text = (content or "").strip().lower()
+    if not text:
+        return "casual"
+    if any(phrase in text for phrase in _DEPTH_SIGNAL_PHRASES):
+        return "deep"
+    if len(text) >= _DEPTH_LONG_MESSAGE_CHAR_THRESHOLD:
+        return "deep"
+    return "casual"
+
+
+# -----------------------------------------------------------------
+# Vision fix: image URLs can come from the message itself, from whatever
+# it's replying to, or (fallback) from a recent nearby message in the same
+# channel — see AIChat._collect_image_urls below for how these combine.
+# These two extraction helpers are pure/duck-typed so they're unit-testable
+# against simple fakes instead of real discord.Attachment/discord.Embed.
+# -----------------------------------------------------------------
+IMAGE_FILE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
+IMAGE_HISTORY_LOOKBACK = 6  # how many prior channel messages to scan as a fallback
+IMAGE_HISTORY_MAX_AGE_SECONDS = 15 * 60  # only consider images posted recently
+
+
+def _looks_like_image(content_type: Optional[str], filename: str) -> bool:
+    if content_type and content_type.startswith("image/"):
+        return True
+    return (filename or "").lower().endswith(IMAGE_FILE_EXTENSIONS)
+
+
+def extract_image_urls_from_attachments(attachments) -> list[str]:
+    """attachments: any iterable of objects with .url/.content_type/.filename
+    (real discord.Attachment objects in production, simple namespaces in
+    tests)."""
+    urls = []
+    for att in attachments or []:
+        url = getattr(att, "url", None)
+        if not url:
+            continue
+        if _looks_like_image(getattr(att, "content_type", None), getattr(att, "filename", "")):
+            urls.append(url)
+    return urls
+
+
+def extract_image_urls_from_embeds(embeds) -> list[str]:
+    """Covers the case of a pasted image link that Discord auto-embeds
+    rather than a native attachment. embeds: any iterable of objects with
+    .image.url / .thumbnail.url (real discord.Embed in production, simple
+    namespaces in tests)."""
+    urls = []
+    for embed in embeds or []:
+        image = getattr(embed, "image", None)
+        image_url = getattr(image, "url", None) if image else None
+        if image_url:
+            urls.append(image_url)
+            continue
+        thumbnail = getattr(embed, "thumbnail", None)
+        thumb_url = getattr(thumbnail, "url", None) if thumbnail else None
+        if thumb_url:
+            urls.append(thumb_url)
+    return urls
 
 
 def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str) -> Optional[str]:
@@ -4323,29 +4702,98 @@ class AIChat(commands.Cog):
             }
             return format_member_lookup(data)
 
+        if name == "get_weather":
+            location = (args.get("location") or "").strip()
+            if not location:
+                return "Error: no location given."
+            return await facts.get_weather(location)
+
+        if name == "search_fact":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Error: no query given."
+            return await facts.search_fact(query)
+
         return f"Error: unknown tool '{name}'."
 
     # -----------------------------------------------------------------
     # Main chat handling
     # -----------------------------------------------------------------
 
+    async def _collect_image_urls(self, message: discord.Message) -> list[str]:
+        """Gather image URLs relevant to this message, in priority order:
+        1. Attachments/embeds on the message itself (the direct "here's an
+           image, @lucy" case — worked before, unchanged).
+        2. Whatever message this one is a *reply* to — covers "someone
+           posts an image, someone else hits Reply and asks @lucy about
+           it," which previously found nothing because only the current
+           message's attachments were ever checked.
+        3. A short recent-history fallback in the same channel — covers
+           "someone posts an image, a different person just says '@lucy
+           thoughts on this' without formally replying to it." Capped to a
+           handful of very recent messages so it can't drag in an
+           unrelated image from earlier in a busy channel.
+        """
+        urls = extract_image_urls_from_attachments(message.attachments)
+        urls += extract_image_urls_from_embeds(message.embeds)
+        if urls:
+            return urls[:3]
+
+        if message.reference is not None:
+            referenced = message.reference.resolved
+            if referenced is None or isinstance(referenced, discord.DeletedReferencedMessage):
+                try:
+                    referenced = await message.channel.fetch_message(message.reference.message_id)
+                except (discord.NotFound, discord.HTTPException):
+                    referenced = None
+            if referenced is not None:
+                urls = extract_image_urls_from_attachments(referenced.attachments)
+                urls += extract_image_urls_from_embeds(referenced.embeds)
+                if urls:
+                    return urls[:3]
+
+        try:
+            now = discord.utils.utcnow()
+            async for earlier in message.channel.history(limit=IMAGE_HISTORY_LOOKBACK, before=message):
+                age_seconds = (now - earlier.created_at).total_seconds()
+                if age_seconds > IMAGE_HISTORY_MAX_AGE_SECONDS:
+                    break  # history() is newest-first, so anything older only gets older
+                found = extract_image_urls_from_attachments(earlier.attachments)
+                found += extract_image_urls_from_embeds(earlier.embeds)
+                if found:
+                    return found[:3]
+        except discord.HTTPException:
+            logger.debug("Image history fallback scan failed for channel %s", message.channel.id)
+
+        return []
+
     async def _maybe_attach_image_context(self, message: discord.Message, chat_messages: list[dict]) -> None:
         if not openrouter_client.is_configured():
             return
-        if not message.attachments:
-            return
-        if not any(att.content_type and att.content_type.startswith("image/") for att in message.attachments):
-            return
-        urls = []
-        for attachment in message.attachments:
-            if attachment.content_type and attachment.content_type.startswith("image/"):
-                urls.append(attachment.url)
+        urls = await self._collect_image_urls(message)
         if not urls:
             return
         try:
             description = await openrouter_client.describe_images(urls)
         except Exception as e:
+            # Bug fixed here: this used to just log and return, leaving the
+            # model with zero awareness an image ever existed — which it
+            # then "resolved" by confidently inventing a story ("just an
+            # empty mention, no attachment") that sounded plausible but was
+            # flatly wrong, since a real image WAS there and the vision call
+            # simply failed (rate limit / timeout). Telling it the truth
+            # here — image existed, couldn't be read, technical issue —
+            # keeps that failure mode from turning into a fresh hallucination.
             logger.warning("Image description failed: %s", e)
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    "An image WAS attached to this message, but it couldn't be analyzed just now "
+                    "(a technical hiccup on the vision service, not a missing attachment). Do NOT "
+                    "say there was no image/attachment or invent what it might contain — say "
+                    "plainly you couldn't quite load/see it and ask them to resend if it matters."
+                ),
+            })
             return
         if description:
             chat_messages.append({
@@ -4437,13 +4885,26 @@ class AIChat(commands.Cog):
             prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
             chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
 
+        # 5c. Reply-length fix: classify casual-vs-deep for THIS message and
+        # fold in a steering note + a matching max_tokens ceiling, rather
+        # than relying only on the static prompt's "match the room's
+        # energy" guidance (see CASUAL_MAX_TOKENS/DEEP_MAX_TOKENS above).
+        depth = classify_reply_depth(cleaned_content)
+        max_tokens = DEEP_MAX_TOKENS if depth == "deep" else CASUAL_MAX_TOKENS
+        chat_messages.append({"role": "system", "content": DEPTH_STEERING_NOTES[depth]})
+
         await self._maybe_attach_image_context(message, chat_messages)
 
         # 6. Call the model (semaphore-capped), with tool support
         try:
             async with self._nim_semaphore:
-                tools = nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + (nim_client.TOOLS if can_use_tools else [])
-                assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
+                tools = (
+                    nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
+                    + (nim_client.TOOLS if can_use_tools else [])
+                )
+                assistant_message = await nim_client.call_nim_with_tools(
+                    chat_messages, tools=tools, max_tokens=max_tokens
+                )
 
                 if assistant_message.get("tool_calls"):
                     chat_messages.append(assistant_message)
@@ -4456,7 +4917,9 @@ class AIChat(commands.Cog):
                         })
                     # One more round trip to let Lucy phrase the final reply
                     async with self._nim_semaphore:
-                        final_message = await nim_client.call_nim_with_tools(chat_messages, tools=None)
+                        final_message = await nim_client.call_nim_with_tools(
+                            chat_messages, tools=None, max_tokens=max_tokens
+                        )
                     reply = (final_message.get("content") or "Done.").strip()
                 else:
                     reply = (assistant_message.get("content") or "").strip()
@@ -4656,6 +5119,31 @@ felt — don't respond to it with the same emotional weight you'd give a member,
 assume it can perceive or reply the way a person would.
 """
 
+# Added directly in response to live testing: Lucy confidently stated a
+# plausible-sounding but unverified date/fact from training data instead of
+# either checking or admitting she wasn't sure. The two grounding tools below
+# (get_weather, search_fact — see GROUNDING_TOOLS) exist specifically so she
+# has a real alternative to guessing. This addendum is what tells her to
+# reach for them instead of guessing in the first place.
+FACTUAL_ACCURACY_ADDENDUM = """
+Accuracy on verifiable facts matters more than sounding confident:
+- Weather: never guess conditions/temperature — call get_weather. If it's not about a place, \
+skip it.
+- Specific, checkable facts you're not fully sure of — exact dates, who did what and when, \
+scores, statistics, "when does/did X happen/start" — call search_fact instead of stating a \
+number from memory you can't fully vouch for. This especially applies to anything current, \
+recent, or after your training — you cannot know those from memory alone.
+- If a tool result is empty, unclear, or doesn't cover what was asked, say plainly that you \
+don't have a reliable answer instead of filling the gap with a guess dressed up as fact. A \
+confident-sounding wrong answer is worse than "not sure, let me think" or "don't quote me on \
+the exact number."
+- This does NOT apply to general knowledge, opinions, banter, or casual claims where being \
+slightly loose is normal conversational texture (that's fine, that's how people talk) — it's \
+specifically about numbers, dates, and current/verifiable facts that someone could later check \
+and catch you being wrong about.
+"""
+
+
 # Added after live testing surfaced a real failure mode: asked to relay a
 # lookup_member result, the model invented a plausible-looking "Status:
 # Offline" line that the tool never returned (it doesn't return status at
@@ -4839,6 +5327,7 @@ def build_system_prompt(
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
     prompt += "\n" + BOT_AWARENESS_ADDENDUM
     prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
+    prompt += "\n" + FACTUAL_ACCURACY_ADDENDUM
 
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
@@ -5054,6 +5543,60 @@ INFO_TOOLS = [
                     },
                 },
                 "required": ["member_name"],
+            },
+        },
+    },
+]
+
+# Hallucination fix (this session): real grounding for the two categories of
+# factual question that were getting confidently guessed — weather, and
+# specific checkable facts/dates. Both backing functions (utils/facts.py) are
+# free with no API key, so — like INFO_TOOLS/CONCERN_TOOLS above — these are
+# always in the tool list unconditionally, not gated by permission. See
+# FACTUAL_ACCURACY_ADDENDUM above for the prompt-side instruction to actually
+# reach for these instead of guessing.
+GROUNDING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "Get real current weather (temperature, conditions, humidity, wind) for a "
+                "named place. Use this any time weather comes up for a specific location — "
+                "never state or guess weather from memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or place name, e.g. 'Jaipur' or 'Mumbai, India'.",
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_fact",
+            "description": (
+                "Look up a specific, checkable fact — a date, an event, who/what something "
+                "is, a real-world statistic — instead of stating it from memory when you're "
+                "not fully sure. Backed by a general encyclopedia, so it's best for real "
+                "entities/events, not for opinions, live scores, or anything happening in the "
+                "last few hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The fact to look up, phrased plainly, e.g. 'FIFA World Cup 2026 start date'.",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },

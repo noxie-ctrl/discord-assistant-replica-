@@ -146,6 +146,23 @@ CREATE TABLE IF NOT EXISTS idle_chatter_channels (
     channel_id BIGINT NOT NULL,
     PRIMARY KEY (guild_id, channel_id)
 );
+
+-- GitHub repo link feature: one row per (guild, repo). last_commit_sha /
+-- last_pr_check_at are the polling cursors used by cogs/github.py's
+-- background loop to figure out what's new since the previous check.
+CREATE TABLE IF NOT EXISTS github_links (
+    guild_id BIGINT NOT NULL,
+    repo TEXT NOT NULL,               -- "owner/name", lowercase
+    channel_id BIGINT NOT NULL,
+    added_by BIGINT,
+    default_branch TEXT DEFAULT 'main',
+    last_commit_sha TEXT,
+    last_pr_check_at TIMESTAMPTZ DEFAULT now(),
+    notify_commits BOOLEAN DEFAULT TRUE,
+    notify_prs BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (guild_id, repo)
+);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -770,3 +787,80 @@ async def set_image_description(cache_key: str, description: str):
 def _normalize_cache_key(key: str) -> str:
     """Internal normalizer for cache keys; kept small for future uses."""
     return key.strip()
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo links
+# ---------------------------------------------------------------------------
+
+async def add_github_link(guild_id: int, repo: str, channel_id: int, added_by: int,
+                            default_branch: str, last_commit_sha: str | None) -> None:
+    """repo is the normalized 'owner/name' string. On conflict (repo already
+    linked in this guild), re-points it at the new channel and resets the
+    polling cursors so the next cycle establishes a fresh baseline instead
+    of dumping old history into the new channel."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO github_links
+                (guild_id, repo, channel_id, added_by, default_branch, last_commit_sha, last_pr_check_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (guild_id, repo) DO UPDATE
+            SET channel_id = EXCLUDED.channel_id,
+                added_by = EXCLUDED.added_by,
+                default_branch = EXCLUDED.default_branch,
+                last_commit_sha = EXCLUDED.last_commit_sha,
+                last_pr_check_at = now()
+            """,
+            guild_id, repo, channel_id, added_by, default_branch, last_commit_sha,
+        )
+
+
+async def remove_github_link(guild_id: int, repo: str) -> bool:
+    """Returns True if a row was actually deleted."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM github_links WHERE guild_id = $1 AND repo = $2",
+            guild_id, repo,
+        )
+        return result.endswith(" 1")
+
+
+async def list_github_links(guild_id: int) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM github_links WHERE guild_id = $1 ORDER BY repo", guild_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_all_github_links() -> list[dict]:
+    """Every linked repo across every guild — used by the background
+    polling loop, which then checks each guild's channel still exists."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM github_links")
+        return [dict(r) for r in rows]
+
+
+async def update_github_link_state(guild_id: int, repo: str, *, last_commit_sha: str | None = None,
+                                     last_pr_check_at=None) -> None:
+    """Partial update of the polling cursors after a background check.
+    Only the fields passed are updated."""
+    updates = {}
+    if last_commit_sha is not None:
+        updates["last_commit_sha"] = last_commit_sha
+    if last_pr_check_at is not None:
+        updates["last_pr_check_at"] = last_pr_check_at
+    if not updates:
+        return
+
+    pool = _require_pool()
+    columns = list(updates.keys())
+    set_clause = ", ".join(f"{col} = ${i + 3}" for i, col in enumerate(columns))
+    query = f"UPDATE github_links SET {set_clause} WHERE guild_id = $1 AND repo = $2"
+    async with pool.acquire() as conn:
+        await conn.execute(query, guild_id, repo, *updates.values())
