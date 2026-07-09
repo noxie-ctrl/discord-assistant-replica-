@@ -98,28 +98,47 @@ async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int,
 
 async def call_openrouter(messages: List[Dict[str, Any]], model: str = DEFAULT_CHAT_MODEL,
                           max_tokens: int = 400, temperature: float = 0.3,
-                          timeout_seconds: int = 12) -> str:
+                          timeout_seconds: int = 12, max_rounds: int = 2) -> str:
     """Call OpenRouter with round-robin API key handling.
 
-    Raises RuntimeError if no keys configured or all keys fail.
+    Live testing surfaced a real gap: free-tier vision calls hitting a 429
+    or a timeout had exactly one shot per key, then gave up outright — no
+    room for a transient blip to clear. `max_rounds` re-cycles through all
+    keys again (with a short backoff) specifically when the failures seen
+    were transient (rate limit / timeout); a hard error (bad request, model
+    rejected the content, etc.) still only gets one pass since retrying
+    those wouldn't change the outcome.
+
+    Raises RuntimeError if no keys configured or all keys/rounds fail.
     """
     keys = _next_key_order()
     if not keys:
         raise RuntimeError("No OPENROUTER_API_KEY configured.")
 
     last_error: Exception | None = None
-    for key in keys:
-        try:
-            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
-        except asyncio.TimeoutError:
-            last_error = TimeoutError(f"OpenRouter {model} timed out")
-            logger.warning("OpenRouter key timed out on %s, trying next key if any", model)
-        except _RateLimited as e:
-            last_error = e
-            logger.warning("OpenRouter key rate-limited, trying next key if any")
-        except Exception as e:
-            last_error = e
-            logger.warning("OpenRouter call failed (%s), trying next key if any", e)
+    for round_num in range(max_rounds):
+        if round_num > 0:
+            logger.warning("Retrying OpenRouter after transient failures (round %d)", round_num + 1)
+            await asyncio.sleep(1.5 * round_num)
+
+        saw_transient_failure = False
+        for key in keys:
+            try:
+                return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
+            except asyncio.TimeoutError:
+                last_error = TimeoutError(f"OpenRouter {model} timed out")
+                saw_transient_failure = True
+                logger.warning("OpenRouter key timed out on %s, trying next key if any", model)
+            except _RateLimited as e:
+                last_error = e
+                saw_transient_failure = True
+                logger.warning("OpenRouter key rate-limited, trying next key if any")
+            except Exception as e:
+                last_error = e
+                logger.warning("OpenRouter call failed (%s), trying next key if any", e)
+
+        if not saw_transient_failure:
+            break  # failures were hard errors — another round won't help
 
     raise RuntimeError(f"All OpenRouter keys failed: {last_error}")
 

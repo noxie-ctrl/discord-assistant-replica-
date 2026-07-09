@@ -758,7 +758,24 @@ class AIChat(commands.Cog):
         try:
             description = await openrouter_client.describe_images(urls)
         except Exception as e:
+            # Bug fixed here: this used to just log and return, leaving the
+            # model with zero awareness an image ever existed — which it
+            # then "resolved" by confidently inventing a story ("just an
+            # empty mention, no attachment") that sounded plausible but was
+            # flatly wrong, since a real image WAS there and the vision call
+            # simply failed (rate limit / timeout). Telling it the truth
+            # here — image existed, couldn't be read, technical issue —
+            # keeps that failure mode from turning into a fresh hallucination.
             logger.warning("Image description failed: %s", e)
+            chat_messages.append({
+                "role": "system",
+                "content": (
+                    "An image WAS attached to this message, but it couldn't be analyzed just now "
+                    "(a technical hiccup on the vision service, not a missing attachment). Do NOT "
+                    "say there was no image/attachment or invent what it might contain — say "
+                    "plainly you couldn't quite load/see it and ask them to resend if it matters."
+                ),
+            })
             return
         if description:
             chat_messages.append({
