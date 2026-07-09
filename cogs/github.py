@@ -11,14 +11,30 @@ Commands:
   /githublink   <repo> [channel]   - link a repo (admin/mod only)
   /githubunlink <repo>             - remove a link (admin/mod only)
   /githublinks                     - list repos linked in this server
+  /githubdigest [channel]          - set/clear the weekly recap channel (admin/mod only)
+
+v2 (this session) — "Discord as the project hub":
+  - AI-written summaries (utils/github_summarizer.py) instead of raw commit
+    messages / bare PR titles, so updates are skimmable by non-technical
+    teammates too.
+  - New PRs get their own Discord thread, so review discussion has a home
+    instead of scattering across the main channel.
+  - Every posted update is logged to github_activity_log (utils/database.py)
+    — this backs both the weekly digest and a new search_github_activity
+    tool that lets Lucy answer "what changed in X this week?" in normal
+    chat (see nim_client.py GROUNDING_TOOLS + ai_chat.py's dispatcher).
+  - Weekly digest: a daily-ticking loop that, once a week, posts one
+    consolidated AI recap of everything that happened across every linked
+    repo in a guild, to an admin-configured channel.
 
 State (last_commit_sha, last_pr_check_at) lives in the github_links table
-(utils/database.py) so it survives restarts — a fresh deploy doesn't dump a
-repo's entire commit history into a channel.
+so it survives restarts — a fresh deploy doesn't dump a repo's entire
+commit history into a channel.
 """
 
 import os
 import logging
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -26,19 +42,23 @@ from discord.ext import commands, tasks
 
 from utils import database as db
 from utils import github_client
+from utils import github_summarizer
 from utils.permissions import is_admin_or_mod
 
 logger = logging.getLogger("lucy.github")
 
 POLL_INTERVAL_MINUTES = int(os.getenv("GITHUB_POLL_INTERVAL_MINUTES", "5"))
+DIGEST_WEEKDAY = int(os.getenv("GITHUB_DIGEST_WEEKDAY", "0"))  # 0 = Monday
 
 COMMIT_COLOR = discord.Color.dark_grey()
+DIGEST_COLOR = discord.Color.gold()
 PR_COLORS = {
     "opened": discord.Color.green(),
     "merged": discord.Color.purple(),
     "closed": discord.Color.red(),
 }
 PR_VERBS = {"opened": "opened", "merged": "merged", "closed": "closed (not merged)"}
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
 class GitHub(commands.Cog):
@@ -47,9 +67,11 @@ class GitHub(commands.Cog):
 
     async def cog_load(self):
         self._poll_loop.start()
+        self._digest_loop.start()
 
     async def cog_unload(self):
         self._poll_loop.cancel()
+        self._digest_loop.cancel()
 
     # -----------------------------------------------------------------
     # Commands
@@ -147,8 +169,23 @@ class GitHub(commands.Cog):
         )
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="githubdigest", description="Set (or clear) the weekly GitHub recap channel")
+    @app_commands.describe(channel="Where to post the weekly recap — omit to turn the digest off")
+    @is_admin_or_mod()
+    async def githubdigest(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await db.update_guild_setting(
+            interaction.guild_id,
+            github_digest_channel_id=channel.id if channel else None,
+        )
+        if channel:
+            await interaction.response.send_message(
+                f"📅 Weekly GitHub recap will post in {channel.mention} (next {WEEKDAY_NAMES[DIGEST_WEEKDAY]})."
+            )
+        else:
+            await interaction.response.send_message("📅 Weekly GitHub recap turned off.")
+
     # -----------------------------------------------------------------
-    # Background polling
+    # Background polling — commits & PRs
     # -----------------------------------------------------------------
 
     @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
@@ -188,7 +225,7 @@ class GitHub(commands.Cog):
         if link.get("notify_prs", True):
             await self._check_prs(link, owner, name, channel)
 
-    async def _check_commits(self, link: dict, owner: str, name: str, channel: discord.abc.Messageable):
+    async def _check_commits(self, link: dict, owner: str, name: str, channel: discord.TextChannel):
         branch = link["default_branch"] or "main"
         head_sha = await github_client.get_latest_commit_sha(owner, name, branch)
         if not head_sha:
@@ -209,40 +246,143 @@ class GitHub(commands.Cog):
             await db.update_github_link_state(link["guild_id"], link["repo"], last_commit_sha=head_sha)
             return
 
+        summary = await github_summarizer.summarize_commits(link["repo"], branch, commits)
+
         embed = discord.Embed(
-            title=f"📦 {len(commits)} new commit{'s' if len(commits) != 1 else ''} on {owner}/{name}@{branch}",
+            title=f"📦 {len(commits)} new commit{'s' if len(commits) != 1 else ''} on {link['repo']}@{branch}",
             color=COMMIT_COLOR,
             url=f"https://github.com/{owner}/{name}/commits/{branch}",
         )
-        lines = [f"[`{c['sha']}`]({c['url']}) {c['message']} — *{c['author']}*" for c in commits[:8]]
-        embed.description = "\n".join(lines)
+        if summary:
+            embed.description = f"**{summary}**"
+        raw_lines = [f"[`{c['sha']}`]({c['url']}) {c['message']} — *{c['author']}*" for c in commits[:8]]
+        embed.add_field(name="Commits", value="\n".join(raw_lines), inline=False)
+
         try:
             await channel.send(embed=embed)
         except discord.Forbidden:
             logger.warning("Missing permission to post in channel %s for repo %s", channel.id, link["repo"])
 
+        await db.log_github_activity(
+            link["guild_id"], link["repo"], "commits", head_sha[:7],
+            title=summary or f"{len(commits)} commit(s) pushed",
+            detail="; ".join(c["message"] for c in commits),
+            author=commits[0]["author"] if commits else None,
+            url=f"https://github.com/{owner}/{name}/commits/{branch}",
+        )
         await db.update_github_link_state(link["guild_id"], link["repo"], last_commit_sha=head_sha)
 
-    async def _check_prs(self, link: dict, owner: str, name: str, channel: discord.abc.Messageable):
+    async def _check_prs(self, link: dict, owner: str, name: str, channel: discord.TextChannel):
         since = link["last_pr_check_at"]
         now = discord.utils.utcnow()
         events = await github_client.get_recent_pull_events(owner, name, since)
 
         for event in events:
+            summary = None
+            size = None
+            if event["type"] == "opened":
+                pr_details = await github_client.get_pull_request(owner, name, event["number"])
+                if pr_details:
+                    size = github_client.pr_size_label(pr_details["additions"], pr_details["deletions"])
+                    summary = await github_summarizer.summarize_pr(
+                        link["repo"], event["title"], pr_details["body"],
+                        pr_details["additions"], pr_details["deletions"], pr_details["changed_files"],
+                    )
+
+            title = f"🔀 PR #{event['number']} {PR_VERBS.get(event['type'], event['type'])} on {link['repo']}"
+            if size:
+                title += f" ({size})"
             embed = discord.Embed(
-                title=f"🔀 PR #{event['number']} {PR_VERBS.get(event['type'], event['type'])} on {owner}/{name}",
-                description=event["title"],
+                title=title,
+                description=summary or event["title"],
                 url=event["url"],
                 color=PR_COLORS.get(event["type"], discord.Color.greyple()),
             )
+            if summary:
+                embed.add_field(name="Title", value=event["title"], inline=False)
             embed.set_footer(text=f"by {event['user']}")
+
+            sent_message = None
             try:
-                await channel.send(embed=embed)
+                sent_message = await channel.send(embed=embed)
             except discord.Forbidden:
                 logger.warning("Missing permission to post in channel %s for repo %s", channel.id, link["repo"])
                 break
 
+            if event["type"] == "opened" and sent_message:
+                try:
+                    await sent_message.create_thread(
+                        name=f"PR #{event['number']}: {event['title'][:80]}",
+                        auto_archive_duration=1440,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning("Couldn't create PR thread in %s: %s", channel.id, e)
+
+            await db.log_github_activity(
+                link["guild_id"], link["repo"], "pr", str(event["number"]),
+                title=event["title"], detail=summary, author=event["user"], url=event["url"],
+            )
+
         await db.update_github_link_state(link["guild_id"], link["repo"], last_pr_check_at=now)
+
+    # -----------------------------------------------------------------
+    # Weekly digest
+    # -----------------------------------------------------------------
+
+    @tasks.loop(hours=24)
+    async def _digest_loop(self):
+        try:
+            await self._maybe_send_digests()
+        except Exception:
+            logger.exception("GitHub weekly digest loop failed")
+
+    @_digest_loop.before_loop
+    async def _before_digest_loop(self):
+        await self.bot.wait_until_ready()
+
+    async def _maybe_send_digests(self):
+        if datetime.now(timezone.utc).weekday() != DIGEST_WEEKDAY:
+            return
+        due = await db.get_guilds_due_for_digest()
+        for settings in due:
+            try:
+                await self._send_digest(settings)
+            except Exception:
+                logger.exception("Failed sending GitHub digest for guild %s", settings["guild_id"])
+
+    async def _send_digest(self, settings: dict):
+        guild = self.bot.get_guild(settings["guild_id"])
+        if not guild:
+            return
+        channel = guild.get_channel(settings["github_digest_channel_id"])
+        if not channel:
+            return
+
+        activity = await db.get_recent_github_activity(guild.id, days=7, limit=100)
+        if not activity:
+            await db.mark_digest_sent(guild.id)  # nothing happened — don't retry daily until next week
+            return
+
+        summary = await github_summarizer.summarize_digest(guild.name, activity)
+        commit_batches = sum(1 for a in activity if a["kind"] == "commits")
+        pr_events = sum(1 for a in activity if a["kind"] == "pr")
+        repos = sorted({a["repo"] for a in activity})
+
+        embed = discord.Embed(
+            title="📅 Weekly GitHub recap",
+            description=summary or "No AI summary available this week — see the raw activity below.",
+            color=DIGEST_COLOR,
+        )
+        embed.add_field(name="Repos", value=", ".join(repos), inline=False)
+        embed.add_field(name="Commit batches", value=str(commit_batches))
+        embed.add_field(name="PR events", value=str(pr_events))
+
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Missing permission to post digest in channel %s for guild %s", channel.id, guild.id)
+
+        await db.mark_digest_sent(guild.id)
 
 
 async def setup(bot: commands.Bot):

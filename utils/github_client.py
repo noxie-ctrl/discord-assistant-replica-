@@ -133,6 +133,39 @@ async def get_new_commits(owner: str, repo: str, base_sha: str, head_sha: str, l
     return out
 
 
+async def get_pull_request(owner: str, repo: str, number: int) -> dict | None:
+    """Full PR details — body/description and diff stats — used for the AI
+    summary and size label. Returns None on any failure rather than raising,
+    since callers treat this as a best-effort enrichment."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+        except GitHubError as e:
+            logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
+            return None
+    return {
+        "body": data.get("body") or "",
+        "merged": bool(data.get("merged_at")),
+        "additions": data.get("additions", 0),
+        "deletions": data.get("deletions", 0),
+        "changed_files": data.get("changed_files", 0),
+    }
+
+
+def pr_size_label(additions: int, deletions: int) -> str:
+    total = additions + deletions
+    if total <= 20:
+        return "XS"
+    if total <= 100:
+        return "S"
+    if total <= 400:
+        return "M"
+    if total <= 1000:
+        return "L"
+    return "XL"
+
+
 async def get_recent_pull_events(owner: str, repo: str, since: datetime, limit: int = 10) -> list[dict]:
     """Pull request activity (opened, merged, closed-without-merge) updated
     since the given UTC datetime. Uses the /issues endpoint (which supports

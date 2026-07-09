@@ -696,6 +696,25 @@ class AIChat(commands.Cog):
                 return "Error: no query given."
             return await facts.search_fact(query)
 
+        if name == "search_github_activity":
+            repo = (args.get("repo") or "").strip().lower() or None
+            days = args.get("days") or 7
+            try:
+                days = max(1, min(int(days), 30))
+            except (TypeError, ValueError):
+                days = 7
+            activity = await db.get_recent_github_activity(guild.id, repo=repo, days=days)
+            if not activity:
+                scope = f"'{repo}'" if repo else "any linked repo"
+                return f"No GitHub activity found for {scope} in the last {days} day(s)."
+            lines = []
+            for item in activity:
+                if item["kind"] == "commits":
+                    lines.append(f"[{item['repo']}] Commits: {item['title']}")
+                else:
+                    lines.append(f"[{item['repo']}] PR #{item['ref']} \"{item['title']}\" — {item['detail'] or 'no summary'}")
+            return "\n".join(lines)
+
         return f"Error: unknown tool '{name}'."
 
     # -----------------------------------------------------------------

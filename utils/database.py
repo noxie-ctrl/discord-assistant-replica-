@@ -11,6 +11,7 @@ wrong names and would have broken /setpersonality and /setchattrigger.
 
 import os
 import logging
+from datetime import datetime, timezone
 
 import asyncpg
 
@@ -163,6 +164,26 @@ CREATE TABLE IF NOT EXISTS github_links (
     created_at TIMESTAMPTZ DEFAULT now(),
     PRIMARY KEY (guild_id, repo)
 );
+
+-- History of everything cogs/github.py has posted (commit batches + PR
+-- events), independent of the github_links polling cursors above. This is
+-- what powers the weekly digest (aggregate over the last 7 days) and the
+-- search_github_activity tool (ai_chat.py answering "what changed in X").
+CREATE TABLE IF NOT EXISTS github_activity_log (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    repo TEXT NOT NULL,
+    kind TEXT NOT NULL,               -- 'commits' or 'pr'
+    ref TEXT,                         -- short sha for commits, PR number (as text) for PRs
+    title TEXT NOT NULL,              -- AI summary (commits) or PR title
+    detail TEXT,                      -- AI summary (PRs) or raw commit lines
+    author TEXT,
+    url TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_github_activity_guild_time
+    ON github_activity_log (guild_id, created_at DESC);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -175,6 +196,8 @@ ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_digest_channel_id BIGINT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_last_digest_at TIMESTAMPTZ;
 """
 
 
@@ -864,3 +887,68 @@ async def update_github_link_state(guild_id: int, repo: str, *, last_commit_sha:
     query = f"UPDATE github_links SET {set_clause} WHERE guild_id = $1 AND repo = $2"
     async with pool.acquire() as conn:
         await conn.execute(query, guild_id, repo, *updates.values())
+
+
+async def log_github_activity(guild_id: int, repo: str, kind: str, ref: str | None, title: str,
+                                 detail: str | None = None, author: str | None = None,
+                                 url: str | None = None) -> None:
+    """kind is 'commits' or 'pr'. Called every time cogs/github.py posts an
+    update, independent of the github_links polling cursors — this is a
+    durable log read by the weekly digest and the search_github_activity
+    tool, not a cursor that gets overwritten."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO github_activity_log (guild_id, repo, kind, ref, title, detail, author, url) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            guild_id, repo, kind, ref, title, detail, author, url,
+        )
+
+
+async def get_recent_github_activity(guild_id: int, repo: str | None = None, days: int = 7,
+                                        limit: int = 30) -> list[dict]:
+    """Used by the search_github_activity tool (ai_chat.py) — recent
+    commit/PR activity, optionally filtered to one repo, most recent
+    first."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        if repo:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM github_activity_log
+                WHERE guild_id = $1 AND repo = $2 AND created_at > now() - ($3 || ' days')::interval
+                ORDER BY created_at DESC LIMIT $4
+                """,
+                guild_id, repo, str(days), limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM github_activity_log
+                WHERE guild_id = $1 AND created_at > now() - ($2 || ' days')::interval
+                ORDER BY created_at DESC LIMIT $3
+                """,
+                guild_id, str(days), limit,
+            )
+        return [dict(r) for r in rows]
+
+
+async def get_guilds_due_for_digest() -> list[dict]:
+    """Guilds with a github_digest_channel_id set whose last digest was
+    sent more than 6 days ago (or never) — the daily digest-check loop
+    calls this and only actually posts on the configured weekday, but this
+    keeps the SQL side of the "has it been a week yet" logic in one place."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM guild_settings
+            WHERE github_digest_channel_id IS NOT NULL
+              AND (github_last_digest_at IS NULL OR github_last_digest_at < now() - interval '6 days')
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_digest_sent(guild_id: int) -> None:
+    await update_guild_setting(guild_id, github_last_digest_at=datetime.now(timezone.utc))

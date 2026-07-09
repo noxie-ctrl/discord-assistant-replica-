@@ -637,6 +637,35 @@ GROUNDING_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_github_activity",
+            "description": (
+                "Look up recent commit and pull-request activity from this server's linked "
+                "GitHub repos (see /githublink) — use this whenever someone asks what changed, "
+                "what shipped, what's been worked on, or the status of a repo/feature, instead "
+                "of guessing from memory. Only covers repos actually linked in this server."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": (
+                            "Optional: a specific 'owner/repo' to filter to. Omit to search "
+                            "across every repo linked in this server."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "How many days back to look. Defaults to 7.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 
