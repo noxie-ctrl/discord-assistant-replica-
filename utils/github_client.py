@@ -15,6 +15,7 @@ at all for public repos; a fine-grained PAT with read-only "Contents" and
 
 import os
 import re
+import base64
 import logging
 from datetime import datetime, timezone
 
@@ -223,3 +224,118 @@ def _parse_ts(value: str | None) -> datetime | None:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Codebase browsing — powers "ask Lucy about the repo" (see
+# get_repo_overview / search_repo_code / read_repo_file tools in
+# nim_client.py, dispatched from cogs/ai_chat.py).
+# ---------------------------------------------------------------------------
+
+MAX_FILE_CHARS = 12000     # keeps a single file read within a sane token budget
+MAX_TREE_ENTRIES = 400     # cap on how many paths get_repo_tree returns
+NOISE_DIR_PREFIXES = (
+    "node_modules/", ".git/", "dist/", "build/", "__pycache__/", ".venv/", "venv/",
+    ".next/", "target/", "vendor/", ".pytest_cache/",
+)
+NOISE_FILE_SUFFIXES = (".lock", ".min.js", ".map", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2")
+
+
+async def get_readme(owner: str, repo: str) -> str | None:
+    """Decoded README text (any of the names GitHub recognizes), or None if
+    the repo has none / it can't be fetched."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/readme")
+        except GitHubError:
+            return None
+    return _decode_content(data)
+
+
+async def get_repo_tree(owner: str, repo: str, branch: str) -> list[str]:
+    """Every file path in the repo at `branch` (recursive git tree), minus
+    obvious noise directories/files, capped to MAX_TREE_ENTRIES. Used to
+    give the model a sense of project layout for broad questions."""
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(
+                session, f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
+                params={"recursive": "1"},
+            )
+        except GitHubError as e:
+            logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
+            return []
+
+    paths = []
+    for entry in data.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        path = entry.get("path", "")
+        if any(path.startswith(p) for p in NOISE_DIR_PREFIXES):
+            continue
+        if any(path.endswith(s) for s in NOISE_FILE_SUFFIXES):
+            continue
+        paths.append(path)
+        if len(paths) >= MAX_TREE_ENTRIES:
+            break
+    return paths
+
+
+async def get_file_content(owner: str, repo: str, path: str, ref: str) -> str | None:
+    """Decoded text content of a single file at `path`, truncated to
+    MAX_FILE_CHARS. Returns None if the file doesn't exist, is binary, or
+    is too large to be worth returning."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(
+                session, f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
+                params={"ref": ref},
+            )
+        except GitHubError as e:
+            logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
+            return None
+
+    if isinstance(data, list):
+        return None  # path was a directory, not a file
+    return _decode_content(data)
+
+
+def _decode_content(data: dict) -> str | None:
+    if data.get("encoding") != "base64" or "content" not in data:
+        return None
+    try:
+        raw = base64.b64decode(data["content"])
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None  # binary file
+    if len(text) > MAX_FILE_CHARS:
+        text = text[:MAX_FILE_CHARS] + "\n... (truncated)"
+    return text
+
+
+async def search_code(owner: str, repo: str, query: str, limit: int = 5) -> list[dict]:
+    """GitHub code search, scoped to one repo. Requires GITHUB_TOKEN — the
+    search API rejects unauthenticated requests entirely, so this raises
+    GitHubError with a clear message if no token is configured, which
+    callers should surface to the user rather than silently returning
+    nothing."""
+    if not os.getenv("GITHUB_TOKEN", "").strip():
+        raise GitHubError(
+            "Code search needs a GITHUB_TOKEN configured (GitHub's search API doesn't allow "
+            "unauthenticated requests) — the repo link and update features still work without one."
+        )
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(
+            session, f"{API_BASE}/search/code",
+            params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
+        )
+
+    results = []
+    for item in data.get("items", [])[:limit]:
+        results.append({"path": item.get("path", ""), "url": item.get("html_url", "")})
+    return results

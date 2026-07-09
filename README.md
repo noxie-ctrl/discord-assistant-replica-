@@ -54,6 +54,7 @@ Optional GitHub repo updates (commits + PRs posted to a channel):
 ```
 GITHUB_TOKEN=...                    # optional but recommended, see below
 GITHUB_POLL_INTERVAL_MINUTES=5      # optional, defaults to 5
+GITHUB_DIGEST_WEEKDAY=0             # optional, defaults to 0 (Monday); 0=Mon ... 6=Sun
 ```
 Works with no token at all for public repos (GitHub allows 60 unauthenticated
 requests/hour, shared across every repo linked on every server this bot is in — fine for
@@ -65,11 +66,35 @@ private repos; no scopes are needed for public-repo read access) to raise that t
 /githublink repo:owner/repo [channel:#dev-updates]   # admin/mod only
 /githubunlink repo:owner/repo                        # admin/mod only
 /githublinks                                         # anyone — lists what's linked
+/githubdigest [channel:#dev-updates]                 # admin/mod only — set/clear weekly recap
+/githubdigestnow [channel:#dev-updates]               # anyone — post a recap right now
 ```
 Lucy checks every linked repo on a timer (`GITHUB_POLL_INTERVAL_MINUTES`) and posts an
-embed to the linked channel for new commits on the default branch and for PRs being
-opened, merged, or closed. Linking a repo baselines it at the current HEAD, so you get
-updates going forward rather than a dump of the whole commit history.
+embed to the linked channel for new commits and for PRs being opened, merged, or closed.
+Linking a repo baselines it at the current HEAD, so you get updates going forward rather
+than a dump of the whole commit history. A few things aimed at making Discord the actual
+hub for a group project rather than just a notification feed:
+- **AI summaries** — commit batches and new PRs get a short, plain-English "what this
+  actually does" blurb (Groq/NIM, same engines as chat) instead of raw commit messages,
+  so non-technical teammates can follow along too. New PRs also get a rough size label
+  (XS/S/M/L/XL) based on lines changed.
+- **Auto-threads on new PRs** — each new PR spins up a Discord thread on its
+  announcement message, so review discussion has a home instead of spreading across the
+  main channel.
+- **Weekly recap** (`/githubdigest`) — once a week (`GITHUB_DIGEST_WEEKDAY`), Lucy posts
+  one consolidated AI write-up of everything that happened across every linked repo —
+  meant to be read in ~10 seconds to catch up on the week. `/githubdigestnow` posts one
+  on demand (e.g. before a meeting) without disturbing the weekly schedule.
+- **Ask Lucy about activity** — since every update is logged, you can just ask her things
+  like "what changed in the database repo this week?" in normal chat and she'll answer
+  from that history instead of guessing.
+- **Ask Lucy about the actual codebase** — she can also read the repo itself: broad
+  questions ("what does this project do", "how's it organized") pull the README and
+  top-level file layout; specific questions ("how is auth handled", "what's in
+  utils/database.py") search the code or read a named file directly and answer from the
+  real content. Code search (not file reading) specifically requires `GITHUB_TOKEN` —
+  GitHub's search API rejects unauthenticated requests — everything else works without
+  one, just at the lower public rate limit.
 
 Testing the vision feature locally
 ---------------------------------

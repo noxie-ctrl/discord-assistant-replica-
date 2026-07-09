@@ -184,6 +184,26 @@ class GitHub(commands.Cog):
         else:
             await interaction.response.send_message("📅 Weekly GitHub recap turned off.")
 
+    @app_commands.command(name="githubdigestnow", description="Post a GitHub recap right now (doesn't affect the weekly schedule)")
+    @app_commands.describe(channel="Where to post it (defaults to the configured digest channel, or this channel)")
+    async def githubdigestnow(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await interaction.response.defer()
+        target_channel = channel
+        if not target_channel:
+            settings = await db.get_guild_settings(interaction.guild_id)
+            digest_channel_id = settings.get("github_digest_channel_id")
+            target_channel = interaction.guild.get_channel(digest_channel_id) if digest_channel_id else None
+        if not target_channel:
+            target_channel = interaction.channel
+
+        had_activity = await self._send_digest(interaction.guild, target_channel, mark_sent=False)
+        if not had_activity:
+            await interaction.followup.send("No GitHub activity in the last 7 days to recap.")
+        elif target_channel.id != interaction.channel.id:
+            await interaction.followup.send(f"📅 Recap posted in {target_channel.mention}.")
+        else:
+            await interaction.followup.send("📅 Recap posted above.")
+
     # -----------------------------------------------------------------
     # Background polling — commits & PRs
     # -----------------------------------------------------------------
@@ -346,22 +366,26 @@ class GitHub(commands.Cog):
         due = await db.get_guilds_due_for_digest()
         for settings in due:
             try:
-                await self._send_digest(settings)
+                guild = self.bot.get_guild(settings["guild_id"])
+                if not guild:
+                    continue
+                channel = guild.get_channel(settings["github_digest_channel_id"])
+                if not channel:
+                    continue
+                await self._send_digest(guild, channel, mark_sent=True)
             except Exception:
                 logger.exception("Failed sending GitHub digest for guild %s", settings["guild_id"])
 
-    async def _send_digest(self, settings: dict):
-        guild = self.bot.get_guild(settings["guild_id"])
-        if not guild:
-            return
-        channel = guild.get_channel(settings["github_digest_channel_id"])
-        if not channel:
-            return
-
+    async def _send_digest(self, guild: discord.Guild, channel: discord.TextChannel, mark_sent: bool) -> bool:
+        """Builds and posts the recap. Returns True if there was activity to
+        report. mark_sent=False (used by the manual /githubdigestnow
+        command) doesn't touch the scheduled loop's weekly cursor, so
+        running it on demand never skips or delays the real weekly post."""
         activity = await db.get_recent_github_activity(guild.id, days=7, limit=100)
         if not activity:
-            await db.mark_digest_sent(guild.id)  # nothing happened — don't retry daily until next week
-            return
+            if mark_sent:
+                await db.mark_digest_sent(guild.id)  # nothing happened — don't retry daily until next week
+            return False
 
         summary = await github_summarizer.summarize_digest(guild.name, activity)
         commit_batches = sum(1 for a in activity if a["kind"] == "commits")
@@ -369,8 +393,8 @@ class GitHub(commands.Cog):
         repos = sorted({a["repo"] for a in activity})
 
         embed = discord.Embed(
-            title="📅 Weekly GitHub recap",
-            description=summary or "No AI summary available this week — see the raw activity below.",
+            title="📅 GitHub recap — last 7 days",
+            description=summary or "No AI summary available — see the raw activity below.",
             color=DIGEST_COLOR,
         )
         embed.add_field(name="Repos", value=", ".join(repos), inline=False)
@@ -382,7 +406,9 @@ class GitHub(commands.Cog):
         except discord.Forbidden:
             logger.warning("Missing permission to post digest in channel %s for guild %s", channel.id, guild.id)
 
-        await db.mark_digest_sent(guild.id)
+        if mark_sent:
+            await db.mark_digest_sent(guild.id)
+        return True
 
 
 async def setup(bot: commands.Bot):

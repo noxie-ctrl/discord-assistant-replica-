@@ -666,6 +666,72 @@ GROUNDING_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_repo_overview",
+            "description": (
+                "Get a high-level overview of a linked GitHub repo — its README and top-level "
+                "project structure. Use this for broad questions about a project: what it does, "
+                "how it's organized, what tech stack it uses, etc. Only works on repos linked "
+                "with /githublink in this server."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "'owner/repo'. Optional if exactly one repo is linked in this server.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_repo_code",
+            "description": (
+                "Search the actual code of a linked GitHub repo for something specific — a "
+                "function name, a config value, how a feature is implemented, etc. Use this "
+                "for pointed technical questions ('how is auth handled', 'where's the database "
+                "connection set up') rather than get_repo_overview, which is for broad "
+                "questions. Returns matching file paths with excerpts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "'owner/repo' to search within."},
+                    "query": {
+                        "type": "string",
+                        "description": "Code search terms — e.g. a function/class name, keyword, or short phrase.",
+                    },
+                },
+                "required": ["repo", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_repo_file",
+            "description": (
+                "Read the full contents of one specific file from a linked GitHub repo by its "
+                "path — use when someone names an exact file ('what's in utils/database.py', "
+                "'show me main.py') or after search_repo_code points at a file worth reading "
+                "in full."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "'owner/repo'."},
+                    "path": {"type": "string", "description": "File path within the repo, e.g. 'utils/database.py'."},
+                },
+                "required": ["repo", "path"],
+            },
+        },
+    },
 ]
 
 

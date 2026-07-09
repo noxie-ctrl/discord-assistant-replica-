@@ -50,6 +50,7 @@ from utils import groq_client
 from utils import awareness
 from utils import openrouter_client
 from utils import facts
+from utils import github_client
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -714,6 +715,85 @@ class AIChat(commands.Cog):
                 else:
                     lines.append(f"[{item['repo']}] PR #{item['ref']} \"{item['title']}\" — {item['detail'] or 'no summary'}")
             return "\n".join(lines)
+
+        if name in ("get_repo_overview", "search_repo_code", "read_repo_file"):
+            return await self._execute_github_repo_tool(name, args, guild)
+
+        return f"Error: unknown tool '{name}'."
+
+    async def _resolve_linked_repo(self, guild: discord.Guild, repo_arg: str | None) -> tuple[dict | None, str]:
+        """Matches a (possibly omitted) repo argument against this guild's
+        linked repos. Returns (link_row_or_None, error_message) — exactly
+        one of which is populated, so callers can just check link first."""
+        links = await db.list_github_links(guild.id)
+        if not links:
+            return None, "Error: no GitHub repos are linked in this server (use /githublink first)."
+
+        if repo_arg:
+            wanted = repo_arg.strip().lower()
+            match = next((l for l in links if l["repo"] == wanted), None)
+            if not match:
+                available = ", ".join(l["repo"] for l in links)
+                return None, f"Error: '{repo_arg}' isn't linked in this server. Linked repos: {available}."
+            return match, ""
+
+        if len(links) == 1:
+            return links[0], ""
+
+        available = ", ".join(l["repo"] for l in links)
+        return None, f"Error: multiple repos are linked — specify one of: {available}."
+
+    async def _execute_github_repo_tool(self, name: str, args: dict, guild: discord.Guild) -> str:
+        repo_arg = (args.get("repo") or "").strip().lower() or None
+        link, error = await self._resolve_linked_repo(guild, repo_arg)
+        if not link:
+            return error
+
+        owner, repo_name = link["repo"].split("/", 1)
+        branch = link["default_branch"] or "main"
+
+        if name == "get_repo_overview":
+            readme = await github_client.get_readme(owner, repo_name)
+            tree = await github_client.get_repo_tree(owner, repo_name, branch)
+            parts = [f"Repo: {link['repo']} (default branch: {branch})"]
+            if readme:
+                parts.append("README (may be truncated):\n" + readme[:3000])
+            else:
+                parts.append("No README found.")
+            if tree:
+                parts.append("Top-level structure:\n" + "\n".join(tree[:150]))
+            return "\n\n".join(parts)
+
+        if name == "search_repo_code":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Error: no search query given."
+            try:
+                results = await github_client.search_code(owner, repo_name, query)
+            except github_client.GitHubError as e:
+                return f"Error: {e}"
+            if not results:
+                return f"No code matches for '{query}' in {link['repo']}."
+
+            chunks = [f"Search results for '{query}' in {link['repo']}:"]
+            for r in results:
+                chunks.append(f"- {r['path']}")
+            # Pull excerpts for the top couple of matches so the model can
+            # actually answer, not just list filenames.
+            for r in results[:2]:
+                content = await github_client.get_file_content(owner, repo_name, r["path"], branch)
+                if content:
+                    chunks.append(f"\n--- {r['path']} (excerpt) ---\n{content[:2000]}")
+            return "\n".join(chunks)
+
+        if name == "read_repo_file":
+            path = (args.get("path") or "").strip().lstrip("/")
+            if not path:
+                return "Error: no file path given."
+            content = await github_client.get_file_content(owner, repo_name, path, branch)
+            if content is None:
+                return f"Error: couldn't read '{path}' in {link['repo']} — it may not exist, be a directory, or be a binary file."
+            return f"{path} in {link['repo']}:\n{content}"
 
         return f"Error: unknown tool '{name}'."
 
