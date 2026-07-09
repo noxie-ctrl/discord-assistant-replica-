@@ -156,6 +156,31 @@ felt — don't respond to it with the same emotional weight you'd give a member,
 assume it can perceive or reply the way a person would.
 """
 
+# Added directly in response to live testing: Lucy confidently stated a
+# plausible-sounding but unverified date/fact from training data instead of
+# either checking or admitting she wasn't sure. The two grounding tools below
+# (get_weather, search_fact — see GROUNDING_TOOLS) exist specifically so she
+# has a real alternative to guessing. This addendum is what tells her to
+# reach for them instead of guessing in the first place.
+FACTUAL_ACCURACY_ADDENDUM = """
+Accuracy on verifiable facts matters more than sounding confident:
+- Weather: never guess conditions/temperature — call get_weather. If it's not about a place, \
+skip it.
+- Specific, checkable facts you're not fully sure of — exact dates, who did what and when, \
+scores, statistics, "when does/did X happen/start" — call search_fact instead of stating a \
+number from memory you can't fully vouch for. This especially applies to anything current, \
+recent, or after your training — you cannot know those from memory alone.
+- If a tool result is empty, unclear, or doesn't cover what was asked, say plainly that you \
+don't have a reliable answer instead of filling the gap with a guess dressed up as fact. A \
+confident-sounding wrong answer is worse than "not sure, let me think" or "don't quote me on \
+the exact number."
+- This does NOT apply to general knowledge, opinions, banter, or casual claims where being \
+slightly loose is normal conversational texture (that's fine, that's how people talk) — it's \
+specifically about numbers, dates, and current/verifiable facts that someone could later check \
+and catch you being wrong about.
+"""
+
+
 # Added after live testing surfaced a real failure mode: asked to relay a
 # lookup_member result, the model invented a plausible-looking "Status:
 # Offline" line that the tool never returned (it doesn't return status at
@@ -339,6 +364,7 @@ def build_system_prompt(
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
     prompt += "\n" + BOT_AWARENESS_ADDENDUM
     prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
+    prompt += "\n" + FACTUAL_ACCURACY_ADDENDUM
 
     if is_owner:
         prompt += "\n" + OWNER_PRIORITY_ADDENDUM.format(owner_name=owner_name)
@@ -554,6 +580,60 @@ INFO_TOOLS = [
                     },
                 },
                 "required": ["member_name"],
+            },
+        },
+    },
+]
+
+# Hallucination fix (this session): real grounding for the two categories of
+# factual question that were getting confidently guessed — weather, and
+# specific checkable facts/dates. Both backing functions (utils/facts.py) are
+# free with no API key, so — like INFO_TOOLS/CONCERN_TOOLS above — these are
+# always in the tool list unconditionally, not gated by permission. See
+# FACTUAL_ACCURACY_ADDENDUM above for the prompt-side instruction to actually
+# reach for these instead of guessing.
+GROUNDING_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": (
+                "Get real current weather (temperature, conditions, humidity, wind) for a "
+                "named place. Use this any time weather comes up for a specific location — "
+                "never state or guess weather from memory."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City or place name, e.g. 'Jaipur' or 'Mumbai, India'.",
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_fact",
+            "description": (
+                "Look up a specific, checkable fact — a date, an event, who/what something "
+                "is, a real-world statistic — instead of stating it from memory when you're "
+                "not fully sure. Backed by a general encyclopedia, so it's best for real "
+                "entities/events, not for opinions, live scores, or anything happening in the "
+                "last few hours."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The fact to look up, phrased plainly, e.g. 'FIFA World Cup 2026 start date'.",
+                    },
+                },
+                "required": ["query"],
             },
         },
     },

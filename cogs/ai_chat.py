@@ -49,6 +49,7 @@ from utils import nim_client
 from utils import groq_client
 from utils import awareness
 from utils import openrouter_client
+from utils import facts
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -70,6 +71,107 @@ VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
 
 FEEDBACK_EMOJI = {"👍": "up", "👎": "down"}
+
+# -----------------------------------------------------------------
+# Reply-length fix: a hard, code-level ceiling on top of the prompt's own
+# "match the room's energy" guidance, same belt-and-suspenders pattern as
+# strip_roleplay_formatting() in nim_client.py for formatting. Prompt-only
+# guidance was getting ignored often enough (casual messages coming back as
+# full paragraphs) that this adds a real cap, not just an instruction.
+# -----------------------------------------------------------------
+CASUAL_MAX_TOKENS = 220
+DEEP_MAX_TOKENS = 700
+_DEPTH_LONG_MESSAGE_CHAR_THRESHOLD = 140
+_DEPTH_SIGNAL_PHRASES = [
+    "explain", "why does", "why is", "why do", "why did", "how does", "how do",
+    "how did", "breakdown", "break down", "in detail", "elaborate",
+    "difference between", "walk me through", "what do you think about",
+    "thoughts on", "critique", "review", "feedback on", "advice", "advise",
+    "help me understand", "compare", "pros and cons", "step by step",
+    "steps to", "tutorial", "guide to", "analysis", "opinion on", "recommend",
+    "what's the best way", "whats the best way", "kaise hota", "kyu hota",
+    "kaise kare", "samjha do", "samjhao",
+]
+DEPTH_STEERING_NOTES = {
+    "casual": (
+        "This message reads as ordinary casual chat — reply the way a person would text back: "
+        "1-2 short sentences, no paragraph breaks, no multi-part breakdown, unless what they're "
+        "actually asking genuinely can't be answered that briefly."
+    ),
+    "deep": (
+        "This message is actually asking for real depth (an explanation, critique, breakdown, or "
+        "advice) — it's fine to write a fuller, multi-paragraph reply here since the topic "
+        "genuinely needs the space. Still write it as normal human paragraphs, not bullet points "
+        "or bolded headers, unless they explicitly asked for a list."
+    ),
+}
+
+
+def classify_reply_depth(content: str) -> str:
+    """Pure classifier (unit-testable, no discord mocking needed): decide
+    whether an incoming message is asking for real depth (explanation,
+    critique, breakdown, advice) or is ordinary casual chat. Drives both
+    max_tokens (see CASUAL_MAX_TOKENS/DEEP_MAX_TOKENS) and a steering note
+    folded into the prompt for this turn. Returns "deep" or "casual"."""
+    text = (content or "").strip().lower()
+    if not text:
+        return "casual"
+    if any(phrase in text for phrase in _DEPTH_SIGNAL_PHRASES):
+        return "deep"
+    if len(text) >= _DEPTH_LONG_MESSAGE_CHAR_THRESHOLD:
+        return "deep"
+    return "casual"
+
+
+# -----------------------------------------------------------------
+# Vision fix: image URLs can come from the message itself, from whatever
+# it's replying to, or (fallback) from a recent nearby message in the same
+# channel — see AIChat._collect_image_urls below for how these combine.
+# These two extraction helpers are pure/duck-typed so they're unit-testable
+# against simple fakes instead of real discord.Attachment/discord.Embed.
+# -----------------------------------------------------------------
+IMAGE_FILE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
+IMAGE_HISTORY_LOOKBACK = 6  # how many prior channel messages to scan as a fallback
+IMAGE_HISTORY_MAX_AGE_SECONDS = 15 * 60  # only consider images posted recently
+
+
+def _looks_like_image(content_type: Optional[str], filename: str) -> bool:
+    if content_type and content_type.startswith("image/"):
+        return True
+    return (filename or "").lower().endswith(IMAGE_FILE_EXTENSIONS)
+
+
+def extract_image_urls_from_attachments(attachments) -> list[str]:
+    """attachments: any iterable of objects with .url/.content_type/.filename
+    (real discord.Attachment objects in production, simple namespaces in
+    tests)."""
+    urls = []
+    for att in attachments or []:
+        url = getattr(att, "url", None)
+        if not url:
+            continue
+        if _looks_like_image(getattr(att, "content_type", None), getattr(att, "filename", "")):
+            urls.append(url)
+    return urls
+
+
+def extract_image_urls_from_embeds(embeds) -> list[str]:
+    """Covers the case of a pasted image link that Discord auto-embeds
+    rather than a native attachment. embeds: any iterable of objects with
+    .image.url / .thumbnail.url (real discord.Embed in production, simple
+    namespaces in tests)."""
+    urls = []
+    for embed in embeds or []:
+        image = getattr(embed, "image", None)
+        image_url = getattr(image, "url", None) if image else None
+        if image_url:
+            urls.append(image_url)
+            continue
+        thumbnail = getattr(embed, "thumbnail", None)
+        thumb_url = getattr(thumbnail, "url", None) if thumbnail else None
+        if thumb_url:
+            urls.append(thumb_url)
+    return urls
 
 
 def maybe_suggest_channel_redirection(channel_topic: Optional[str], content: str) -> Optional[str]:
@@ -582,23 +684,75 @@ class AIChat(commands.Cog):
             }
             return format_member_lookup(data)
 
+        if name == "get_weather":
+            location = (args.get("location") or "").strip()
+            if not location:
+                return "Error: no location given."
+            return await facts.get_weather(location)
+
+        if name == "search_fact":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Error: no query given."
+            return await facts.search_fact(query)
+
         return f"Error: unknown tool '{name}'."
 
     # -----------------------------------------------------------------
     # Main chat handling
     # -----------------------------------------------------------------
 
+    async def _collect_image_urls(self, message: discord.Message) -> list[str]:
+        """Gather image URLs relevant to this message, in priority order:
+        1. Attachments/embeds on the message itself (the direct "here's an
+           image, @lucy" case — worked before, unchanged).
+        2. Whatever message this one is a *reply* to — covers "someone
+           posts an image, someone else hits Reply and asks @lucy about
+           it," which previously found nothing because only the current
+           message's attachments were ever checked.
+        3. A short recent-history fallback in the same channel — covers
+           "someone posts an image, a different person just says '@lucy
+           thoughts on this' without formally replying to it." Capped to a
+           handful of very recent messages so it can't drag in an
+           unrelated image from earlier in a busy channel.
+        """
+        urls = extract_image_urls_from_attachments(message.attachments)
+        urls += extract_image_urls_from_embeds(message.embeds)
+        if urls:
+            return urls[:3]
+
+        if message.reference is not None:
+            referenced = message.reference.resolved
+            if referenced is None or isinstance(referenced, discord.DeletedReferencedMessage):
+                try:
+                    referenced = await message.channel.fetch_message(message.reference.message_id)
+                except (discord.NotFound, discord.HTTPException):
+                    referenced = None
+            if referenced is not None:
+                urls = extract_image_urls_from_attachments(referenced.attachments)
+                urls += extract_image_urls_from_embeds(referenced.embeds)
+                if urls:
+                    return urls[:3]
+
+        try:
+            now = discord.utils.utcnow()
+            async for earlier in message.channel.history(limit=IMAGE_HISTORY_LOOKBACK, before=message):
+                age_seconds = (now - earlier.created_at).total_seconds()
+                if age_seconds > IMAGE_HISTORY_MAX_AGE_SECONDS:
+                    break  # history() is newest-first, so anything older only gets older
+                found = extract_image_urls_from_attachments(earlier.attachments)
+                found += extract_image_urls_from_embeds(earlier.embeds)
+                if found:
+                    return found[:3]
+        except discord.HTTPException:
+            logger.debug("Image history fallback scan failed for channel %s", message.channel.id)
+
+        return []
+
     async def _maybe_attach_image_context(self, message: discord.Message, chat_messages: list[dict]) -> None:
         if not openrouter_client.is_configured():
             return
-        if not message.attachments:
-            return
-        if not any(att.content_type and att.content_type.startswith("image/") for att in message.attachments):
-            return
-        urls = []
-        for attachment in message.attachments:
-            if attachment.content_type and attachment.content_type.startswith("image/"):
-                urls.append(attachment.url)
+        urls = await self._collect_image_urls(message)
         if not urls:
             return
         try:
@@ -696,13 +850,26 @@ class AIChat(commands.Cog):
             prefix = f"{h['speaker_name']}: " if role == "user" and h["speaker_name"] else ""
             chat_messages.append({"role": role, "content": f"{prefix}{h['content']}"})
 
+        # 5c. Reply-length fix: classify casual-vs-deep for THIS message and
+        # fold in a steering note + a matching max_tokens ceiling, rather
+        # than relying only on the static prompt's "match the room's
+        # energy" guidance (see CASUAL_MAX_TOKENS/DEEP_MAX_TOKENS above).
+        depth = classify_reply_depth(cleaned_content)
+        max_tokens = DEEP_MAX_TOKENS if depth == "deep" else CASUAL_MAX_TOKENS
+        chat_messages.append({"role": "system", "content": DEPTH_STEERING_NOTES[depth]})
+
         await self._maybe_attach_image_context(message, chat_messages)
 
         # 6. Call the model (semaphore-capped), with tool support
         try:
             async with self._nim_semaphore:
-                tools = nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + (nim_client.TOOLS if can_use_tools else [])
-                assistant_message = await nim_client.call_nim_with_tools(chat_messages, tools=tools)
+                tools = (
+                    nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
+                    + (nim_client.TOOLS if can_use_tools else [])
+                )
+                assistant_message = await nim_client.call_nim_with_tools(
+                    chat_messages, tools=tools, max_tokens=max_tokens
+                )
 
                 if assistant_message.get("tool_calls"):
                     chat_messages.append(assistant_message)
@@ -715,7 +882,9 @@ class AIChat(commands.Cog):
                         })
                     # One more round trip to let Lucy phrase the final reply
                     async with self._nim_semaphore:
-                        final_message = await nim_client.call_nim_with_tools(chat_messages, tools=None)
+                        final_message = await nim_client.call_nim_with_tools(
+                            chat_messages, tools=None, max_tokens=max_tokens
+                        )
                     reply = (final_message.get("content") or "Done.").strip()
                 else:
                     reply = (assistant_message.get("content") or "").strip()
