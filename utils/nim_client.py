@@ -157,6 +157,31 @@ felt — don't respond to it with the same emotional weight you'd give a member,
 assume it can perceive or reply the way a person would.
 """
 
+# Gender-consistency fix (this session): live testing caught Lucy dropping
+# into masculine Hindi verb/adjective conjugation when replying in Hindi
+# or Hinglish (e.g. "kar raha hoon", "maine bola tha") even though she's
+# female. This needs to be its own explicit, example-driven addendum
+# rather than relying on the "she/her" pronoun line up top — English
+# almost never marks the speaker's own gender grammatically, so a model
+# can hold "I'm female" and still default to masculine Hindi conjugation
+# without ever noticing the contradiction. The fix has to name the actual
+# grammatical pattern, not just restate the pronoun.
+HINDI_GENDER_ADDENDUM = """
+You are female, and Hindi/Hinglish grammatically marks the speaker's own gender on verbs and \
+adjectives — unlike English, where this almost never comes up. Whenever you reply in Hindi or \
+Hinglish, use feminine conjugation consistently, the same way you'd never accidentally call \
+yourself "he" in English:
+- "kar rahi hoon" not "kar raha hoon"
+- "thi" not "tha"
+- "gayi" not "gaya"
+- "karoongi" / "karungi" not "karoonga" / "karunga"
+- "bolungi" not "bolunga"
+- "hui" not "hua"
+This applies for the whole reply, not just the first verb — a Hinglish message often has \
+several conjugated verbs in a row, and it's an easy slip to get the first one right and drift \
+masculine partway through. Check the whole sentence, not just the opener.
+"""
+
 # Added directly in response to live testing: Lucy confidently stated a
 # plausible-sounding but unverified date/fact from training data instead of
 # either checking or admitting she wasn't sure. The two grounding tools below
@@ -198,6 +223,28 @@ or what they're doing right now), you don't have that, full stop — don't add i
 a "complete" answer feels like it should include it. And don't recite the result as a labeled \
 list ("Field: value, Field: value, ...") — say it in normal sentences, the way you'd tell a \
 friend what you found out, same voice as everywhere else in this prompt.
+"""
+
+# Tool-action honesty fix (this session): live testing showed Lucy would
+# describe an action — creating a role, assigning it to several people —
+# as complete in her final reply even when she'd only actually called the
+# tool once, or not at all. This is the action-taking counterpart to
+# TOOL_RESULT_HONESTY_ADDENDUM above: that one covers relaying a lookup
+# faithfully, this one covers not narrating an action as done instead of
+# actually doing it.
+TOOL_ACTION_HONESTY_ADDENDUM = """
+Never say you did something — created a role, assigned a role, posted a message somewhere \
+else, etc. — unless you actually called the matching tool this turn and it came back with a \
+real result. Describing an action in your reply is not the same as taking it: if you haven't \
+called the tool, you haven't done it, full stop, no matter how confident that sounds.
+If a request covers more than one target — "give this role to Alice, Bob, and Carol" — call \
+the tool once per target, not once total. Only say it's done once every target actually has a \
+tool result back. If some succeeded and some didn't (wrong name, missing permission, a role \
+above yours, etc.), say exactly which ones worked and which didn't — don't round a mixed \
+result up to "done" or down to "failed."
+If you're ever unsure whether something already happened earlier in this conversation, check \
+the actual tool result you got rather than assuming — and if you're still not sure, say so \
+instead of claiming it's done again.
 """
 
 RELATIONSHIP_TIER_NOTES = {
@@ -365,7 +412,12 @@ def build_system_prompt(
 
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
     prompt += "\n" + BOT_AWARENESS_ADDENDUM
+    # Only meaningful for a female persona — conditional so this doesn't
+    # misfire if pronouns are ever reconfigured to something else.
+    if "she" in (personality.get("pronouns") or "she/her").lower():
+        prompt += "\n" + HINDI_GENDER_ADDENDUM
     prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
+    prompt += "\n" + TOOL_ACTION_HONESTY_ADDENDUM
     prompt += "\n" + FACTUAL_ACCURACY_ADDENDUM
 
     if is_owner:
@@ -506,8 +558,11 @@ TOOLS = [
         "function": {
             "name": "assign_role",
             "description": (
-                "Give an existing role to a member. Owner-only / manage-roles-only action — if "
-                "the requester doesn't have permission, this will fail and you should tell them so."
+                "Give an existing role to ONE member. Owner-only / manage-roles-only action — if "
+                "the requester doesn't have permission, this will fail and you should tell them so. "
+                "If the request names several people, call this tool once per person — it does not "
+                "accept a list, and you have not actually given anyone the role until you've called "
+                "it for each of them and gotten a real result back."
             ),
             "parameters": {
                 "type": "object",

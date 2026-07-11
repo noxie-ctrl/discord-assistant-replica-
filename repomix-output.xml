@@ -58,6 +58,7 @@ tests/
   test_idle_chatter_channels.py
   test_member_lookup.py
   test_openrouter_client.py
+  test_persona_engine.py
   test_time_awareness.py
 utils/
   __init__.py
@@ -67,13 +68,12 @@ utils/
   github_client.py
   github_summarizer.py
   groq_client.py
-  k.py
   nim_client.py
   openrouter_client.py
   permissions.py
+  persona_engine.py
 .gitignore
 main.py
-PASSENGERS.dat
 personality_default.json
 Procfile
 README.md
@@ -82,47 +82,6 @@ requirements.txt
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="utils/k.py">
-import pickle
-def create():
-    f = open("PASSENGERS.dat", "wb")
-    PNR = input("Enter PNR Number: ")
-    PName = input("Enter Passenger Name: ")
-    BRDSTN = input("Enter Boarding Station: ")
-    DESTN = input("Enter Destination: ")
-    FARE = input("Enter Fare: ")
-    Data = [PNR, PName, BRDSTN, DESTN, FARE]
-    pickle.dump(Data, f)
-    f.close()
-
-def searchDestn(D):
-    f = open("PASSENGERS.dat", "rb")
-    Data = pickle.load(f)
-    D = input("Enter Destination: ")
-    if D == Data[3]:
-        print("Record Found")
-        print("PNR Number: ", Data[0])
-        print("Passenger Name: ", Data[1])
-        print("Boarding Station: ", Data[2])
-        print("Destination: ", Data[3])
-        print("Fare: ", Data[4])
-    else:
-        print("No Record Found")
-    f.close()
-
-
-create()
-searchDestn(D = input("Enter Destination to search: "))
-
-def updateFare(): #to increase fare by 5% and rewrite the file
-    f = open("PASSENGERS.dat", "rb+")
-    Data = pickle.load(f)
-    Data[4] = str(float(Data[4]) * 1.05)
-    f.seek(0)
-    pickle.dump(Data, f)
-    f.close()
-</file>
 
 <file path="cogs/__init__.py">
 
@@ -455,102 +414,6 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Personality(bot))
 </file>
 
-<file path="cogs/preferences.py">
-"""
-cogs/preferences.py
-
-Lets members set how Lucy talks to them personally:
-  - /mysettings language:<lang> style:<style>  — stored on their user_profiles row
-  - /myprofile                                  — shows what Lucy currently
-    remembers about them (notes + preferences), for transparency
-  - /feedbackstats                              — owner/mod-only rollup of
-    reaction-based feedback (👍/👎ing Lucy's own replies)
-"""
-
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from utils import database as db
-
-
-RESPONSE_STYLES = [
-    app_commands.Choice(name="Concise", value="concise, short answers"),
-    app_commands.Choice(name="Detailed", value="detailed, thorough explanations"),
-    app_commands.Choice(name="Casual", value="very casual and informal"),
-    app_commands.Choice(name="Formal", value="more formal and professional"),
-]
-
-
-class Preferences(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="mysettings", description="Set how Lucy talks to you personally")
-    @app_commands.describe(
-        language="Reply to you in this language by default (e.g. 'Hindi', 'Spanish', 'English')",
-        style="Preferred response style",
-    )
-    @app_commands.choices(style=RESPONSE_STYLES)
-    async def mysettings(
-        self,
-        interaction: discord.Interaction,
-        language: str | None = None,
-        style: app_commands.Choice[str] | None = None,
-    ):
-        if language is None and style is None:
-            await interaction.response.send_message(
-                "Give me at least one of `language` or `style` to update.", ephemeral=True
-            )
-            return
-
-        await db.touch_profile(interaction.guild_id, interaction.user.id, str(interaction.user), interaction.user.display_name)
-        await db.set_user_preference(
-            interaction.guild_id,
-            interaction.user.id,
-            preferred_language=language,
-            response_style=style.value if style else None,
-        )
-        await interaction.response.send_message("Got it — updated your preferences.", ephemeral=True)
-
-    @app_commands.command(name="myprofile", description="See what Lucy remembers about you")
-    async def myprofile(self, interaction: discord.Interaction):
-        profile = await db.get_profile(interaction.guild_id, interaction.user.id)
-        if profile is None:
-            await interaction.response.send_message(
-                "I don't have anything on you yet — chat with me a bit first.", ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(title=f"What I've got on {interaction.user.display_name}", color=discord.Color.blurple())
-        embed.add_field(name="Messages seen", value=str(profile.get("message_count", 0)), inline=True)
-        embed.add_field(name="Preferred language", value=profile.get("preferred_language") or "not set", inline=True)
-        embed.add_field(name="Response style", value=profile.get("response_style") or "not set", inline=True)
-        embed.add_field(name="Notes", value=profile.get("notes") or "(nothing noted yet)", inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="feedbackstats", description="See Lucy's feedback stats (mod/owner only)")
-    async def feedbackstats(self, interaction: discord.Interaction):
-        if not (interaction.user.guild_permissions.manage_guild or interaction.user.id == getattr(self.bot, "owner_id", None)):
-            await interaction.response.send_message("You need Manage Server permission for this.", ephemeral=True)
-            return
-
-        summary = await db.get_feedback_summary(interaction.guild_id)
-        negatives = await db.get_recent_negative_feedback(interaction.guild_id, limit=5)
-
-        embed = discord.Embed(title="Lucy feedback summary", color=discord.Color.orange())
-        embed.add_field(name="👍", value=str(summary.get("up", 0)), inline=True)
-        embed.add_field(name="👎", value=str(summary.get("down", 0)), inline=True)
-        if negatives:
-            recent = "\n".join(f"- {n['message_snippet'][:80]}" for n in negatives)
-            embed.add_field(name="Recent 👎 replies", value=recent, inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Preferences(bot))
-</file>
-
 <file path="cogs/serverlog.py">
 """
 cogs/serverlog.py
@@ -740,6 +603,222 @@ class IdleChatterChannelResolutionTests(unittest.TestCase):
     def test_preserves_configured_order(self):
         result = resolve_idle_chatter_channel_ids([333, 111, 222], fallback_channel_id=999)
         self.assertEqual(result, [333, 111, 222])
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_persona_engine.py">
+import unittest
+
+from utils import persona_engine as pe
+
+
+class ApplySignalTests(unittest.TestCase):
+    def test_defaults_used_when_value_and_confidence_missing(self):
+        value, confidence = pe.apply_signal(None, None, delta=10, weight=1.0, cap_gain=45.0)
+        self.assertEqual(value, 60.0)
+        self.assertGreater(confidence, 0.0)
+
+    def test_value_clamped_to_0_100(self):
+        value, _ = pe.apply_signal(95.0, 50.0, delta=30, weight=1.0, cap_gain=45.0)
+        self.assertEqual(value, 100.0)
+        value, _ = pe.apply_signal(5.0, 50.0, delta=-30, weight=1.0, cap_gain=45.0)
+        self.assertEqual(value, 0.0)
+
+    def test_confidence_gain_diminishes_as_confidence_rises(self):
+        _, low_conf_gain = pe.apply_signal(50.0, 0.0, delta=5, weight=1.0, cap_gain=45.0)
+        _, high_conf_gain = pe.apply_signal(50.0, 90.0, delta=5, weight=1.0, cap_gain=45.0)
+        gain_from_low = low_conf_gain - 0.0
+        gain_from_high = high_conf_gain - 90.0
+        self.assertGreater(gain_from_low, gain_from_high)
+
+    def test_confidence_clamped_to_100(self):
+        _, confidence = pe.apply_signal(50.0, 99.0, delta=5, weight=1.0, cap_gain=45.0)
+        self.assertLessEqual(confidence, 100.0)
+
+
+class ApplyDeltasTiersTests(unittest.TestCase):
+    def test_explicit_moves_value_more_than_inferred_or_heuristic(self):
+        profile, confidence = {}, {}
+        explicit_profile, explicit_conf = pe.apply_explicit_deltas(profile, confidence, {"directness": 35})
+        inferred_profile, inferred_conf = pe.apply_inferred_deltas(profile, confidence, {"directness": 35})
+        heuristic_profile, heuristic_conf = pe.apply_heuristic_deltas(profile, confidence, {"directness": 35})
+
+        self.assertGreater(explicit_profile["directness"], inferred_profile["directness"])
+        self.assertGreater(inferred_profile["directness"], heuristic_profile["directness"])
+        self.assertGreater(explicit_conf["directness"], inferred_conf["directness"])
+        self.assertGreater(inferred_conf["directness"], heuristic_conf["directness"])
+
+    def test_unknown_axis_is_ignored(self):
+        profile, confidence = pe.apply_explicit_deltas({}, {}, {"not_a_real_axis": 50})
+        self.assertNotIn("not_a_real_axis", profile)
+        self.assertEqual(profile, {})
+
+    def test_zero_delta_is_a_noop(self):
+        profile, confidence = pe.apply_explicit_deltas({"energy": 50.0}, {"energy": 10.0}, {"energy": 0})
+        self.assertEqual(profile["energy"], 50.0)
+        self.assertEqual(confidence["energy"], 10.0)
+
+    def test_only_touches_axes_present_in_deltas(self):
+        profile, confidence = pe.apply_explicit_deltas({}, {}, {"banter": 20})
+        self.assertIn("banter", profile)
+        self.assertNotIn("directness", profile)
+
+
+class LoadProfileRowTests(unittest.TestCase):
+    def test_parses_valid_json(self):
+        row = {"style_profile": '{"directness": 70.5, "banter": 30}', "style_confidence": '{"directness": 50}'}
+        profile, confidence = pe.load_profile_row(row)
+        self.assertEqual(profile["directness"], 70.5)
+        self.assertEqual(profile["banter"], 30.0)
+        self.assertEqual(confidence["directness"], 50.0)
+
+    def test_missing_columns_degrade_to_empty_dicts(self):
+        profile, confidence = pe.load_profile_row({})
+        self.assertEqual(profile, {})
+        self.assertEqual(confidence, {})
+
+    def test_malformed_json_degrades_to_empty_dict(self):
+        profile, confidence = pe.load_profile_row({"style_profile": "not json", "style_confidence": "{}"})
+        self.assertEqual(profile, {})
+
+    def test_unknown_axis_keys_are_dropped(self):
+        row = {"style_profile": '{"directness": 60, "made_up_axis": 99}', "style_confidence": "{}"}
+        profile, _ = pe.load_profile_row(row)
+        self.assertIn("directness", profile)
+        self.assertNotIn("made_up_axis", profile)
+
+    def test_none_row_does_not_raise(self):
+        profile, confidence = pe.load_profile_row(None)
+        self.assertEqual(profile, {})
+        self.assertEqual(confidence, {})
+
+
+class HeuristicSignalTests(unittest.TestCase):
+    def test_empty_messages_returns_empty_dict(self):
+        self.assertEqual(pe.heuristic_signal([]), {})
+        self.assertEqual(pe.heuristic_signal(None), {})
+
+    def test_exclamation_heavy_text_nudges_energy_up(self):
+        deltas = pe.heuristic_signal(["this is so cool!!!", "amazing!!! love it!!!"])
+        self.assertIn("energy", deltas)
+        self.assertGreater(deltas["energy"], 0)
+
+    def test_slang_nudges_banter_up(self):
+        deltas = pe.heuristic_signal(["lol that's wild", "lmao no way bruh"])
+        self.assertIn("banter", deltas)
+        self.assertGreater(deltas["banter"], 0)
+
+    def test_long_messages_nudge_depth_up(self):
+        long_msg = "so I've been thinking about this a lot lately and honestly there's a lot going on " * 2
+        deltas = pe.heuristic_signal([long_msg, long_msg])
+        self.assertIn("depth", deltas)
+        self.assertGreater(deltas["depth"], 0)
+
+    def test_short_messages_nudge_depth_down(self):
+        deltas = pe.heuristic_signal(["lol", "ok", "sure"])
+        self.assertIn("depth", deltas)
+        self.assertLess(deltas["depth"], 0)
+
+    def test_deltas_stay_within_clamp_bounds(self):
+        spammy = ["!!!!!!!!! LOL LMAO WOW AMAZING !!!!!!!!"] * 10
+        deltas = pe.heuristic_signal(spammy)
+        for value in deltas.values():
+            self.assertLessEqual(abs(value), 6.0)
+
+
+class ParseInferredDeltasTests(unittest.TestCase):
+    def test_parses_plain_json(self):
+        raw = '{"directness": 5, "banter": -3, "energy": 0, "depth": 0, "support_style": 0}'
+        deltas = pe.parse_inferred_deltas(raw)
+        self.assertEqual(deltas["directness"], 5.0)
+        self.assertEqual(deltas["banter"], -3.0)
+
+    def test_zero_values_are_dropped(self):
+        raw = '{"directness": 0, "banter": 4}'
+        deltas = pe.parse_inferred_deltas(raw)
+        self.assertNotIn("directness", deltas)
+        self.assertIn("banter", deltas)
+
+    def test_strips_markdown_code_fences(self):
+        raw = '```json\n{"directness": 5}\n```'
+        deltas = pe.parse_inferred_deltas(raw)
+        self.assertEqual(deltas["directness"], 5.0)
+
+    def test_invalid_json_returns_none(self):
+        self.assertIsNone(pe.parse_inferred_deltas("not json at all"))
+
+    def test_empty_or_none_input_returns_none(self):
+        self.assertIsNone(pe.parse_inferred_deltas(""))
+        self.assertIsNone(pe.parse_inferred_deltas(None))
+
+    def test_non_dict_json_returns_none(self):
+        self.assertIsNone(pe.parse_inferred_deltas("[1, 2, 3]"))
+
+    def test_values_clamped_to_ten(self):
+        raw = '{"directness": 500, "banter": -500}'
+        deltas = pe.parse_inferred_deltas(raw)
+        self.assertEqual(deltas["directness"], 10.0)
+        self.assertEqual(deltas["banter"], -10.0)
+
+    def test_unknown_keys_ignored_all_zero_or_unknown_returns_none(self):
+        raw = '{"not_a_real_axis": 8, "directness": 0}'
+        self.assertIsNone(pe.parse_inferred_deltas(raw))
+
+
+class RenderAdaptationLayerTests(unittest.TestCase):
+    def test_returns_none_with_no_confidence(self):
+        self.assertIsNone(pe.render_adaptation_layer({"directness": 90}, {"directness": 0}))
+
+    def test_returns_none_with_empty_inputs(self):
+        self.assertIsNone(pe.render_adaptation_layer({}, {}))
+        self.assertIsNone(pe.render_adaptation_layer(None, None))
+
+    def test_includes_high_directness_phrasing_once_confident(self):
+        note = pe.render_adaptation_layer({"directness": 80}, {"directness": 90})
+        self.assertIsNotNone(note)
+        self.assertIn("blunt", note.lower())
+
+    def test_includes_low_banter_phrasing_once_confident(self):
+        note = pe.render_adaptation_layer({"banter": 10}, {"banter": 90})
+        self.assertIn("sincere", note.lower())
+
+    def test_mid_range_value_with_confidence_produces_no_phrase_for_that_axis(self):
+        # 50 is neutral — shouldn't trigger either the high or low phrasing.
+        note = pe.render_adaptation_layer({"directness": 50}, {"directness": 90})
+        self.assertIsNone(note)
+
+    def test_never_reveals_mechanics_of_adaptation(self):
+        note = pe.render_adaptation_layer({"directness": 80}, {"directness": 90})
+        self.assertNotIn("axis", note.lower())
+        self.assertNotIn("confidence", note.lower())
+
+
+class DescribeStyleForUserTests(unittest.TestCase):
+    def test_default_message_when_no_signal(self):
+        summary = pe.describe_style_for_user({}, {})
+        self.assertIn("vibecheck", summary.lower())
+
+    def test_summary_reflects_confident_axis(self):
+        summary = pe.describe_style_for_user({"energy": 85}, {"energy": 90})
+        self.assertIn("high energy", summary.lower())
+
+
+class VibecheckQuestionsTests(unittest.TestCase):
+    def test_every_question_has_two_options_with_valid_axis_deltas(self):
+        for question in pe.VIBECHECK_QUESTIONS:
+            self.assertEqual(len(question["options"]), 2)
+            for option in question["options"]:
+                self.assertTrue(option["label"])
+                for axis in option["delta"]:
+                    self.assertIn(axis, pe.AXES)
+
+    def test_options_within_a_question_pull_opposite_directions(self):
+        for question in pe.VIBECHECK_QUESTIONS:
+            deltas = [sum(opt["delta"].values()) for opt in question["options"]]
+            self.assertLess(deltas[0] * deltas[1], 0)
 
 
 if __name__ == "__main__":
@@ -1209,8 +1288,524 @@ def is_configured() -> bool:
     return bool(_get_keys())
 </file>
 
+<file path="utils/persona_engine.py">
+"""
+utils/persona_engine.py
+
+Adaptive persona layer: gives Lucy a per-user read on HOW someone likes to
+be talked to, separate from relationship_tier (which tracks how CLOSE she
+is with them). Two independent dials — a brand-new "acquaintance" can still
+want blunt banter, and a "best friend" can still want a gentle touch.
+
+Five axes, each 0-100 (50 = no lean yet), each with its own 0-100
+confidence score so a single weird message can't swing behavior:
+
+  directness      gentle/diplomatic (low)   <-> blunt/no-fluff (high)
+  banter          sincere/earnest (low)     <-> sarcastic/teasing (high)
+  energy          calm/low-key (low)        <-> high-energy/hyped (high)
+  depth           quick/light chat (low)    <-> long thoughtful chat (high)
+  support_style   wants to be heard (low)   <-> wants solutions (high)
+
+Signal comes in three trust tiers, each with its own weight/confidence-gain
+(see apply_explicit_deltas / apply_inferred_deltas / apply_heuristic_deltas):
+  - explicit  : /vibecheck answers (cogs/preferences.py) — big, trusted nudge
+  - inferred  : small LLM read on a batch of recent messages
+                (nim_client.infer_style_signals) — moderate trust
+  - heuristic : cheap lexical proxies computed right here, free and instant,
+                deliberately low-weight since they're rough proxies, not
+                real understanding
+
+This module is deliberately network-free and side-effect-free so all of it
+is unit-testable without mocking an API client. The one LLM call
+(infer_style_signals) lives in utils/nim_client.py, next to
+summarize_user_notes, and calls back into this module only for the AXES
+dict (to build its prompt) and parse_inferred_deltas (to validate its
+output) — a one-way dependency, nim_client -> persona_engine, no cycle.
+"""
+
+import json
+import re
+
+# ---------------------------------------------------------------------------
+# Axis definitions
+# ---------------------------------------------------------------------------
+
+AXES: dict[str, str] = {
+    "directness": "gentle/diplomatic (low) vs blunt/no-fluff (high)",
+    "banter": "sincere/earnest (low) vs sarcastic/teasing (high)",
+    "energy": "calm/low-key (low) vs high-energy/hyped (high)",
+    "depth": "prefers quick/light exchanges (low) vs enjoys longer thoughtful ones (high)",
+    "support_style": "wants to be heard/validated (low) vs wants solutions/advice (high)",
+}
+
+DEFAULT_AXIS_VALUE = 50.0
+MIN_CONFIDENCE_TO_RENDER = 22.0
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+# ---------------------------------------------------------------------------
+# Signal merging — one generic function, three trust-tier wrappers around it.
+# Confidence approaches 100 with diminishing returns (each new signal moves
+# it less than the last), so a profile "settles" rather than drifting
+# forever on noise.
+# ---------------------------------------------------------------------------
+
+def apply_signal(value: float | None, confidence: float | None, delta: float,
+                  weight: float, cap_gain: float) -> tuple[float, float]:
+    value = DEFAULT_AXIS_VALUE if value is None else value
+    confidence = 0.0 if confidence is None else confidence
+    new_value = _clamp(value + delta * weight, 0.0, 100.0)
+    gain = cap_gain * weight * (1 - confidence / 100.0)
+    new_confidence = _clamp(confidence + gain, 0.0, 100.0)
+    return new_value, new_confidence
+
+
+def apply_deltas(profile: dict, confidence: dict, deltas: dict, *,
+                  weight: float, cap_gain: float) -> tuple[dict, dict]:
+    profile = dict(profile or {})
+    confidence = dict(confidence or {})
+    for axis, delta in (deltas or {}).items():
+        if axis not in AXES or not delta:
+            continue
+        v, c = apply_signal(profile.get(axis), confidence.get(axis), float(delta), weight, cap_gain)
+        profile[axis] = v
+        confidence[axis] = c
+    return profile, confidence
+
+
+def apply_explicit_deltas(profile: dict, confidence: dict, deltas: dict) -> tuple[dict, dict]:
+    """/vibecheck answers — the user told us directly, trust it fully."""
+    return apply_deltas(profile, confidence, deltas, weight=1.0, cap_gain=45.0)
+
+
+def apply_inferred_deltas(profile: dict, confidence: dict, deltas: dict) -> tuple[dict, dict]:
+    """One LLM read on a batch of recent messages — real evidence, but a
+    single pass could misjudge, so it moves things at partial trust."""
+    return apply_deltas(profile, confidence, deltas, weight=0.6, cap_gain=15.0)
+
+
+def apply_heuristic_deltas(profile: dict, confidence: dict, deltas: dict) -> tuple[dict, dict]:
+    """Free lexical proxies (see heuristic_signal) — rough, so low weight."""
+    return apply_deltas(profile, confidence, deltas, weight=0.35, cap_gain=8.0)
+
+
+# ---------------------------------------------------------------------------
+# DB row <-> dict helpers. style_profile/style_confidence are stored as
+# plain TEXT (JSON-encoded), matching the rest of user_profiles (e.g.
+# `notes`) rather than reaching for asyncpg's JSONB codec setup.
+# ---------------------------------------------------------------------------
+
+def load_profile_row(row: dict) -> tuple[dict, dict]:
+    """Parses a user_profiles row (as returned by db.touch_profile /
+    db.get_profile) into (style_profile, style_confidence) dicts. Missing
+    or malformed data degrades to empty dicts rather than raising —
+    callers should treat a missing axis as DEFAULT_AXIS_VALUE / 0 confidence."""
+
+    def _parse(raw):
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {k: float(v) for k, v in data.items() if k in AXES and isinstance(v, (int, float))}
+
+    row = row or {}
+    return _parse(row.get("style_profile")), _parse(row.get("style_confidence"))
+
+
+# ---------------------------------------------------------------------------
+# Heuristic (free, instant, lexical) signal
+# ---------------------------------------------------------------------------
+
+_EMOJI_PATTERN = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]"
+)
+_SLANG_WORDS = ("lol", "lmao", "lmfao", "rofl", "bruh", "ong", "ngl", "fr fr", "deadass", "lowkey", "highkey")
+
+
+def heuristic_signal(messages: list[str]) -> dict[str, float]:
+    """Cheap, deterministic lexical proxies — no API call. Deliberately
+    only touches energy/banter/depth, the axes that actually show up in
+    surface features of text; directness and support_style need real
+    reading comprehension and are left entirely to infer_style_signals()."""
+    messages = [m for m in (messages or []) if m]
+    if not messages:
+        return {}
+
+    n = len(messages)
+    text = " ".join(messages)
+    lower = text.lower()
+
+    avg_len = sum(len(m) for m in messages) / n
+    exclaim_rate = text.count("!") / n
+    emoji_count = len(_EMOJI_PATTERN.findall(text))
+    slang_hits = sum(lower.count(w) for w in _SLANG_WORDS)
+    caps_words = sum(1 for w in text.split() if len(w) > 2 and w.isupper())
+
+    deltas: dict[str, float] = {}
+
+    energy_signal = exclaim_rate * 3.0 + caps_words * 0.5 + (emoji_count / n) * 2.0
+    if energy_signal:
+        deltas["energy"] = _clamp(energy_signal, -6.0, 6.0)
+
+    if slang_hits:
+        deltas["banter"] = _clamp(slang_hits * 1.5, -6.0, 6.0)
+
+    depth_signal = (avg_len - 60.0) / 20.0
+    if abs(depth_signal) >= 0.5:
+        deltas["depth"] = _clamp(depth_signal, -6.0, 6.0)
+
+    return deltas
+
+
+# ---------------------------------------------------------------------------
+# LLM-inferred signal — parsing only (the network call lives in
+# nim_client.infer_style_signals, right next to summarize_user_notes).
+# ---------------------------------------------------------------------------
+
+def parse_inferred_deltas(raw: str | None) -> dict[str, float] | None:
+    """Validates + clamps a model's JSON reply into a clean deltas dict.
+    Returns None (not {}) on any failure so callers can distinguish
+    "nothing worth noting" from "couldn't parse it" if they ever care to."""
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned[:4].lower() == "json":
+            cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+    try:
+        data = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    out = {}
+    for axis in AXES:
+        v = data.get(axis)
+        if isinstance(v, (int, float)) and v:
+            out[axis] = _clamp(float(v), -10.0, 10.0)
+    return out or None
+
+
+# ---------------------------------------------------------------------------
+# Rendering — axis values -> natural language. One shared table-driven
+# helper, two phrasing tables (one for the model, one for the human).
+# ---------------------------------------------------------------------------
+
+AXIS_ADAPTATION_PHRASING = {
+    "directness": {
+        "high": "give it to them straight and skip the cushioning — they'd rather hear the blunt version",
+        "low": "ease things in rather than dropping blunt takes on them cold — they land better with a gentler approach",
+    },
+    "banter": {
+        "high": "lean into banter and teasing with them, they enjoy getting roasted a little",
+        "low": "keep it more sincere with them and dial back the sarcasm/teasing",
+    },
+    "energy": {
+        "high": "match their higher energy — more enthusiasm, less flat",
+        "low": "keep your energy chill and low-key with them, don't over-hype replies",
+    },
+    "depth": {
+        "high": "they genuinely enjoy longer, more thoughtful exchanges — it's fine to go deeper with them, not just quick banter",
+        "low": "they tend to prefer quick, light exchanges — don't over-elaborate by default",
+    },
+    "support_style": {
+        "high": "when something's wrong, they want practical help — offer something concrete, not just sympathy",
+        "low": "when they're venting, they want to feel heard first — don't rush to fix it or advise unless asked",
+    },
+}
+
+AXIS_USER_PHRASING = {
+    "directness": {"high": "likes it straight-up, less cushioning", "low": "prefers things eased in gently"},
+    "banter": {"high": "down for banter and teasing", "low": "prefers sincerity over sarcasm"},
+    "energy": {"high": "matches high energy", "low": "prefers a chill, low-key tone"},
+    "depth": {"high": "enjoys going deep on topics", "low": "prefers quick, light exchanges"},
+    "support_style": {"high": "wants solutions when venting", "low": "wants to be heard first when venting"},
+}
+
+
+def _axis_bits(profile: dict | None, confidence: dict | None, phrasing_table: dict,
+               min_confidence: float) -> list[str]:
+    bits = []
+    profile = profile or {}
+    confidence = confidence or {}
+    for axis, phrasing in phrasing_table.items():
+        conf = confidence.get(axis, 0.0) or 0.0
+        if conf < min_confidence:
+            continue
+        val = profile.get(axis, DEFAULT_AXIS_VALUE)
+        if val >= 65:
+            bits.append(phrasing["high"])
+        elif val <= 35:
+            bits.append(phrasing["low"])
+    return bits
+
+
+def render_adaptation_layer(profile: dict | None, confidence: dict | None,
+                             *, min_confidence: float = MIN_CONFIDENCE_TO_RENDER) -> str | None:
+    """System-prompt addendum, written as a standing instruction to the
+    model. Returns None when there isn't enough signal on ANY axis yet —
+    callers should skip appending anything in that case rather than
+    injecting an empty/generic note."""
+    bits = _axis_bits(profile, confidence, AXIS_ADAPTATION_PHRASING, min_confidence)
+    if not bits:
+        return None
+    header = (
+        "You've picked up a read on how this specific person likes to be talked to (this "
+        "shapes delivery only — it never overrides your core personality or boundaries): "
+    )
+    return header + "; ".join(bits) + ". Weave this in naturally — never announce or explain that you're adapting."
+
+
+def describe_style_for_user(profile: dict | None, confidence: dict | None,
+                             *, min_confidence: float = MIN_CONFIDENCE_TO_RENDER) -> str:
+    """Second-person, /myprofile-facing summary — same signal as
+    render_adaptation_layer, phrased for the person themselves instead of
+    as an instruction to the model. Always returns a string (never None) —
+    /myprofile has a field to fill either way."""
+    bits = _axis_bits(profile, confidence, AXIS_USER_PHRASING, min_confidence)
+    if not bits:
+        return "Still getting a read on your vibe — the more we talk (or run `/vibecheck`), the better I'll match it."
+    return "So far: " + ", ".join(bits) + "."
+
+
+# ---------------------------------------------------------------------------
+# /vibecheck — 4 forced-choice questions, tap-only, ~15 seconds. One axis
+# per question, big deltas since these are direct, trusted answers.
+# Order chosen to open on the lowest-stakes question (directness) and close
+# on the quickest/most fun one (energy).
+# ---------------------------------------------------------------------------
+
+VIBECHECK_QUESTIONS = [
+    {
+        "prompt": "If I think you're about to mess something up, I should:",
+        "options": [
+            {"label": "Tell me straight up", "delta": {"directness": 35}},
+            {"label": "Ease into it a bit", "delta": {"directness": -35}},
+        ],
+    },
+    {
+        "prompt": "Quick banter check:",
+        "options": [
+            {"label": "Roast me, I can take it", "delta": {"banter": 35}},
+            {"label": "Keep it sincere with me", "delta": {"banter": -35}},
+        ],
+    },
+    {
+        "prompt": "When I'm venting about something:",
+        "options": [
+            {"label": "Just listen, don't fix it", "delta": {"support_style": -35}},
+            {"label": "Help me actually solve it", "delta": {"support_style": 35}},
+        ],
+    },
+    {
+        "prompt": "Ideal chat energy for you:",
+        "options": [
+            {"label": "Chill and low-key", "delta": {"energy": -30}},
+            {"label": "Hyped and enthusiastic", "delta": {"energy": 30}},
+        ],
+    },
+]
+</file>
+
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="cogs/preferences.py">
+"""
+cogs/preferences.py
+
+Lets members set how Lucy talks to them personally:
+  - /mysettings language:<lang> style:<style>  — stored on their user_profiles row
+  - /vibecheck                                  — 4-tap forced-choice calibration
+    that fast-tracks utils/persona_engine.py's per-user style axes (Lucy adapts
+    passively either way — this just speeds it up and lets someone state a
+    preference explicitly instead of waiting for it to be inferred)
+  - /myprofile                                  — shows what Lucy currently
+    remembers about them (notes + preferences + how she's adapted), for
+    transparency — the personalization should never feel like it's happening
+    behind their back
+  - /feedbackstats                              — owner/mod-only rollup of
+    reaction-based feedback (👍/👎ing Lucy's own replies)
+"""
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+from utils import persona_engine
+
+
+RESPONSE_STYLES = [
+    app_commands.Choice(name="Concise", value="concise, short answers"),
+    app_commands.Choice(name="Detailed", value="detailed, thorough explanations"),
+    app_commands.Choice(name="Casual", value="very casual and informal"),
+    app_commands.Choice(name="Formal", value="more formal and professional"),
+]
+
+
+class VibeCheckButton(discord.ui.Button):
+    def __init__(self, label: str, delta: dict):
+        super().__init__(style=discord.ButtonStyle.secondary, label=label[:80])
+        self.delta = delta
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "VibeCheckView" = self.view
+        if interaction.user.id != view.user_id:
+            await interaction.response.send_message(
+                "This vibe check isn't yours — run `/vibecheck` for your own.", ephemeral=True
+            )
+            return
+        await view.advance(interaction, self.delta)
+
+
+class VibeCheckView(discord.ui.View):
+    """4 forced-choice questions, one screen at a time, edited in place so
+    it reads as a quick tap-through rather than a form. Each answer saves
+    immediately (see persona_engine.apply_explicit_deltas), so quitting
+    halfway still keeps whatever was answered — nothing is lost or wasted
+    by not finishing."""
+
+    def __init__(self, guild_id: int, user_id: int, *, timeout: float = 90.0):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.step = 0
+        self._build_buttons()
+
+    def _build_buttons(self):
+        self.clear_items()
+        question = persona_engine.VIBECHECK_QUESTIONS[self.step]
+        for option in question["options"]:
+            self.add_item(VibeCheckButton(option["label"], option["delta"]))
+
+    def current_embed(self) -> discord.Embed:
+        question = persona_engine.VIBECHECK_QUESTIONS[self.step]
+        embed = discord.Embed(description=f"**{question['prompt']}**", color=discord.Color.pink())
+        embed.set_footer(text=f"Question {self.step + 1}/{len(persona_engine.VIBECHECK_QUESTIONS)} — tap one")
+        return embed
+
+    async def advance(self, interaction: discord.Interaction, delta: dict):
+        profile_row = await db.get_profile(self.guild_id, self.user_id) or {}
+        style_profile, style_confidence = persona_engine.load_profile_row(profile_row)
+        style_profile, style_confidence = persona_engine.apply_explicit_deltas(
+            style_profile, style_confidence, delta
+        )
+        await db.save_style_profile(self.guild_id, self.user_id, style_profile, style_confidence)
+
+        self.step += 1
+        if self.step >= len(persona_engine.VIBECHECK_QUESTIONS):
+            await db.mark_onboarded(self.guild_id, self.user_id)
+            self.clear_items()
+            done_embed = discord.Embed(
+                description=(
+                    "That's the vibe check done — I'll keep tuning as we talk. Run "
+                    "`/myprofile` anytime to see how I've read you, or `/vibecheck` again to redo it."
+                ),
+                color=discord.Color.pink(),
+            )
+            await interaction.response.edit_message(embed=done_embed, view=None)
+            self.stop()
+            return
+
+        self._build_buttons()
+        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+class Preferences(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="mysettings", description="Set how Lucy talks to you personally")
+    @app_commands.describe(
+        language="Reply to you in this language by default (e.g. 'Hindi', 'Spanish', 'English')",
+        style="Preferred response style",
+    )
+    @app_commands.choices(style=RESPONSE_STYLES)
+    async def mysettings(
+        self,
+        interaction: discord.Interaction,
+        language: str | None = None,
+        style: app_commands.Choice[str] | None = None,
+    ):
+        if language is None and style is None:
+            await interaction.response.send_message(
+                "Give me at least one of `language` or `style` to update.", ephemeral=True
+            )
+            return
+
+        await db.touch_profile(interaction.guild_id, interaction.user.id, str(interaction.user), interaction.user.display_name)
+        await db.set_user_preference(
+            interaction.guild_id,
+            interaction.user.id,
+            preferred_language=language,
+            response_style=style.value if style else None,
+        )
+        await interaction.response.send_message("Got it — updated your preferences.", ephemeral=True)
+
+    @app_commands.command(name="vibecheck", description="Quick 4-tap calibration so Lucy matches your vibe faster")
+    async def vibecheck(self, interaction: discord.Interaction):
+        await db.touch_profile(
+            interaction.guild_id, interaction.user.id, str(interaction.user), interaction.user.display_name
+        )
+        view = VibeCheckView(interaction.guild_id, interaction.user.id)
+        await interaction.response.send_message(embed=view.current_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="myprofile", description="See what Lucy remembers about you")
+    async def myprofile(self, interaction: discord.Interaction):
+        profile = await db.get_profile(interaction.guild_id, interaction.user.id)
+        if profile is None:
+            await interaction.response.send_message(
+                "I don't have anything on you yet — chat with me a bit first.", ephemeral=True
+            )
+            return
+
+        style_profile, style_confidence = persona_engine.load_profile_row(profile)
+        vibe_summary = persona_engine.describe_style_for_user(style_profile, style_confidence)
+
+        embed = discord.Embed(title=f"What I've got on {interaction.user.display_name}", color=discord.Color.blurple())
+        embed.add_field(name="Messages seen", value=str(profile.get("message_count", 0)), inline=True)
+        embed.add_field(name="Preferred language", value=profile.get("preferred_language") or "not set", inline=True)
+        embed.add_field(name="Response style", value=profile.get("response_style") or "not set", inline=True)
+        embed.add_field(name="How I've adapted to you", value=vibe_summary, inline=False)
+        embed.add_field(name="Notes", value=profile.get("notes") or "(nothing noted yet)", inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="feedbackstats", description="See Lucy's feedback stats (mod/owner only)")
+    async def feedbackstats(self, interaction: discord.Interaction):
+        if not (interaction.user.guild_permissions.manage_guild or interaction.user.id == getattr(self.bot, "owner_id", None)):
+            await interaction.response.send_message("You need Manage Server permission for this.", ephemeral=True)
+            return
+
+        summary = await db.get_feedback_summary(interaction.guild_id)
+        negatives = await db.get_recent_negative_feedback(interaction.guild_id, limit=5)
+
+        embed = discord.Embed(title="Lucy feedback summary", color=discord.Color.orange())
+        embed.add_field(name="👍", value=str(summary.get("up", 0)), inline=True)
+        embed.add_field(name="👎", value=str(summary.get("down", 0)), inline=True)
+        if negatives:
+            recent = "\n".join(f"- {n['message_snippet'][:80]}" for n in negatives)
+            embed.add_field(name="Recent 👎 replies", value=recent, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Preferences(bot))
 </file>
 
 <file path="tests/test_ai_chat_helpers.py">
@@ -4202,6 +4797,10 @@ Run these once, in Discord:
 - `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
 - `/setlogchannel` — where moderation actions get logged
 - `/setwelcome` — welcome channel + message for new members
+- `/vibecheck` — anyone, 4-tap calibration so Lucy adapts her delivery (blunt vs.
+  gentle, banter vs. sincere, chill vs. hyped, fix-it vs. just-listen) to how you
+  personally like to be talked to. Optional — she picks this up passively from
+  chat either way, this just fast-tracks it. `/myprofile` shows what she's picked up.
 
 ## What's included
 - **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
@@ -4212,6 +4811,13 @@ Run these once, in Discord:
   real current headlines. She naturally warms up to people over time (acquaintance → friend →
   close friend → best friend, based on how much you've talked and how well it's gone), while
   the owner always gets top priority and candor.
+- **Adaptive persona:** independent of closeness above, Lucy separately reads *how* each
+  person likes to be talked to — blunt vs. gentle, banter vs. sincere, chill vs. hyped,
+  wants-solutions vs. wants-to-vent — and quietly adjusts delivery per person, never her
+  core personality or boundaries. Builds passively from ordinary chat (a cheap lexical read
+  plus a small AI read every 15 messages), or fast-tracked with `/vibecheck` (4 taps, optional).
+  Fully transparent — `/myprofile` shows exactly what's been picked up. See
+  `utils/persona_engine.py`.
 - **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
   to need a real person to check in — separate from normal banter/venting.
 - **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number
@@ -4244,6 +4850,7 @@ wrong names and would have broken /setpersonality and /setchattrigger.
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -4432,6 +5039,15 @@ ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_digest_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_last_digest_at TIMESTAMPTZ;
+-- Adaptive persona (utils/persona_engine.py): per-user communication-style
+-- axes (directness, banter, energy, depth, support_style), stored as plain
+-- JSON-encoded TEXT (same pattern as `notes`) rather than JSONB, so no
+-- asyncpg codec setup is needed. onboarded_at is set the first time someone
+-- completes /vibecheck; NULL just means "never ran it" (passive inference
+-- still applies regardless).
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS style_profile TEXT DEFAULT '{}';
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS style_confidence TEXT DEFAULT '{}';
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
 """
 
 
@@ -4775,6 +5391,31 @@ async def update_profile_notes(guild_id: int, user_id: int, notes: str):
         await conn.execute(
             "UPDATE user_profiles SET notes = $3 WHERE guild_id = $1 AND user_id = $2",
             guild_id, user_id, notes,
+        )
+
+
+async def save_style_profile(guild_id: int, user_id: int, profile: dict, confidence: dict):
+    """Persists the (style_profile, style_confidence) dicts produced by
+    utils/persona_engine.py's apply_*_deltas functions. Callers pass plain
+    dicts; this is the only place that touches JSON encoding for them."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET style_profile = $3, style_confidence = $4 "
+            "WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, json.dumps(profile or {}), json.dumps(confidence or {}),
+        )
+
+
+async def mark_onboarded(guild_id: int, user_id: int):
+    """Called once /vibecheck finishes (cogs/preferences.py). Purely
+    informational — doesn't gate passive adaptation, just lets the
+    first-message nudge in cogs/ai_chat.py know not to offer it again."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET onboarded_at = now() WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
         )
 
 
@@ -5242,6 +5883,7 @@ from utils import awareness
 from utils import openrouter_client
 from utils import facts
 from utils import github_client
+from utils import persona_engine
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -6079,6 +6721,13 @@ class AIChat(commands.Cog):
 
         # 1. Long-term profile bookkeeping (id + username + display name)
         profile = await db.touch_profile(guild.id, author.id, str(author), author.display_name)
+        is_first_message_ever = profile["message_count"] == 1
+
+        # Adaptive persona (utils/persona_engine.py): load this person's
+        # current style axes once per message (cheap — already part of the
+        # touch_profile row, no extra query) so build_system_prompt below
+        # always has a value, even between the periodic update passes.
+        style_profile, style_confidence = persona_engine.load_profile_row(profile)
 
         if profile["message_count"] % NOTES_UPDATE_INTERVAL == 0:
             history = await db.get_chat_history(guild.id, message.channel.id, limit=NOTES_UPDATE_INTERVAL)
@@ -6093,6 +6742,23 @@ class AIChat(commands.Cog):
                 if new_notes != profile.get("notes"):
                     await db.update_profile_notes(guild.id, author.id, new_notes)
                     profile["notes"] = new_notes
+
+                # Same cadence, same batch of messages — blend a free
+                # lexical read with one small LLM read into this person's
+                # style profile. Anyone who never touches /vibecheck still
+                # gets adapted to, just more gradually.
+                heuristic_deltas = persona_engine.heuristic_signal(recent_from_user)
+                if heuristic_deltas:
+                    style_profile, style_confidence = persona_engine.apply_heuristic_deltas(
+                        style_profile, style_confidence, heuristic_deltas
+                    )
+                inferred_deltas = await nim_client.infer_style_signals(author.display_name, recent_from_user)
+                if inferred_deltas:
+                    style_profile, style_confidence = persona_engine.apply_inferred_deltas(
+                        style_profile, style_confidence, inferred_deltas
+                    )
+                if heuristic_deltas or inferred_deltas:
+                    await db.save_style_profile(guild.id, author.id, style_profile, style_confidence)
 
         # 2. Resolve mentions (users/channels/roles), strip Lucy's own mention
         cleaned_content, mentioned_facts = await self._resolve_mentions(message)
@@ -6116,6 +6782,7 @@ class AIChat(commands.Cog):
             or author.guild_permissions.manage_channels
 
         relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
+        adaptation_note = persona_engine.render_adaptation_layer(style_profile, style_confidence)
 
         system_prompt = nim_client.build_system_prompt(
             personality=personality,
@@ -6128,6 +6795,7 @@ class AIChat(commands.Cog):
             response_style=profile.get("response_style"),
             can_use_tools=can_use_tools,
             relationship_tier=relationship_tier,
+            adaptation_note=adaptation_note,
             news_digest=awareness.get_cached_digest() or None,
             server_vibe=awareness.get_cached_server_vibe(guild.id) or None,
         )
@@ -6227,6 +6895,20 @@ class AIChat(commands.Cog):
                 oldest_key = next(iter(self._recent_replies))
                 self._recent_replies.pop(oldest_key, None)
 
+        # First-ever message from this person in this guild: offer a fast,
+        # skippable calibration so Lucy can start adapting sooner than
+        # passive inference alone would. Purely a fast-track — passive
+        # adaptation (above) runs regardless of whether they ever touch this.
+        if is_first_message_ever and not profile.get("onboarded_at"):
+            try:
+                await message.channel.send(
+                    f"(hey {author.display_name} — `/vibecheck` if you want, 4 taps and I'll "
+                    "match your vibe faster. totally optional, I'll pick it up naturally either way)",
+                    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+                )
+            except discord.HTTPException:
+                pass
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AIChat(bot))
@@ -6275,6 +6957,7 @@ import aiohttp
 
 from utils import groq_client
 from utils import openrouter_client
+from utils import persona_engine
 
 logger = logging.getLogger("lucy.nim_client")
 
@@ -6580,6 +7263,7 @@ def build_system_prompt(
     response_style: str | None = None,
     can_use_tools: bool = False,
     relationship_tier: str | None = None,
+    adaptation_note: str | None = None,
     news_digest: str | None = None,
     server_vibe: str | None = None,
 ) -> str:
@@ -6610,6 +7294,14 @@ def build_system_prompt(
                 f"\n\nYour relationship with this specific person so far: **{relationship_tier}**. "
                 f"{tier_note} This should shape tone, not override your core personality or boundaries."
             )
+
+    # Adaptive persona (utils/persona_engine.py): a second, independent dial
+    # from relationship_tier above — that one tracks how CLOSE you are with
+    # someone, this one tracks HOW they like to be talked to regardless of
+    # closeness. Only present once there's real signal (see
+    # persona_engine.render_adaptation_layer / MIN_CONFIDENCE_TO_RENDER).
+    if adaptation_note:
+        prompt += "\n\n" + adaptation_note
 
     prompt += (
         "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
@@ -7122,6 +7814,51 @@ async def summarize_user_notes(display_name: str, recent_messages: list[str], ex
     if result.strip().upper() == "NONE":
         return existing_notes
     return result.strip()
+
+
+async def infer_style_signals(display_name: str, recent_messages: list[str]) -> dict[str, float] | None:
+    """Small, cheap read on this user's communication-style axes (see
+    utils/persona_engine.py) from a batch of their recent messages. Same
+    cost profile and cadence as summarize_user_notes above (Groq first,
+    NIM fallback) — called right alongside it in cogs/ai_chat.py's
+    NOTES_UPDATE_INTERVAL block, so this doesn't add a new background-task
+    tier of its own. Returns None if there's nothing usable (empty input,
+    a failed call, or a reply that doesn't parse) — callers should treat
+    that as "no change this pass," not an error."""
+    if not recent_messages:
+        return None
+
+    convo = "\n".join(recent_messages[-20:])
+    axis_lines = "\n".join(f"- {axis}: {desc}" for axis, desc in persona_engine.AXES.items())
+    system = (
+        "You read a Discord user's recent messages and estimate small nudges (-10 to 10 "
+        "integers) on communication-style axes, based ONLY on clear evidence in these "
+        f"specific messages. Axes (each described low vs high):\n{axis_lines}\n"
+        "Output strict JSON only, no prose, no markdown fences, with exactly these keys: "
+        f"{', '.join(persona_engine.AXES.keys())}. Use 0 for any axis with no clear evidence "
+        "in these messages — do not guess. Keep numbers small; this is a gentle nudge, not a verdict."
+    )
+    user_content = f"User: {display_name}\nRecent messages:\n{convo}"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    result = None
+    if groq_client.is_configured():
+        try:
+            result = await groq_client.call_groq(messages, model=groq_client.MODEL_FAST, max_tokens=120, temperature=0.2)
+        except Exception as e:
+            logger.warning("Groq infer_style_signals failed, falling back to NIM: %s", e)
+
+    if result is None:
+        try:
+            result = await call_nim(messages, max_tokens=120, temperature=0.2)
+        except Exception as e:
+            logger.warning("infer_style_signals failed, skipping this pass: %s", e)
+            return None
+
+    return persona_engine.parse_inferred_deltas(result)
 </file>
 
 </files>

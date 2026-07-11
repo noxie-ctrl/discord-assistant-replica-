@@ -68,6 +68,19 @@ DEFAULT_CHANNEL_REDIRECTION_HINTS = {
 }
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
+# Tool-loop bug fix (this session): the old code allowed exactly ONE round
+# of tool calls before forcing a tools=None finalization pass. Fine for a
+# single action, but it silently broke multi-step requests — "make a role
+# and give it to Alice, Bob, and Carol" needs create_role PLUS one
+# assign_role per person, and a model will often only emit one or two
+# tool_calls per turn, intending to keep going after seeing the results.
+# Under the single-round version, that continuation never happened: the
+# finalization pass had no tools available, so the model just wrote a
+# reply describing the rest of the job as done. MAX_TOOL_ITERATIONS caps
+# how many rounds of real tool-calling Lucy gets per message — high enough
+# for realistic multi-step actions, low enough that a confused/looping
+# model can't hammer the API forever on one message.
+MAX_TOOL_ITERATIONS = 5
 OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
 VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a busy vent channel
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
@@ -211,6 +224,19 @@ def resolve_idle_chatter_channel_ids(
     if fallback_channel_id:
         return [fallback_channel_id]
     return []
+
+
+def summarize_tool_results_for_fallback(tool_results: list[tuple[str, str]]) -> str:
+    """Pure helper (unit-testable): if the model comes back with empty
+    content after a round of real tool calls, this builds the reply from
+    what the tools actually reported instead of the old behavior — a
+    hardcoded "Done." string that asserted success even when a tool call
+    had failed or only partially completed. tool_results is a list of
+    (tool_name, result_string) pairs in call order, exactly what
+    AIChat._handle_chat's tool loop accumulates below."""
+    if not tool_results:
+        return "Sorry, I got tangled up mid-thought there — try that again?"
+    return "Here's what actually happened: " + " ".join(result for _, result in tool_results)
 
 
 def format_member_lookup(data: dict) -> str:
@@ -1003,36 +1029,58 @@ class AIChat(commands.Cog):
 
         await self._maybe_attach_image_context(message, chat_messages)
 
-        # 6. Call the model (semaphore-capped), with tool support
+        # 6. Call the model (semaphore-capped), with tool support. This is a
+        # real multi-step loop now (see MAX_TOOL_ITERATIONS above) — Lucy can
+        # call a tool, see the result, and call another before ever writing
+        # a word to the user, instead of being cut off after one round.
         try:
-            async with self._nim_semaphore:
-                tools = (
-                    nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
-                    + (nim_client.TOOLS if can_use_tools else [])
-                )
-                assistant_message = await nim_client.call_nim_with_tools(
-                    chat_messages, tools=tools, max_tokens=max_tokens
-                )
+            tools = (
+                nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
+                + (nim_client.TOOLS if can_use_tools else [])
+            )
+            tool_results_log: list[tuple[str, str]] = []
+            reply = None
 
-                if assistant_message.get("tool_calls"):
-                    chat_messages.append(assistant_message)
-                    for tool_call in assistant_message["tool_calls"]:
-                        result = await self._execute_tool_call(tool_call, message)
-                        chat_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.get("id", ""),
-                            "content": result,
-                        })
-                    # One more round trip to let Lucy phrase the final reply
-                    async with self._nim_semaphore:
-                        final_message = await nim_client.call_nim_with_tools(
-                            chat_messages, tools=None, max_tokens=max_tokens
-                        )
-                    reply = (final_message.get("content") or "Done.").strip()
-                else:
+            for _ in range(MAX_TOOL_ITERATIONS):
+                async with self._nim_semaphore:
+                    assistant_message = await nim_client.call_nim_with_tools(
+                        chat_messages, tools=tools, max_tokens=max_tokens
+                    )
+
+                if not assistant_message.get("tool_calls"):
                     reply = (assistant_message.get("content") or "").strip()
+                    break
 
-                reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
+                chat_messages.append(assistant_message)
+                for tool_call in assistant_message["tool_calls"]:
+                    result = await self._execute_tool_call(tool_call, message)
+                    tool_results_log.append((tool_call["function"]["name"], result))
+                    chat_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", ""),
+                        "content": result,
+                    })
+                # Loop again: Lucy now has these results and can either call
+                # more tools (multi-step actions) or write the real reply.
+
+            if reply is None:
+                # Hit MAX_TOOL_ITERATIONS while she still wanted to call
+                # tools — force one last plain-text pass with no tools
+                # available, so a stuck/looping model can't spin forever.
+                async with self._nim_semaphore:
+                    final_message = await nim_client.call_nim_with_tools(
+                        chat_messages, tools=None, max_tokens=max_tokens
+                    )
+                reply = (final_message.get("content") or "").strip()
+
+            if not reply:
+                # Tool-honesty fix (this session): used to default to a
+                # hardcoded "Done." here, which asserted success even when
+                # a tool call had failed or partially completed. Ground the
+                # fallback in what actually happened instead.
+                reply = summarize_tool_results_for_fallback(tool_results_log)
+
+            reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
         except Exception:
             logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
             await message.reply(

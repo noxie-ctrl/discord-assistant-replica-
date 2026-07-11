@@ -6,6 +6,7 @@ from cogs.ai_chat import (
     classify_reply_depth,
     extract_image_urls_from_attachments,
     extract_image_urls_from_embeds,
+    summarize_tool_results_for_fallback,
 )
 
 
@@ -84,6 +85,39 @@ class ImageUrlExtractionTests(unittest.TestCase):
     def test_handles_no_embeds(self):
         self.assertEqual(extract_image_urls_from_embeds([]), [])
         self.assertEqual(extract_image_urls_from_embeds(None), [])
+
+
+class ToolHonestyFallbackTests(unittest.TestCase):
+    """Regression coverage for the 'stop saying Done. when nothing was
+    confirmed' fix — this is what AIChat._handle_chat's tool loop falls
+    back on when the model returns empty content after a round of real
+    tool calls, instead of the old hardcoded 'Done.' string."""
+
+    def test_no_tool_calls_gives_generic_apology_not_done(self):
+        result = summarize_tool_results_for_fallback([])
+        self.assertNotIn("Done.", result)
+        self.assertIn("try that again", result.lower())
+
+    def test_single_success_is_reflected_verbatim(self):
+        result = summarize_tool_results_for_fallback(
+            [("create_role", "Success: created role 'Raiders'.")]
+        )
+        self.assertIn("Success: created role 'Raiders'.", result)
+
+    def test_mixed_success_and_failure_both_show_up(self):
+        # The real-world case this exists for: "make a role and give it to
+        # Alice, Bob, and Carol" where Bob's name doesn't resolve — the
+        # fallback must not silently drop the failure and imply everyone
+        # got it.
+        result = summarize_tool_results_for_fallback([
+            ("create_role", "Success: created role 'Raiders'."),
+            ("assign_role", "Success: gave Alice the 'Raiders' role."),
+            ("assign_role", "Error: no member named 'bobb' found."),
+            ("assign_role", "Success: gave Carol the 'Raiders' role."),
+        ])
+        self.assertIn("Alice", result)
+        self.assertIn("Error: no member named 'bobb' found.", result)
+        self.assertIn("Carol", result)
 
 
 if __name__ == "__main__":
