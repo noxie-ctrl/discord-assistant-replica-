@@ -44,6 +44,7 @@ cogs/
   __init__.py
   ai_chat.py
   games.py
+  github.py
   moderation.py
   news.py
   personality.py
@@ -63,12 +64,16 @@ utils/
   awareness.py
   database.py
   facts.py
+  github_client.py
+  github_summarizer.py
   groq_client.py
+  k.py
   nim_client.py
   openrouter_client.py
   permissions.py
 .gitignore
 main.py
+PASSENGERS.dat
 personality_default.json
 Procfile
 README.md
@@ -77,6 +82,47 @@ requirements.txt
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="utils/k.py">
+import pickle
+def create():
+    f = open("PASSENGERS.dat", "wb")
+    PNR = input("Enter PNR Number: ")
+    PName = input("Enter Passenger Name: ")
+    BRDSTN = input("Enter Boarding Station: ")
+    DESTN = input("Enter Destination: ")
+    FARE = input("Enter Fare: ")
+    Data = [PNR, PName, BRDSTN, DESTN, FARE]
+    pickle.dump(Data, f)
+    f.close()
+
+def searchDestn(D):
+    f = open("PASSENGERS.dat", "rb")
+    Data = pickle.load(f)
+    D = input("Enter Destination: ")
+    if D == Data[3]:
+        print("Record Found")
+        print("PNR Number: ", Data[0])
+        print("Passenger Name: ", Data[1])
+        print("Boarding Station: ", Data[2])
+        print("Destination: ", Data[3])
+        print("Fare: ", Data[4])
+    else:
+        print("No Record Found")
+    f.close()
+
+
+create()
+searchDestn(D = input("Enter Destination to search: "))
+
+def updateFare(): #to increase fare by 5% and rewrite the file
+    f = open("PASSENGERS.dat", "rb+")
+    Data = pickle.load(f)
+    Data[4] = str(float(Data[4]) * 1.05)
+    f.seek(0)
+    pickle.dump(Data, f)
+    f.close()
+</file>
 
 <file path="cogs/__init__.py">
 
@@ -662,10 +708,6 @@ if __name__ == "__main__":
     unittest.main()
 </file>
 
-<file path="tests/test_facts.py">
-
-</file>
-
 <file path="tests/test_idle_chatter_channels.py">
 import unittest
 
@@ -942,6 +984,103 @@ async def search_fact(query: str) -> str:
         return f"Couldn't look that up right now — the fact-check service didn't respond in time."
 </file>
 
+<file path="utils/github_summarizer.py">
+"""
+utils/github_summarizer.py
+
+Turns raw GitHub API data into short, plain-English blurbs for cogs/github.py
+to post — "what actually changed" instead of a wall of raw commit messages
+or a bare PR title. Same cheap-background-task pattern as
+summarize_user_notes() in nim_client.py: try Groq first (fast, free,
+plenty for a couple of sentences), fall back to NIM if Groq isn't
+configured or fails, and fall back to a plain non-AI rendering if both are
+unavailable so the feature never goes silent just because a summarizer call
+failed.
+"""
+
+import logging
+
+from utils import groq_client
+from utils import nim_client
+
+logger = logging.getLogger("lucy.github_summarizer")
+
+_SYSTEM = (
+    "You write extremely short, plain-English summaries of software changes for a "
+    "Discord channel of teammates, some non-technical. 1-2 sentences, no preamble, "
+    "no markdown headers, no bullet points unless there are genuinely 3+ distinct "
+    "changes. Say what changed and why it matters, not a restatement of the commit "
+    "message. Never invent details that aren't in the input."
+)
+
+
+async def _summarize(user_content: str, max_tokens: int = 120) -> str | None:
+    """Returns None (rather than raising) on total failure, so callers can
+    fall back to a non-AI rendering instead of dropping the update."""
+    messages = [
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+    if groq_client.is_configured():
+        try:
+            return (await groq_client.call_groq(
+                messages, model=groq_client.MODEL_FAST, max_tokens=max_tokens, temperature=0.3,
+            )).strip()
+        except Exception as e:
+            logger.warning("Groq summarization failed, falling back to NIM: %s", e)
+
+    try:
+        return (await nim_client.call_nim(messages, max_tokens=max_tokens, temperature=0.3)).strip()
+    except Exception as e:
+        logger.warning("NIM summarization also failed, skipping AI summary: %s", e)
+        return None
+
+
+async def summarize_commits(repo: str, branch: str, commits: list[dict]) -> str | None:
+    lines = "\n".join(f"- {c['message']} (by {c['author']})" for c in commits)
+    prompt = (
+        f"Repo: {repo} (branch: {branch})\n"
+        f"New commits, oldest to newest:\n{lines}\n\n"
+        "Summarize what this batch of commits actually accomplishes."
+    )
+    return await _summarize(prompt)
+
+
+async def summarize_pr(repo: str, title: str, body: str, additions: int, deletions: int,
+                          changed_files: int) -> str | None:
+    body = (body or "").strip()[:1500]  # cap so a huge PR description doesn't blow the token budget
+    prompt = (
+        f"Repo: {repo}\n"
+        f"PR title: {title}\n"
+        f"PR description: {body or '(no description given)'}\n"
+        f"Diff size: +{additions}/-{deletions} across {changed_files} file(s)\n\n"
+        "Summarize what this PR does in plain English."
+    )
+    return await _summarize(prompt)
+
+
+async def summarize_digest(guild_name: str, activity: list[dict]) -> str | None:
+    """activity is a list of github_activity_log rows (dicts) covering the
+    past week, most recent first. Produces one consolidated write-up across
+    every repo, not a per-repo breakdown, since the point of the digest is
+    a single skimmable "what happened this week" post."""
+    lines = []
+    for item in activity:
+        label = item["title"] if item["kind"] == "commits" else f"PR: {item['title']}"
+        lines.append(f"- [{item['repo']}] {label}")
+    body = "\n".join(lines)
+
+    prompt = (
+        f"Server: {guild_name}\n"
+        f"All GitHub activity across linked repos in the last 7 days:\n{body}\n\n"
+        "Write a short weekly recap (3-6 sentences, or a few short bullet points if there "
+        "are clearly distinct workstreams) a teammate could read in 10 seconds to catch up "
+        "on what shipped this week. Group related items together rather than listing every "
+        "single one. Don't restate the repo list mechanically — write it like a real update."
+    )
+    return await _summarize(prompt, max_tokens=280)
+</file>
+
 <file path="utils/groq_client.py">
 """
 utils/groq_client.py
@@ -1161,6 +1300,49 @@ class ImageUrlExtractionTests(unittest.TestCase):
     def test_handles_no_embeds(self):
         self.assertEqual(extract_image_urls_from_embeds([]), [])
         self.assertEqual(extract_image_urls_from_embeds(None), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_facts.py">
+import asyncio
+import unittest
+from unittest import mock
+
+from utils import facts
+
+
+class FactsClientTests(unittest.TestCase):
+    def test_get_weather_empty_location_returns_message_not_error(self):
+        result = asyncio.run(facts.get_weather(""))
+        self.assertIn("No location", result)
+
+    def test_search_fact_empty_query_returns_message_not_error(self):
+        result = asyncio.run(facts.search_fact("   "))
+        self.assertIn("No question", result)
+
+    def test_get_weather_network_failure_degrades_gracefully(self):
+        # Regression-style test matching the OpenRouterClientTests pattern:
+        # a network failure should come back as a short honest string, never
+        # an unhandled exception bubbling up into the chat pipeline.
+        with mock.patch.object(facts.aiohttp, "ClientSession", side_effect=RuntimeError("boom")):
+            result = asyncio.run(facts.get_weather("Jaipur"))
+        self.assertIn("Couldn't check the weather", result)
+
+    def test_search_fact_network_failure_degrades_gracefully(self):
+        with mock.patch.object(facts.aiohttp, "ClientSession", side_effect=RuntimeError("boom")):
+            result = asyncio.run(facts.search_fact("FIFA World Cup 2026"))
+        self.assertIn("Couldn't look that up", result)
+
+    def test_describe_weather_code_known(self):
+        self.assertEqual(facts._describe_weather_code(0), "clear sky")
+        self.assertEqual(facts._describe_weather_code(61), "light rain")
+
+    def test_describe_weather_code_unknown_or_missing(self):
+        self.assertEqual(facts._describe_weather_code(None), "conditions unclear")
+        self.assertEqual(facts._describe_weather_code(12345), "conditions unclear")
 
 
 if __name__ == "__main__":
@@ -1505,6 +1687,424 @@ asyncpg>=0.29.0
 python-dotenv>=1.0.0
 </file>
 
+<file path="cogs/github.py">
+"""
+cogs/github.py
+
+Lets a server admin/mod link a GitHub repo to a channel; Lucy then posts an
+update whenever there's new activity on it — new commits pushed to the
+default branch, and pull requests being opened/merged/closed. Polling runs
+in the background (GITHUB_POLL_INTERVAL_MINUTES, default 5) across every
+linked repo on every guild the bot is in.
+
+Commands:
+  /githublink   <repo> [channel]   - link a repo (admin/mod only)
+  /githubunlink <repo>             - remove a link (admin/mod only)
+  /githublinks                     - list repos linked in this server
+  /githubdigest [channel]          - set/clear the weekly recap channel (admin/mod only)
+
+v2 (this session) — "Discord as the project hub":
+  - AI-written summaries (utils/github_summarizer.py) instead of raw commit
+    messages / bare PR titles, so updates are skimmable by non-technical
+    teammates too.
+  - New PRs get their own Discord thread, so review discussion has a home
+    instead of scattering across the main channel.
+  - Every posted update is logged to github_activity_log (utils/database.py)
+    — this backs both the weekly digest and a new search_github_activity
+    tool that lets Lucy answer "what changed in X this week?" in normal
+    chat (see nim_client.py GROUNDING_TOOLS + ai_chat.py's dispatcher).
+  - Weekly digest: a daily-ticking loop that, once a week, posts one
+    consolidated AI recap of everything that happened across every linked
+    repo in a guild, to an admin-configured channel.
+
+State (last_commit_sha, last_pr_check_at) lives in the github_links table
+so it survives restarts — a fresh deploy doesn't dump a repo's entire
+commit history into a channel.
+"""
+
+import os
+import logging
+from datetime import datetime, timezone
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+from utils import database as db
+from utils import github_client
+from utils import github_summarizer
+from utils.permissions import is_admin_or_mod
+
+logger = logging.getLogger("lucy.github")
+
+POLL_INTERVAL_MINUTES = int(os.getenv("GITHUB_POLL_INTERVAL_MINUTES", "5"))
+DIGEST_WEEKDAY = int(os.getenv("GITHUB_DIGEST_WEEKDAY", "0"))  # 0 = Monday
+
+COMMIT_COLOR = discord.Color.dark_grey()
+DIGEST_COLOR = discord.Color.gold()
+PR_COLORS = {
+    "opened": discord.Color.green(),
+    "merged": discord.Color.purple(),
+    "closed": discord.Color.red(),
+}
+PR_VERBS = {"opened": "opened", "merged": "merged", "closed": "closed (not merged)"}
+WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+class GitHub(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        self._poll_loop.start()
+        self._digest_loop.start()
+
+    async def cog_unload(self):
+        self._poll_loop.cancel()
+        self._digest_loop.cancel()
+
+    # -----------------------------------------------------------------
+    # Commands
+    # -----------------------------------------------------------------
+
+    @app_commands.command(name="githublink", description="Link a GitHub repo — get updates on commits and PRs here")
+    @app_commands.describe(
+        repo="owner/repo, or a github.com URL",
+        channel="Where to post updates (defaults to this channel)",
+    )
+    @is_admin_or_mod()
+    async def githublink(self, interaction: discord.Interaction, repo: str, channel: discord.TextChannel = None):
+        await interaction.response.defer()
+        target_channel = channel or interaction.channel
+
+        try:
+            owner, name = github_client.parse_repo(repo)
+        except ValueError as e:
+            await interaction.followup.send(f"❌ {e}")
+            return
+
+        repo_key = f"{owner}/{name}".lower()
+
+        try:
+            info = await github_client.get_repo_info(owner, name)
+        except github_client.RepoNotFound:
+            await interaction.followup.send(
+                f"❌ Couldn't find `{owner}/{name}` — check the name, or if it's private make sure "
+                f"`GITHUB_TOKEN` (with access to it) is configured."
+            )
+            return
+        except github_client.RateLimited as e:
+            await interaction.followup.send(f"⏳ {e}")
+            return
+        except github_client.GitHubError:
+            logger.exception("Failed to fetch repo info for %s", repo_key)
+            await interaction.followup.send("❌ GitHub API error while looking up that repo — try again shortly.")
+            return
+
+        # Baseline the commit cursor at HEAD so linking doesn't immediately
+        # dump the repo's whole recent history into the channel.
+        head_sha = await github_client.get_latest_commit_sha(owner, name, info["default_branch"])
+
+        await db.add_github_link(
+            interaction.guild_id, repo_key, target_channel.id, interaction.user.id,
+            default_branch=info["default_branch"], last_commit_sha=head_sha,
+        )
+
+        embed = discord.Embed(
+            title=f"🔗 Linked {owner}/{name}",
+            description=info["description"] or "\u200b",
+            url=info["html_url"],
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Updates in", value=target_channel.mention)
+        embed.add_field(name="Default branch", value=info["default_branch"])
+        if info["private"]:
+            embed.add_field(name="Note", value="This repo is private — make sure `GITHUB_TOKEN` has access.", inline=False)
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="githubunlink", description="Stop tracking a linked GitHub repo")
+    @app_commands.describe(repo="owner/repo of the linked repo to remove")
+    @is_admin_or_mod()
+    async def githubunlink(self, interaction: discord.Interaction, repo: str):
+        try:
+            owner, name = github_client.parse_repo(repo)
+        except ValueError as e:
+            await interaction.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+        repo_key = f"{owner}/{name}".lower()
+        removed = await db.remove_github_link(interaction.guild_id, repo_key)
+        if removed:
+            await interaction.response.send_message(f"🗑️ Unlinked `{repo_key}`.")
+        else:
+            await interaction.response.send_message(f"`{repo_key}` wasn't linked in this server.", ephemeral=True)
+
+    @app_commands.command(name="githublinks", description="List GitHub repos linked in this server")
+    async def githublinks(self, interaction: discord.Interaction):
+        links = await db.list_github_links(interaction.guild_id)
+        if not links:
+            await interaction.response.send_message("No repos linked yet — use `/githublink` to add one.")
+            return
+
+        lines = []
+        for link in links:
+            channel = interaction.guild.get_channel(link["channel_id"])
+            where = channel.mention if channel else f"channel {link['channel_id']} (missing)"
+            lines.append(f"• **{link['repo']}** → {where}")
+
+        embed = discord.Embed(
+            title="🔗 Linked GitHub repos",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="githubdigest", description="Set (or clear) the weekly GitHub recap channel")
+    @app_commands.describe(channel="Where to post the weekly recap — omit to turn the digest off")
+    @is_admin_or_mod()
+    async def githubdigest(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await db.update_guild_setting(
+            interaction.guild_id,
+            github_digest_channel_id=channel.id if channel else None,
+        )
+        if channel:
+            await interaction.response.send_message(
+                f"📅 Weekly GitHub recap will post in {channel.mention} (next {WEEKDAY_NAMES[DIGEST_WEEKDAY]})."
+            )
+        else:
+            await interaction.response.send_message("📅 Weekly GitHub recap turned off.")
+
+    @app_commands.command(name="githubdigestnow", description="Post a GitHub recap right now (doesn't affect the weekly schedule)")
+    @app_commands.describe(channel="Where to post it (defaults to the configured digest channel, or this channel)")
+    async def githubdigestnow(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
+        await interaction.response.defer()
+        target_channel = channel
+        if not target_channel:
+            settings = await db.get_guild_settings(interaction.guild_id)
+            digest_channel_id = settings.get("github_digest_channel_id")
+            target_channel = interaction.guild.get_channel(digest_channel_id) if digest_channel_id else None
+        if not target_channel:
+            target_channel = interaction.channel
+
+        had_activity = await self._send_digest(interaction.guild, target_channel, mark_sent=False)
+        if not had_activity:
+            await interaction.followup.send("No GitHub activity in the last 7 days to recap.")
+        elif target_channel.id != interaction.channel.id:
+            await interaction.followup.send(f"📅 Recap posted in {target_channel.mention}.")
+        else:
+            await interaction.followup.send("📅 Recap posted above.")
+
+    # -----------------------------------------------------------------
+    # Background polling — commits & PRs
+    # -----------------------------------------------------------------
+
+    @tasks.loop(minutes=POLL_INTERVAL_MINUTES)
+    async def _poll_loop(self):
+        try:
+            await self._check_all_links()
+        except Exception:
+            logger.exception("GitHub poll loop failed")
+
+    @_poll_loop.before_loop
+    async def _before_poll_loop(self):
+        await self.bot.wait_until_ready()
+
+    async def _check_all_links(self):
+        links = await db.get_all_github_links()
+        for link in links:
+            try:
+                await self._check_link(link)
+            except github_client.RateLimited as e:
+                logger.warning("GitHub rate limited mid-poll, stopping this cycle early: %s", e)
+                return
+            except Exception:
+                logger.exception("Failed checking github link %s for guild %s", link["repo"], link["guild_id"])
+
+    async def _check_link(self, link: dict):
+        guild = self.bot.get_guild(link["guild_id"])
+        if not guild:
+            return
+        channel = guild.get_channel(link["channel_id"])
+        if not channel:
+            return
+
+        owner, name = link["repo"].split("/", 1)
+
+        if link.get("notify_commits", True):
+            await self._check_commits(link, owner, name, channel)
+        if link.get("notify_prs", True):
+            await self._check_prs(link, owner, name, channel)
+
+    async def _check_commits(self, link: dict, owner: str, name: str, channel: discord.TextChannel):
+        branch = link["default_branch"] or "main"
+        head_sha = await github_client.get_latest_commit_sha(owner, name, branch)
+        if not head_sha:
+            return
+
+        old_sha = link["last_commit_sha"]
+        if old_sha == head_sha:
+            return
+        if not old_sha:
+            # First time we've ever checked this link (shouldn't normally
+            # happen — /githublink baselines it — but covers edge cases).
+            await db.update_github_link_state(link["guild_id"], link["repo"], last_commit_sha=head_sha)
+            return
+
+        commits = await github_client.get_new_commits(owner, name, old_sha, head_sha)
+        if not commits:
+            # Compare failed (e.g. force-push) — resync quietly rather than spam.
+            await db.update_github_link_state(link["guild_id"], link["repo"], last_commit_sha=head_sha)
+            return
+
+        summary = await github_summarizer.summarize_commits(link["repo"], branch, commits)
+
+        embed = discord.Embed(
+            title=f"📦 {len(commits)} new commit{'s' if len(commits) != 1 else ''} on {link['repo']}@{branch}",
+            color=COMMIT_COLOR,
+            url=f"https://github.com/{owner}/{name}/commits/{branch}",
+        )
+        if summary:
+            embed.description = f"**{summary}**"
+        raw_lines = [f"[`{c['sha']}`]({c['url']}) {c['message']} — *{c['author']}*" for c in commits[:8]]
+        embed.add_field(name="Commits", value="\n".join(raw_lines), inline=False)
+
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Missing permission to post in channel %s for repo %s", channel.id, link["repo"])
+
+        await db.log_github_activity(
+            link["guild_id"], link["repo"], "commits", head_sha[:7],
+            title=summary or f"{len(commits)} commit(s) pushed",
+            detail="; ".join(c["message"] for c in commits),
+            author=commits[0]["author"] if commits else None,
+            url=f"https://github.com/{owner}/{name}/commits/{branch}",
+        )
+        await db.update_github_link_state(link["guild_id"], link["repo"], last_commit_sha=head_sha)
+
+    async def _check_prs(self, link: dict, owner: str, name: str, channel: discord.TextChannel):
+        since = link["last_pr_check_at"]
+        now = discord.utils.utcnow()
+        events = await github_client.get_recent_pull_events(owner, name, since)
+
+        for event in events:
+            summary = None
+            size = None
+            if event["type"] == "opened":
+                pr_details = await github_client.get_pull_request(owner, name, event["number"])
+                if pr_details:
+                    size = github_client.pr_size_label(pr_details["additions"], pr_details["deletions"])
+                    summary = await github_summarizer.summarize_pr(
+                        link["repo"], event["title"], pr_details["body"],
+                        pr_details["additions"], pr_details["deletions"], pr_details["changed_files"],
+                    )
+
+            title = f"🔀 PR #{event['number']} {PR_VERBS.get(event['type'], event['type'])} on {link['repo']}"
+            if size:
+                title += f" ({size})"
+            embed = discord.Embed(
+                title=title,
+                description=summary or event["title"],
+                url=event["url"],
+                color=PR_COLORS.get(event["type"], discord.Color.greyple()),
+            )
+            if summary:
+                embed.add_field(name="Title", value=event["title"], inline=False)
+            embed.set_footer(text=f"by {event['user']}")
+
+            sent_message = None
+            try:
+                sent_message = await channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.warning("Missing permission to post in channel %s for repo %s", channel.id, link["repo"])
+                break
+
+            if event["type"] == "opened" and sent_message:
+                try:
+                    await sent_message.create_thread(
+                        name=f"PR #{event['number']}: {event['title'][:80]}",
+                        auto_archive_duration=1440,
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning("Couldn't create PR thread in %s: %s", channel.id, e)
+
+            await db.log_github_activity(
+                link["guild_id"], link["repo"], "pr", str(event["number"]),
+                title=event["title"], detail=summary, author=event["user"], url=event["url"],
+            )
+
+        await db.update_github_link_state(link["guild_id"], link["repo"], last_pr_check_at=now)
+
+    # -----------------------------------------------------------------
+    # Weekly digest
+    # -----------------------------------------------------------------
+
+    @tasks.loop(hours=24)
+    async def _digest_loop(self):
+        try:
+            await self._maybe_send_digests()
+        except Exception:
+            logger.exception("GitHub weekly digest loop failed")
+
+    @_digest_loop.before_loop
+    async def _before_digest_loop(self):
+        await self.bot.wait_until_ready()
+
+    async def _maybe_send_digests(self):
+        if datetime.now(timezone.utc).weekday() != DIGEST_WEEKDAY:
+            return
+        due = await db.get_guilds_due_for_digest()
+        for settings in due:
+            try:
+                guild = self.bot.get_guild(settings["guild_id"])
+                if not guild:
+                    continue
+                channel = guild.get_channel(settings["github_digest_channel_id"])
+                if not channel:
+                    continue
+                await self._send_digest(guild, channel, mark_sent=True)
+            except Exception:
+                logger.exception("Failed sending GitHub digest for guild %s", settings["guild_id"])
+
+    async def _send_digest(self, guild: discord.Guild, channel: discord.TextChannel, mark_sent: bool) -> bool:
+        """Builds and posts the recap. Returns True if there was activity to
+        report. mark_sent=False (used by the manual /githubdigestnow
+        command) doesn't touch the scheduled loop's weekly cursor, so
+        running it on demand never skips or delays the real weekly post."""
+        activity = await db.get_recent_github_activity(guild.id, days=7, limit=100)
+        if not activity:
+            if mark_sent:
+                await db.mark_digest_sent(guild.id)  # nothing happened — don't retry daily until next week
+            return False
+
+        summary = await github_summarizer.summarize_digest(guild.name, activity)
+        commit_batches = sum(1 for a in activity if a["kind"] == "commits")
+        pr_events = sum(1 for a in activity if a["kind"] == "pr")
+        repos = sorted({a["repo"] for a in activity})
+
+        embed = discord.Embed(
+            title="📅 GitHub recap — last 7 days",
+            description=summary or "No AI summary available — see the raw activity below.",
+            color=DIGEST_COLOR,
+        )
+        embed.add_field(name="Repos", value=", ".join(repos), inline=False)
+        embed.add_field(name="Commit batches", value=str(commit_batches))
+        embed.add_field(name="PR events", value=str(pr_events))
+
+        try:
+            await channel.send(embed=embed)
+        except discord.Forbidden:
+            logger.warning("Missing permission to post digest in channel %s for guild %s", channel.id, guild.id)
+
+        if mark_sent:
+            await db.mark_digest_sent(guild.id)
+        return True
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(GitHub(bot))
+</file>
+
 <file path="tests/test_openrouter_client.py">
 import asyncio
 import os
@@ -1547,6 +2147,350 @@ class OpenRouterClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+</file>
+
+<file path="utils/github_client.py">
+"""
+utils/github_client.py
+
+Thin async wrapper around the public GitHub REST API (v3), used by
+cogs/github.py to power the "link a repo to a channel" feature.
+
+No dependency beyond aiohttp (already a requirement). Works unauthenticated
+(60 requests/hour per IP, shared across ALL linked repos on ALL guilds this
+bot instance serves), or authenticated if GITHUB_TOKEN is set in the
+environment (5,000 requests/hour) — strongly recommended once more than a
+couple of repos are linked. GITHUB_TOKEN only needs public_repo / no scopes
+at all for public repos; a fine-grained PAT with read-only "Contents" and
+"Pull requests" access is enough for private repos too.
+"""
+
+import os
+import re
+import base64
+import logging
+from datetime import datetime, timezone
+
+import aiohttp
+
+logger = logging.getLogger("lucy.github_client")
+
+API_BASE = "https://api.github.com"
+
+_REPO_URL_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+_REPO_SHORT_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$")
+
+
+class GitHubError(Exception):
+    """Raised for anything that isn't a clean 200 from the GitHub API."""
+
+
+class RepoNotFound(GitHubError):
+    pass
+
+
+class RateLimited(GitHubError):
+    pass
+
+
+def parse_repo(text: str) -> tuple[str, str]:
+    """Accepts 'owner/repo', a full/partial github.com URL, or an SSH-style
+    URL, and returns (owner, repo). Raises ValueError if it can't be parsed."""
+    text = text.strip()
+    text = re.sub(r"^git@github\.com:", "https://github.com/", text)
+
+    match = _REPO_URL_RE.match(text) or _REPO_SHORT_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"Couldn't parse '{text}' as a GitHub repo. Use `owner/repo` or a github.com URL."
+        )
+    owner, repo = match.group(1), match.group(2)
+    return owner, repo
+
+
+def _headers() -> dict:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "lucy-discord-bot",
+    }
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+async def _get(session: aiohttp.ClientSession, url: str, params: dict | None = None):
+    async with session.get(url, params=params, headers=_headers()) as resp:
+        if resp.status == 404:
+            raise RepoNotFound(url)
+        if resp.status == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
+            raise RateLimited("GitHub API rate limit hit — set GITHUB_TOKEN for a higher limit.")
+        if resp.status >= 400:
+            body = await resp.text()
+            raise GitHubError(f"GitHub API {resp.status} for {url}: {body[:300]}")
+        return await resp.json()
+
+
+async def get_repo_info(owner: str, repo: str) -> dict:
+    """Validates the repo exists (and is reachable with current auth) and
+    returns a small dict: default_branch, description, html_url, private, stars."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}")
+    return {
+        "default_branch": data.get("default_branch") or "main",
+        "description": data.get("description") or "",
+        "html_url": data.get("html_url") or f"https://github.com/{owner}/{repo}",
+        "private": bool(data.get("private")),
+        "stars": data.get("stargazers_count", 0),
+    }
+
+
+async def get_latest_commit_sha(owner: str, repo: str, branch: str) -> str | None:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/commits/{branch}")
+        except RepoNotFound:
+            return None
+    return data.get("sha")
+
+
+async def get_new_commits(owner: str, repo: str, base_sha: str, head_sha: str, limit: int = 8) -> list[dict]:
+    """Commits reachable from head_sha but not base_sha, newest first. Falls
+    back to an empty list (rather than raising) if the compare fails — e.g.
+    base_sha was force-pushed away — so the caller can just resync quietly."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}")
+        except GitHubError as e:
+            logger.warning("Compare failed for %s/%s (%s...%s): %s", owner, repo, base_sha, head_sha, e)
+            return []
+
+    commits = data.get("commits", [])[-limit:]
+    out = []
+    for c in reversed(commits):  # newest first
+        commit_info = c.get("commit", {})
+        author = commit_info.get("author", {}) or {}
+        message = (commit_info.get("message") or "").split("\n", 1)[0]  # first line only
+        out.append({
+            "sha": c.get("sha", "")[:7],
+            "message": message,
+            "author": author.get("name") or (c.get("author") or {}).get("login") or "unknown",
+            "url": c.get("html_url", ""),
+        })
+    return out
+
+
+async def get_pull_request(owner: str, repo: str, number: int) -> dict | None:
+    """Full PR details — body/description and diff stats — used for the AI
+    summary and size label. Returns None on any failure rather than raising,
+    since callers treat this as a best-effort enrichment."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+        except GitHubError as e:
+            logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
+            return None
+    return {
+        "body": data.get("body") or "",
+        "merged": bool(data.get("merged_at")),
+        "additions": data.get("additions", 0),
+        "deletions": data.get("deletions", 0),
+        "changed_files": data.get("changed_files", 0),
+    }
+
+
+def pr_size_label(additions: int, deletions: int) -> str:
+    total = additions + deletions
+    if total <= 20:
+        return "XS"
+    if total <= 100:
+        return "S"
+    if total <= 400:
+        return "M"
+    if total <= 1000:
+        return "L"
+    return "XL"
+
+
+async def get_recent_pull_events(owner: str, repo: str, since: datetime, limit: int = 10) -> list[dict]:
+    """Pull request activity (opened, merged, closed-without-merge) updated
+    since the given UTC datetime. Uses the /issues endpoint (which supports
+    `since`) filtered down to items that are actually PRs, then resolves
+    closed ones against /pulls/{number} to distinguish merged vs closed."""
+    since_iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timeout = aiohttp.ClientTimeout(total=10)
+    events: list[dict] = []
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            issues = await _get(
+                session,
+                f"{API_BASE}/repos/{owner}/{repo}/issues",
+                params={"since": since_iso, "state": "all", "sort": "updated",
+                        "direction": "asc", "per_page": str(limit * 2)},
+            )
+        except GitHubError as e:
+            logger.warning("Issue/PR listing failed for %s/%s: %s", owner, repo, e)
+            return []
+
+        prs = [i for i in issues if "pull_request" in i][-limit:]
+
+        for pr in prs:
+            number = pr["number"]
+            created_at = _parse_ts(pr.get("created_at"))
+            closed_at = _parse_ts(pr.get("closed_at"))
+
+            if created_at and created_at > since:
+                events.append({
+                    "type": "opened", "number": number, "title": pr.get("title", ""),
+                    "url": pr.get("html_url", ""), "user": (pr.get("user") or {}).get("login", "someone"),
+                })
+                continue  # don't also report it as closed in the same cycle
+
+            if pr.get("state") == "closed" and closed_at and closed_at > since:
+                try:
+                    full = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+                    merged = bool(full.get("merged_at"))
+                except GitHubError:
+                    merged = False
+                events.append({
+                    "type": "merged" if merged else "closed", "number": number,
+                    "title": pr.get("title", ""), "url": pr.get("html_url", ""),
+                    "user": (pr.get("user") or {}).get("login", "someone"),
+                })
+
+    return events
+
+
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Codebase browsing — powers "ask Lucy about the repo" (see
+# get_repo_overview / search_repo_code / read_repo_file tools in
+# nim_client.py, dispatched from cogs/ai_chat.py).
+# ---------------------------------------------------------------------------
+
+MAX_FILE_CHARS = 12000     # keeps a single file read within a sane token budget
+MAX_TREE_ENTRIES = 400     # cap on how many paths get_repo_tree returns
+NOISE_DIR_PREFIXES = (
+    "node_modules/", ".git/", "dist/", "build/", "__pycache__/", ".venv/", "venv/",
+    ".next/", "target/", "vendor/", ".pytest_cache/",
+)
+NOISE_FILE_SUFFIXES = (".lock", ".min.js", ".map", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2")
+
+
+async def get_readme(owner: str, repo: str) -> str | None:
+    """Decoded README text (any of the names GitHub recognizes), or None if
+    the repo has none / it can't be fetched."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/readme")
+        except GitHubError:
+            return None
+    return _decode_content(data)
+
+
+async def get_repo_tree(owner: str, repo: str, branch: str) -> list[str]:
+    """Every file path in the repo at `branch` (recursive git tree), minus
+    obvious noise directories/files, capped to MAX_TREE_ENTRIES. Used to
+    give the model a sense of project layout for broad questions."""
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(
+                session, f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
+                params={"recursive": "1"},
+            )
+        except GitHubError as e:
+            logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
+            return []
+
+    paths = []
+    for entry in data.get("tree", []):
+        if entry.get("type") != "blob":
+            continue
+        path = entry.get("path", "")
+        if any(path.startswith(p) for p in NOISE_DIR_PREFIXES):
+            continue
+        if any(path.endswith(s) for s in NOISE_FILE_SUFFIXES):
+            continue
+        paths.append(path)
+        if len(paths) >= MAX_TREE_ENTRIES:
+            break
+    return paths
+
+
+async def get_file_content(owner: str, repo: str, path: str, ref: str) -> str | None:
+    """Decoded text content of a single file at `path`, truncated to
+    MAX_FILE_CHARS. Returns None if the file doesn't exist, is binary, or
+    is too large to be worth returning."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            data = await _get(
+                session, f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
+                params={"ref": ref},
+            )
+        except GitHubError as e:
+            logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
+            return None
+
+    if isinstance(data, list):
+        return None  # path was a directory, not a file
+    return _decode_content(data)
+
+
+def _decode_content(data: dict) -> str | None:
+    if data.get("encoding") != "base64" or "content" not in data:
+        return None
+    try:
+        raw = base64.b64decode(data["content"])
+        text = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None  # binary file
+    if len(text) > MAX_FILE_CHARS:
+        text = text[:MAX_FILE_CHARS] + "\n... (truncated)"
+    return text
+
+
+async def search_code(owner: str, repo: str, query: str, limit: int = 5) -> list[dict]:
+    """GitHub code search, scoped to one repo. Requires GITHUB_TOKEN — the
+    search API rejects unauthenticated requests entirely, so this raises
+    GitHubError with a clear message if no token is configured, which
+    callers should surface to the user rather than silently returning
+    nothing."""
+    if not os.getenv("GITHUB_TOKEN", "").strip():
+        raise GitHubError(
+            "Code search needs a GITHUB_TOKEN configured (GitHub's search API doesn't allow "
+            "unauthenticated requests) — the repo link and update features still work without one."
+        )
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        data = await _get(
+            session, f"{API_BASE}/search/code",
+            params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
+        )
+
+    results = []
+    for item in data.get("items", [])[:limit]:
+        results.append({"path": item.get("path", ""), "url": item.get("html_url", "")})
+    return results
 </file>
 
 <file path=".gitignore">
@@ -2811,6 +3755,7 @@ COGS = [
     "cogs.news",
     "cogs.preferences",
     "cogs.serverlog",
+    "cogs.github",
 ]
 
 
@@ -3162,6 +4107,52 @@ avoids pinning one that goes stale; set `OPENROUTER_MODEL` if you'd rather pin s
 specific. If you don't set OpenRouter keys, vision and the 4th fallback tier stay off and
 Lucy still works normally on NIM + Groq.
 
+Optional GitHub repo updates (commits + PRs posted to a channel):
+```
+GITHUB_TOKEN=...                    # optional but recommended, see below
+GITHUB_POLL_INTERVAL_MINUTES=5      # optional, defaults to 5
+GITHUB_DIGEST_WEEKDAY=0             # optional, defaults to 0 (Monday); 0=Mon ... 6=Sun
+```
+Works with no token at all for public repos (GitHub allows 60 unauthenticated
+requests/hour, shared across every repo linked on every server this bot is in — fine for
+a repo or two, tight beyond that). Create a token at
+https://github.com/settings/tokens (a classic token with the `repo` scope works for
+private repos; no scopes are needed for public-repo read access) to raise that to
+5,000 requests/hour and to let Lucy see private repos. Then in Discord:
+```
+/githublink repo:owner/repo [channel:#dev-updates]   # admin/mod only
+/githubunlink repo:owner/repo                        # admin/mod only
+/githublinks                                         # anyone — lists what's linked
+/githubdigest [channel:#dev-updates]                 # admin/mod only — set/clear weekly recap
+/githubdigestnow [channel:#dev-updates]               # anyone — post a recap right now
+```
+Lucy checks every linked repo on a timer (`GITHUB_POLL_INTERVAL_MINUTES`) and posts an
+embed to the linked channel for new commits and for PRs being opened, merged, or closed.
+Linking a repo baselines it at the current HEAD, so you get updates going forward rather
+than a dump of the whole commit history. A few things aimed at making Discord the actual
+hub for a group project rather than just a notification feed:
+- **AI summaries** — commit batches and new PRs get a short, plain-English "what this
+  actually does" blurb (Groq/NIM, same engines as chat) instead of raw commit messages,
+  so non-technical teammates can follow along too. New PRs also get a rough size label
+  (XS/S/M/L/XL) based on lines changed.
+- **Auto-threads on new PRs** — each new PR spins up a Discord thread on its
+  announcement message, so review discussion has a home instead of spreading across the
+  main channel.
+- **Weekly recap** (`/githubdigest`) — once a week (`GITHUB_DIGEST_WEEKDAY`), Lucy posts
+  one consolidated AI write-up of everything that happened across every linked repo —
+  meant to be read in ~10 seconds to catch up on the week. `/githubdigestnow` posts one
+  on demand (e.g. before a meeting) without disturbing the weekly schedule.
+- **Ask Lucy about activity** — since every update is logged, you can just ask her things
+  like "what changed in the database repo this week?" in normal chat and she'll answer
+  from that history instead of guessing.
+- **Ask Lucy about the actual codebase** — she can also read the repo itself: broad
+  questions ("what does this project do", "how's it organized") pull the README and
+  top-level file layout; specific questions ("how is auth handled", "what's in
+  utils/database.py") search the code or read a named file directly and answer from the
+  real content. Code search (not file reading) specifically requires `GITHUB_TOKEN` —
+  GitHub's search API rejects unauthenticated requests — everything else works without
+  one, just at the lower public rate limit.
+
 Testing the vision feature locally
 ---------------------------------
 If you set `OPENROUTER_API_KEY` (and optionally `OPENROUTER_API_KEY_2`), you can test
@@ -3254,6 +4245,7 @@ wrong names and would have broken /setpersonality and /setchattrigger.
 
 import os
 import logging
+from datetime import datetime, timezone
 
 import asyncpg
 
@@ -3389,6 +4381,43 @@ CREATE TABLE IF NOT EXISTS idle_chatter_channels (
     channel_id BIGINT NOT NULL,
     PRIMARY KEY (guild_id, channel_id)
 );
+
+-- GitHub repo link feature: one row per (guild, repo). last_commit_sha /
+-- last_pr_check_at are the polling cursors used by cogs/github.py's
+-- background loop to figure out what's new since the previous check.
+CREATE TABLE IF NOT EXISTS github_links (
+    guild_id BIGINT NOT NULL,
+    repo TEXT NOT NULL,               -- "owner/name", lowercase
+    channel_id BIGINT NOT NULL,
+    added_by BIGINT,
+    default_branch TEXT DEFAULT 'main',
+    last_commit_sha TEXT,
+    last_pr_check_at TIMESTAMPTZ DEFAULT now(),
+    notify_commits BOOLEAN DEFAULT TRUE,
+    notify_prs BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (guild_id, repo)
+);
+
+-- History of everything cogs/github.py has posted (commit batches + PR
+-- events), independent of the github_links polling cursors above. This is
+-- what powers the weekly digest (aggregate over the last 7 days) and the
+-- search_github_activity tool (ai_chat.py answering "what changed in X").
+CREATE TABLE IF NOT EXISTS github_activity_log (
+    id SERIAL PRIMARY KEY,
+    guild_id BIGINT NOT NULL,
+    repo TEXT NOT NULL,
+    kind TEXT NOT NULL,               -- 'commits' or 'pr'
+    ref TEXT,                         -- short sha for commits, PR number (as text) for PRs
+    title TEXT NOT NULL,              -- AI summary (commits) or PR title
+    detail TEXT,                      -- AI summary (PRs) or raw commit lines
+    author TEXT,
+    url TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_github_activity_guild_time
+    ON github_activity_log (guild_id, created_at DESC);
 """
 
 # Tables above only get created if they don't exist — they already exist in
@@ -3401,6 +4430,8 @@ ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS vent_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS channel_redirection_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_digest_channel_id BIGINT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_last_digest_at TIMESTAMPTZ;
 """
 
 
@@ -4013,6 +5044,148 @@ async def set_image_description(cache_key: str, description: str):
 def _normalize_cache_key(key: str) -> str:
     """Internal normalizer for cache keys; kept small for future uses."""
     return key.strip()
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo links
+# ---------------------------------------------------------------------------
+
+async def add_github_link(guild_id: int, repo: str, channel_id: int, added_by: int,
+                            default_branch: str, last_commit_sha: str | None) -> None:
+    """repo is the normalized 'owner/name' string. On conflict (repo already
+    linked in this guild), re-points it at the new channel and resets the
+    polling cursors so the next cycle establishes a fresh baseline instead
+    of dumping old history into the new channel."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO github_links
+                (guild_id, repo, channel_id, added_by, default_branch, last_commit_sha, last_pr_check_at)
+            VALUES ($1, $2, $3, $4, $5, $6, now())
+            ON CONFLICT (guild_id, repo) DO UPDATE
+            SET channel_id = EXCLUDED.channel_id,
+                added_by = EXCLUDED.added_by,
+                default_branch = EXCLUDED.default_branch,
+                last_commit_sha = EXCLUDED.last_commit_sha,
+                last_pr_check_at = now()
+            """,
+            guild_id, repo, channel_id, added_by, default_branch, last_commit_sha,
+        )
+
+
+async def remove_github_link(guild_id: int, repo: str) -> bool:
+    """Returns True if a row was actually deleted."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM github_links WHERE guild_id = $1 AND repo = $2",
+            guild_id, repo,
+        )
+        return result.endswith(" 1")
+
+
+async def list_github_links(guild_id: int) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM github_links WHERE guild_id = $1 ORDER BY repo", guild_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def get_all_github_links() -> list[dict]:
+    """Every linked repo across every guild — used by the background
+    polling loop, which then checks each guild's channel still exists."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM github_links")
+        return [dict(r) for r in rows]
+
+
+async def update_github_link_state(guild_id: int, repo: str, *, last_commit_sha: str | None = None,
+                                     last_pr_check_at=None) -> None:
+    """Partial update of the polling cursors after a background check.
+    Only the fields passed are updated."""
+    updates = {}
+    if last_commit_sha is not None:
+        updates["last_commit_sha"] = last_commit_sha
+    if last_pr_check_at is not None:
+        updates["last_pr_check_at"] = last_pr_check_at
+    if not updates:
+        return
+
+    pool = _require_pool()
+    columns = list(updates.keys())
+    set_clause = ", ".join(f"{col} = ${i + 3}" for i, col in enumerate(columns))
+    query = f"UPDATE github_links SET {set_clause} WHERE guild_id = $1 AND repo = $2"
+    async with pool.acquire() as conn:
+        await conn.execute(query, guild_id, repo, *updates.values())
+
+
+async def log_github_activity(guild_id: int, repo: str, kind: str, ref: str | None, title: str,
+                                 detail: str | None = None, author: str | None = None,
+                                 url: str | None = None) -> None:
+    """kind is 'commits' or 'pr'. Called every time cogs/github.py posts an
+    update, independent of the github_links polling cursors — this is a
+    durable log read by the weekly digest and the search_github_activity
+    tool, not a cursor that gets overwritten."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO github_activity_log (guild_id, repo, kind, ref, title, detail, author, url) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            guild_id, repo, kind, ref, title, detail, author, url,
+        )
+
+
+async def get_recent_github_activity(guild_id: int, repo: str | None = None, days: int = 7,
+                                        limit: int = 30) -> list[dict]:
+    """Used by the search_github_activity tool (ai_chat.py) — recent
+    commit/PR activity, optionally filtered to one repo, most recent
+    first."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        if repo:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM github_activity_log
+                WHERE guild_id = $1 AND repo = $2 AND created_at > now() - ($3 || ' days')::interval
+                ORDER BY created_at DESC LIMIT $4
+                """,
+                guild_id, repo, str(days), limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM github_activity_log
+                WHERE guild_id = $1 AND created_at > now() - ($2 || ' days')::interval
+                ORDER BY created_at DESC LIMIT $3
+                """,
+                guild_id, str(days), limit,
+            )
+        return [dict(r) for r in rows]
+
+
+async def get_guilds_due_for_digest() -> list[dict]:
+    """Guilds with a github_digest_channel_id set whose last digest was
+    sent more than 6 days ago (or never) — the daily digest-check loop
+    calls this and only actually posts on the configured weekday, but this
+    keeps the SQL side of the "has it been a week yet" logic in one place."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM guild_settings
+            WHERE github_digest_channel_id IS NOT NULL
+              AND (github_last_digest_at IS NULL OR github_last_digest_at < now() - interval '6 days')
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_digest_sent(guild_id: int) -> None:
+    await update_guild_setting(guild_id, github_last_digest_at=datetime.now(timezone.utc))
 </file>
 
 <file path="cogs/ai_chat.py">
@@ -4068,6 +5241,7 @@ from utils import groq_client
 from utils import awareness
 from utils import openrouter_client
 from utils import facts
+from utils import github_client
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -4713,6 +5887,104 @@ class AIChat(commands.Cog):
             if not query:
                 return "Error: no query given."
             return await facts.search_fact(query)
+
+        if name == "search_github_activity":
+            repo = (args.get("repo") or "").strip().lower() or None
+            days = args.get("days") or 7
+            try:
+                days = max(1, min(int(days), 30))
+            except (TypeError, ValueError):
+                days = 7
+            activity = await db.get_recent_github_activity(guild.id, repo=repo, days=days)
+            if not activity:
+                scope = f"'{repo}'" if repo else "any linked repo"
+                return f"No GitHub activity found for {scope} in the last {days} day(s)."
+            lines = []
+            for item in activity:
+                if item["kind"] == "commits":
+                    lines.append(f"[{item['repo']}] Commits: {item['title']}")
+                else:
+                    lines.append(f"[{item['repo']}] PR #{item['ref']} \"{item['title']}\" — {item['detail'] or 'no summary'}")
+            return "\n".join(lines)
+
+        if name in ("get_repo_overview", "search_repo_code", "read_repo_file"):
+            return await self._execute_github_repo_tool(name, args, guild)
+
+        return f"Error: unknown tool '{name}'."
+
+    async def _resolve_linked_repo(self, guild: discord.Guild, repo_arg: str | None) -> tuple[dict | None, str]:
+        """Matches a (possibly omitted) repo argument against this guild's
+        linked repos. Returns (link_row_or_None, error_message) — exactly
+        one of which is populated, so callers can just check link first."""
+        links = await db.list_github_links(guild.id)
+        if not links:
+            return None, "Error: no GitHub repos are linked in this server (use /githublink first)."
+
+        if repo_arg:
+            wanted = repo_arg.strip().lower()
+            match = next((l for l in links if l["repo"] == wanted), None)
+            if not match:
+                available = ", ".join(l["repo"] for l in links)
+                return None, f"Error: '{repo_arg}' isn't linked in this server. Linked repos: {available}."
+            return match, ""
+
+        if len(links) == 1:
+            return links[0], ""
+
+        available = ", ".join(l["repo"] for l in links)
+        return None, f"Error: multiple repos are linked — specify one of: {available}."
+
+    async def _execute_github_repo_tool(self, name: str, args: dict, guild: discord.Guild) -> str:
+        repo_arg = (args.get("repo") or "").strip().lower() or None
+        link, error = await self._resolve_linked_repo(guild, repo_arg)
+        if not link:
+            return error
+
+        owner, repo_name = link["repo"].split("/", 1)
+        branch = link["default_branch"] or "main"
+
+        if name == "get_repo_overview":
+            readme = await github_client.get_readme(owner, repo_name)
+            tree = await github_client.get_repo_tree(owner, repo_name, branch)
+            parts = [f"Repo: {link['repo']} (default branch: {branch})"]
+            if readme:
+                parts.append("README (may be truncated):\n" + readme[:3000])
+            else:
+                parts.append("No README found.")
+            if tree:
+                parts.append("Top-level structure:\n" + "\n".join(tree[:150]))
+            return "\n\n".join(parts)
+
+        if name == "search_repo_code":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Error: no search query given."
+            try:
+                results = await github_client.search_code(owner, repo_name, query)
+            except github_client.GitHubError as e:
+                return f"Error: {e}"
+            if not results:
+                return f"No code matches for '{query}' in {link['repo']}."
+
+            chunks = [f"Search results for '{query}' in {link['repo']}:"]
+            for r in results:
+                chunks.append(f"- {r['path']}")
+            # Pull excerpts for the top couple of matches so the model can
+            # actually answer, not just list filenames.
+            for r in results[:2]:
+                content = await github_client.get_file_content(owner, repo_name, r["path"], branch)
+                if content:
+                    chunks.append(f"\n--- {r['path']} (excerpt) ---\n{content[:2000]}")
+            return "\n".join(chunks)
+
+        if name == "read_repo_file":
+            path = (args.get("path") or "").strip().lstrip("/")
+            if not path:
+                return "Error: no file path given."
+            content = await github_client.get_file_content(owner, repo_name, path, branch)
+            if content is None:
+                return f"Error: couldn't read '{path}' in {link['repo']} — it may not exist, be a directory, or be a binary file."
+            return f"{path} in {link['repo']}:\n{content}"
 
         return f"Error: unknown tool '{name}'."
 
@@ -5597,6 +6869,101 @@ GROUNDING_TOOLS = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_github_activity",
+            "description": (
+                "Look up recent commit and pull-request activity from this server's linked "
+                "GitHub repos (see /githublink) — use this whenever someone asks what changed, "
+                "what shipped, what's been worked on, or the status of a repo/feature, instead "
+                "of guessing from memory. Only covers repos actually linked in this server."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": (
+                            "Optional: a specific 'owner/repo' to filter to. Omit to search "
+                            "across every repo linked in this server."
+                        ),
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "How many days back to look. Defaults to 7.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_repo_overview",
+            "description": (
+                "Get a high-level overview of a linked GitHub repo — its README and top-level "
+                "project structure. Use this for broad questions about a project: what it does, "
+                "how it's organized, what tech stack it uses, etc. Only works on repos linked "
+                "with /githublink in this server."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "'owner/repo'. Optional if exactly one repo is linked in this server.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_repo_code",
+            "description": (
+                "Search the actual code of a linked GitHub repo for something specific — a "
+                "function name, a config value, how a feature is implemented, etc. Use this "
+                "for pointed technical questions ('how is auth handled', 'where's the database "
+                "connection set up') rather than get_repo_overview, which is for broad "
+                "questions. Returns matching file paths with excerpts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "'owner/repo' to search within."},
+                    "query": {
+                        "type": "string",
+                        "description": "Code search terms — e.g. a function/class name, keyword, or short phrase.",
+                    },
+                },
+                "required": ["repo", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_repo_file",
+            "description": (
+                "Read the full contents of one specific file from a linked GitHub repo by its "
+                "path — use when someone names an exact file ('what's in utils/database.py', "
+                "'show me main.py') or after search_repo_code points at a file worth reading "
+                "in full."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "'owner/repo'."},
+                    "path": {"type": "string", "description": "File path within the repo, e.g. 'utils/database.py'."},
+                },
+                "required": ["repo", "path"],
             },
         },
     },

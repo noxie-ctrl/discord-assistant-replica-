@@ -40,6 +40,7 @@ import aiohttp
 
 from utils import groq_client
 from utils import openrouter_client
+from utils import persona_engine
 
 logger = logging.getLogger("lucy.nim_client")
 
@@ -345,6 +346,7 @@ def build_system_prompt(
     response_style: str | None = None,
     can_use_tools: bool = False,
     relationship_tier: str | None = None,
+    adaptation_note: str | None = None,
     news_digest: str | None = None,
     server_vibe: str | None = None,
 ) -> str:
@@ -375,6 +377,14 @@ def build_system_prompt(
                 f"\n\nYour relationship with this specific person so far: **{relationship_tier}**. "
                 f"{tier_note} This should shape tone, not override your core personality or boundaries."
             )
+
+    # Adaptive persona (utils/persona_engine.py): a second, independent dial
+    # from relationship_tier above — that one tracks how CLOSE you are with
+    # someone, this one tracks HOW they like to be talked to regardless of
+    # closeness. Only present once there's real signal (see
+    # persona_engine.render_adaptation_layer / MIN_CONFIDENCE_TO_RENDER).
+    if adaptation_note:
+        prompt += "\n\n" + adaptation_note
 
     prompt += (
         "\n\nYou always have a quiet, private way to let the owner know if someone seems to "
@@ -887,3 +897,48 @@ async def summarize_user_notes(display_name: str, recent_messages: list[str], ex
     if result.strip().upper() == "NONE":
         return existing_notes
     return result.strip()
+
+
+async def infer_style_signals(display_name: str, recent_messages: list[str]) -> dict[str, float] | None:
+    """Small, cheap read on this user's communication-style axes (see
+    utils/persona_engine.py) from a batch of their recent messages. Same
+    cost profile and cadence as summarize_user_notes above (Groq first,
+    NIM fallback) — called right alongside it in cogs/ai_chat.py's
+    NOTES_UPDATE_INTERVAL block, so this doesn't add a new background-task
+    tier of its own. Returns None if there's nothing usable (empty input,
+    a failed call, or a reply that doesn't parse) — callers should treat
+    that as "no change this pass," not an error."""
+    if not recent_messages:
+        return None
+
+    convo = "\n".join(recent_messages[-20:])
+    axis_lines = "\n".join(f"- {axis}: {desc}" for axis, desc in persona_engine.AXES.items())
+    system = (
+        "You read a Discord user's recent messages and estimate small nudges (-10 to 10 "
+        "integers) on communication-style axes, based ONLY on clear evidence in these "
+        f"specific messages. Axes (each described low vs high):\n{axis_lines}\n"
+        "Output strict JSON only, no prose, no markdown fences, with exactly these keys: "
+        f"{', '.join(persona_engine.AXES.keys())}. Use 0 for any axis with no clear evidence "
+        "in these messages — do not guess. Keep numbers small; this is a gentle nudge, not a verdict."
+    )
+    user_content = f"User: {display_name}\nRecent messages:\n{convo}"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    result = None
+    if groq_client.is_configured():
+        try:
+            result = await groq_client.call_groq(messages, model=groq_client.MODEL_FAST, max_tokens=120, temperature=0.2)
+        except Exception as e:
+            logger.warning("Groq infer_style_signals failed, falling back to NIM: %s", e)
+
+    if result is None:
+        try:
+            result = await call_nim(messages, max_tokens=120, temperature=0.2)
+        except Exception as e:
+            logger.warning("infer_style_signals failed, skipping this pass: %s", e)
+            return None
+
+    return persona_engine.parse_inferred_deltas(result)

@@ -145,6 +145,10 @@ Run these once, in Discord:
 - `/disableventchannel` / `/ventstatus` — turn vent watching off/on without redeploying
 - `/setlogchannel` — where moderation actions get logged
 - `/setwelcome` — welcome channel + message for new members
+- `/vibecheck` — anyone, 4-tap calibration so Lucy adapts her delivery (blunt vs.
+  gentle, banter vs. sincere, chill vs. hyped, fix-it vs. just-listen) to how you
+  personally like to be talked to. Optional — she picks this up passively from
+  chat either way, this just fast-tracks it. `/myprofile` shows what she's picked up.
 
 ## What's included
 - **Moderation:** ban, kick, mute/unmute (timeout), unban, warn, warnings, purge — logged to your log channel
@@ -155,6 +159,13 @@ Run these once, in Discord:
   real current headlines. She naturally warms up to people over time (acquaintance → friend →
   close friend → best friend, based on how much you've talked and how well it's gone), while
   the owner always gets top priority and candor.
+- **Adaptive persona:** independent of closeness above, Lucy separately reads *how* each
+  person likes to be talked to — blunt vs. gentle, banter vs. sincere, chill vs. hyped,
+  wants-solutions vs. wants-to-vent — and quietly adjusts delivery per person, never her
+  core personality or boundaries. Builds passively from ordinary chat (a cheap lexical read
+  plus a small AI read every 15 messages), or fast-tracked with `/vibecheck` (4 taps, optional).
+  Fully transparent — `/myprofile` shows exactly what's been picked up. See
+  `utils/persona_engine.py`.
 - **Vent support:** quietly flags the owner (privately, via DM) when someone genuinely seems
   to need a real person to check in — separate from normal banter/venting.
 - **Games:** Tic-Tac-Toe, Connect Four (both 2-player), Rock-Paper-Scissors, Guess the Number

@@ -51,6 +51,7 @@ from utils import awareness
 from utils import openrouter_client
 from utils import facts
 from utils import github_client
+from utils import persona_engine
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -888,6 +889,13 @@ class AIChat(commands.Cog):
 
         # 1. Long-term profile bookkeeping (id + username + display name)
         profile = await db.touch_profile(guild.id, author.id, str(author), author.display_name)
+        is_first_message_ever = profile["message_count"] == 1
+
+        # Adaptive persona (utils/persona_engine.py): load this person's
+        # current style axes once per message (cheap — already part of the
+        # touch_profile row, no extra query) so build_system_prompt below
+        # always has a value, even between the periodic update passes.
+        style_profile, style_confidence = persona_engine.load_profile_row(profile)
 
         if profile["message_count"] % NOTES_UPDATE_INTERVAL == 0:
             history = await db.get_chat_history(guild.id, message.channel.id, limit=NOTES_UPDATE_INTERVAL)
@@ -902,6 +910,23 @@ class AIChat(commands.Cog):
                 if new_notes != profile.get("notes"):
                     await db.update_profile_notes(guild.id, author.id, new_notes)
                     profile["notes"] = new_notes
+
+                # Same cadence, same batch of messages — blend a free
+                # lexical read with one small LLM read into this person's
+                # style profile. Anyone who never touches /vibecheck still
+                # gets adapted to, just more gradually.
+                heuristic_deltas = persona_engine.heuristic_signal(recent_from_user)
+                if heuristic_deltas:
+                    style_profile, style_confidence = persona_engine.apply_heuristic_deltas(
+                        style_profile, style_confidence, heuristic_deltas
+                    )
+                inferred_deltas = await nim_client.infer_style_signals(author.display_name, recent_from_user)
+                if inferred_deltas:
+                    style_profile, style_confidence = persona_engine.apply_inferred_deltas(
+                        style_profile, style_confidence, inferred_deltas
+                    )
+                if heuristic_deltas or inferred_deltas:
+                    await db.save_style_profile(guild.id, author.id, style_profile, style_confidence)
 
         # 2. Resolve mentions (users/channels/roles), strip Lucy's own mention
         cleaned_content, mentioned_facts = await self._resolve_mentions(message)
@@ -925,6 +950,7 @@ class AIChat(commands.Cog):
             or author.guild_permissions.manage_channels
 
         relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
+        adaptation_note = persona_engine.render_adaptation_layer(style_profile, style_confidence)
 
         system_prompt = nim_client.build_system_prompt(
             personality=personality,
@@ -937,6 +963,7 @@ class AIChat(commands.Cog):
             response_style=profile.get("response_style"),
             can_use_tools=can_use_tools,
             relationship_tier=relationship_tier,
+            adaptation_note=adaptation_note,
             news_digest=awareness.get_cached_digest() or None,
             server_vibe=awareness.get_cached_server_vibe(guild.id) or None,
         )
@@ -1035,6 +1062,20 @@ class AIChat(commands.Cog):
             if len(self._recent_replies) > 500:
                 oldest_key = next(iter(self._recent_replies))
                 self._recent_replies.pop(oldest_key, None)
+
+        # First-ever message from this person in this guild: offer a fast,
+        # skippable calibration so Lucy can start adapting sooner than
+        # passive inference alone would. Purely a fast-track — passive
+        # adaptation (above) runs regardless of whether they ever touch this.
+        if is_first_message_ever and not profile.get("onboarded_at"):
+            try:
+                await message.channel.send(
+                    f"(hey {author.display_name} — `/vibecheck` if you want, 4 taps and I'll "
+                    "match your vibe faster. totally optional, I'll pick it up naturally either way)",
+                    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=False),
+                )
+            except discord.HTTPException:
+                pass
 
 
 async def setup(bot: commands.Bot):

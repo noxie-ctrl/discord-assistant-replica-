@@ -10,6 +10,7 @@ wrong names and would have broken /setpersonality and /setchattrigger.
 """
 
 import os
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -198,6 +199,15 @@ ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS idle_chatter_enabled BOOLEAN
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS server_vibe_enabled BOOLEAN DEFAULT TRUE;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_digest_channel_id BIGINT;
 ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS github_last_digest_at TIMESTAMPTZ;
+-- Adaptive persona (utils/persona_engine.py): per-user communication-style
+-- axes (directness, banter, energy, depth, support_style), stored as plain
+-- JSON-encoded TEXT (same pattern as `notes`) rather than JSONB, so no
+-- asyncpg codec setup is needed. onboarded_at is set the first time someone
+-- completes /vibecheck; NULL just means "never ran it" (passive inference
+-- still applies regardless).
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS style_profile TEXT DEFAULT '{}';
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS style_confidence TEXT DEFAULT '{}';
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
 """
 
 
@@ -541,6 +551,31 @@ async def update_profile_notes(guild_id: int, user_id: int, notes: str):
         await conn.execute(
             "UPDATE user_profiles SET notes = $3 WHERE guild_id = $1 AND user_id = $2",
             guild_id, user_id, notes,
+        )
+
+
+async def save_style_profile(guild_id: int, user_id: int, profile: dict, confidence: dict):
+    """Persists the (style_profile, style_confidence) dicts produced by
+    utils/persona_engine.py's apply_*_deltas functions. Callers pass plain
+    dicts; this is the only place that touches JSON encoding for them."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET style_profile = $3, style_confidence = $4 "
+            "WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id, json.dumps(profile or {}), json.dumps(confidence or {}),
+        )
+
+
+async def mark_onboarded(guild_id: int, user_id: int):
+    """Called once /vibecheck finishes (cogs/preferences.py). Purely
+    informational — doesn't gate passive adaptation, just lets the
+    first-message nudge in cogs/ai_chat.py know not to offer it again."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_profiles SET onboarded_at = now() WHERE guild_id = $1 AND user_id = $2",
+            guild_id, user_id,
         )
 
 
