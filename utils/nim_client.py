@@ -41,6 +41,7 @@ import aiohttp
 from utils import groq_client
 from utils import openrouter_client
 from utils import persona_engine
+from utils import http
 
 logger = logging.getLogger("lucy.nim_client")
 
@@ -837,12 +838,12 @@ async def _call_one_model(model: str, messages: list[dict], max_tokens: int, tem
         "Accept": "application/json",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
+    session = await http.get_session()
+    async with session.post(NIM_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
         message = data["choices"][0]["message"]

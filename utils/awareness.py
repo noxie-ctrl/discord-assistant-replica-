@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 import aiohttp
 
 from utils import groq_client
+from utils import http
 
 logger = logging.getLogger("lucy.awareness")
 
@@ -43,20 +44,20 @@ _cached_at: float = 0.0
 async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
     titles: list[str] = []
     timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in FEEDS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    raw = await resp.text()
-                root = ET.fromstring(raw)
-                for item in root.findall(".//item")[:limit_per_feed]:
-                    title = (item.findtext("title", default="") or "").strip()
-                    if title:
-                        titles.append(title)
-            except Exception as e:
-                logger.warning("Failed fetching feed %s: %s", url, e)
+    session = await http.get_session()
+    for url in FEEDS:
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    continue
+                raw = await resp.text()
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item")[:limit_per_feed]:
+                title = (item.findtext("title", default="") or "").strip()
+                if title:
+                    titles.append(title)
+        except Exception as e:
+            logger.warning("Failed fetching feed %s: %s", url, e)
     # de-dupe while preserving order
     seen = set()
     unique = []

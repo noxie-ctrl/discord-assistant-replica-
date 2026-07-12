@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import cachetools
 import discord
 from discord.ext import commands, tasks
 
@@ -306,18 +307,43 @@ def format_member_lookup(data: dict) -> str:
 class AIChat(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Left as a genuinely unbounded defaultdict on purpose: cachetools'
+        # LRUCache would need to evict an old channel's Lock to make room
+        # for a new one, and if that channel's handler was still awaiting
+        # that exact Lock object, evicting it from the *cache* wouldn't stop
+        # in-flight coroutines still holding it — but a later message in
+        # that same channel would then be handed a brand-new Lock instead,
+        # letting two handlers for the same channel interleave, which is
+        # the exact chat_memory ordering bug this lock exists to prevent.
+        # Lock objects are a few dozen bytes each and this server's channel
+        # count is small and stable, so the actual growth here is trivial —
+        # not worth trading a real (if rare) correctness bug for.
         self._channel_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._nim_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NIM_CALLS)
+        # Bounded-cache fix (this session): these five used to be plain
+        # dicts that only ever grew for the life of the process — fine for
+        # a small private server that runs for days, less fine across
+        # months of uptime on a memory-capped Railway instance. Swapped for
+        # cachetools caches that clean themselves up; all four still
+        # support plain dict-style .get()/[]=, so no call site below needed
+        # to change, only these declarations. TTLs are chosen so an entry
+        # expiring is equivalent to "no recent value," which is exactly the
+        # same as their old default `.get(key, 0.0)` fallback behavior —
+        # this isn't just tidiness, it's semantically the right expiry.
+        #
         # message_id -> (original_author_id, guild_id, channel_id, snippet) for feedback tracking
-        self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
-        # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
-        self._last_alert: dict[tuple[int, int], float] = {}
-        # channel_id -> last time we saw a real message there
-        self._last_activity_at: dict[int, float] = {}
-        # channel_id -> last time we sent idle chatter there
-        self._last_idle_chatter_at: dict[int, float] = {}
-        # channel_id -> last time we ran a vent-channel classification call
-        self._last_vent_check: dict[int, float] = {}
+        self._recent_replies: cachetools.LRUCache = cachetools.LRUCache(maxsize=500)
+        # (guild_id, user_id) -> time of last owner alert; expires shortly
+        # after OWNER_ALERT_COOLDOWN_SECONDS so it can't outlive its purpose.
+        self._last_alert: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=30 * 60)
+        # channel_id -> last time we saw a real message there; kept for a
+        # day, comfortably longer than IDLE_CHATTER_INTERVAL_SECONDS.
+        self._last_activity_at: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=24 * 60 * 60)
+        # channel_id -> last time we sent idle chatter there; same window.
+        self._last_idle_chatter_at: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=24 * 60 * 60)
+        # channel_id -> last time we ran a vent-channel classification call;
+        # only needs to outlive VENT_CHECK_MIN_INTERVAL_SECONDS (15s).
+        self._last_vent_check: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=5 * 60)
 
     async def cog_load(self):
         # Prime the news digest once at startup so the very first replies
@@ -449,7 +475,7 @@ class AIChat(commands.Cog):
             return
 
         key = (message.guild.id, message.author.id)
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         last = self._last_alert.get(key)
         if last is not None and (now - last) < OWNER_ALERT_COOLDOWN_SECONDS:
             return  # already alerted about this person recently, don't spam
@@ -484,7 +510,7 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
-        self._last_activity_at[message.channel.id] = asyncio.get_event_loop().time()
+        self._last_activity_at[message.channel.id] = asyncio.get_running_loop().time()
         will_reply = await self._should_respond(message)
 
         settings = await db.get_guild_settings(message.guild.id)
@@ -532,7 +558,7 @@ class AIChat(commands.Cog):
                 if not channel.permissions_for(guild.me).send_messages:
                     continue
 
-                now_ts = asyncio.get_event_loop().time()
+                now_ts = asyncio.get_running_loop().time()
                 last_activity = self._last_activity_at.get(channel.id, 0.0)
                 last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
                 if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
@@ -567,7 +593,7 @@ class AIChat(commands.Cog):
         if len(content) < VENT_MIN_MESSAGE_LENGTH:
             return
 
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         last_check = self._last_vent_check.get(message.channel.id)
         if last_check is not None and (now - last_check) < VENT_CHECK_MIN_INTERVAL_SECONDS:
             return
@@ -1155,10 +1181,9 @@ class AIChat(commands.Cog):
                     await sent_message.add_reaction(emoji)
                 except discord.HTTPException:
                     pass
-            # keep the tracking dict from growing forever
-            if len(self._recent_replies) > 500:
-                oldest_key = next(iter(self._recent_replies))
-                self._recent_replies.pop(oldest_key, None)
+            # (LRUCache(maxsize=500) now evicts the oldest entry on its own
+            # once full — the old manual "pop the oldest key" block that
+            # used to live here is gone, cachetools does this for us.)
 
         # First-ever message from this person in this guild: offer a fast,
         # skippable calibration so Lucy can start adapting sooner than

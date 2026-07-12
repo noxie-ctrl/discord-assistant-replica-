@@ -24,6 +24,8 @@ from typing import Any, Dict, List
 
 import aiohttp
 
+from utils import http
+
 logger = logging.getLogger("lucy.openrouter")
 
 OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -77,14 +79,14 @@ async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int,
         "Content-Type": "application/json",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(OPENROUTER_API_URL, json=payload, headers=headers) as resp:
-            if resp.status == 429:
-                raise _RateLimited(f"OpenRouter key rate-limited on {model}")
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"OpenRouter {model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
+    session = await http.get_session()
+    async with session.post(OPENROUTER_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise _RateLimited(f"OpenRouter key rate-limited on {model}")
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"OpenRouter {model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
         # Support typical OpenAI-compatible shape: choices[0].message.content

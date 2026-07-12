@@ -267,10 +267,32 @@ async def get_guild_settings(guild_id: int) -> dict:
         return dict(row)
 
 
+VALID_GUILD_SETTING_FIELDS = {
+    "log_channel_id", "chat_trigger_mode", "chat_channel_id", "welcome_channel_id",
+    "welcome_message", "vent_channel_id", "channel_redirection_enabled",
+    "idle_chatter_enabled", "server_vibe_enabled", "github_digest_channel_id",
+    "github_last_digest_at",
+}
+
+
 async def update_guild_setting(guild_id: int, **kwargs):
     """update_guild_setting(guild_id, chat_trigger_mode='mention', chat_channel_id=123)"""
     if not kwargs:
         return
+    # Hardening fix (this session): every call site today passes literal,
+    # hardcoded kwarg names written in this codebase (see cogs/utility.py,
+    # cogs/github.py), so this wasn't reachable with attacker-controlled
+    # column names in practice — but unlike set_personality_field just
+    # below, which validates against VALID_PERSONALITY_FIELDS, this had NO
+    # guard at all before the column name landed in an f-string. That's a
+    # foot-gun waiting for a future refactor (e.g. a generic "/setconfig
+    # <key> <value>" command mapping free text into these kwargs) to turn
+    # into a real SQL injection with nobody noticing until it's exploited.
+    # Whitelisting now costs nothing for legitimate callers and closes that
+    # off permanently.
+    unknown = set(kwargs) - VALID_GUILD_SETTING_FIELDS
+    if unknown:
+        raise ValueError(f"Unknown guild_settings field(s): {', '.join(sorted(unknown))}")
     await get_guild_settings(guild_id)  # ensure row exists
     pool = _require_pool()
     columns = list(kwargs.keys())

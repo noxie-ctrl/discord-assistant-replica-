@@ -24,6 +24,7 @@ their own spec.
 import random
 import asyncio
 import collections
+import logging
 
 import discord
 from discord import app_commands
@@ -31,6 +32,7 @@ from discord.ext import commands
 
 from utils import database as db
 
+logger = logging.getLogger("lucy.games")
 
 # Reward amounts, kept simple and flat
 PAYOUT = {
@@ -45,6 +47,38 @@ PAYOUT = {
     "connect4_draw": 8,
     "trivia_correct": 8,
 }
+
+
+class TimeoutAwareView(discord.ui.View):
+    """Base for the button-driven games below (this session's fix).
+
+    Plain discord.ui.View's default on_timeout only flips button.disabled
+    on the in-memory objects — nothing tells Discord, so the message kept
+    showing fully-enabled-looking buttons forever after a game actually
+    expired, and clicking one either silently did nothing or surfaced a
+    generic "This interaction failed." TicTacToeView, RPSView, and
+    Connect4View all hit this: none of them awaited their own view (unlike
+    TriviaRoundView, whose caller explicitly `await`s view.wait() and edits
+    the message itself right after — that one was never actually broken).
+
+    Subclasses: set `self.message` once the view's message is known (right
+    after sending it), and have on_timeout call `_disable_and_finalize`
+    with a short note instead of hand-rolling the disable loop.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.message: discord.Message | None = None
+
+    async def _disable_and_finalize(self, note: str):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=note, view=self)
+        except discord.HTTPException:
+            logger.debug("Timeout edit failed for message %s (likely deleted)", self.message.id)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +96,7 @@ class TicTacToeButton(discord.ui.Button):
         await view.handle_move(interaction, self)
 
 
-class TicTacToeView(discord.ui.View):
+class TicTacToeView(TimeoutAwareView):
     X, O, EMPTY = "X", "O", None
 
     def __init__(self, player_x: discord.Member, player_o: discord.Member, guild_id: int):
@@ -138,15 +172,14 @@ class TicTacToeView(discord.ui.View):
         self.stop()
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        await self._disable_and_finalize("⏱️ This Tic-Tac-Toe game timed out — nobody moved in time.")
 
 
 # ---------------------------------------------------------------------------
 # Rock Paper Scissors
 # ---------------------------------------------------------------------------
 
-class RPSView(discord.ui.View):
+class RPSView(TimeoutAwareView):
     CHOICES = ["rock", "paper", "scissors"]
     BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
 
@@ -154,6 +187,9 @@ class RPSView(discord.ui.View):
         super().__init__(timeout=30)
         self.player = player
         self.guild_id = guild_id
+
+    async def on_timeout(self):
+        await self._disable_and_finalize("⏱️ No pick in time — this round's off.")
 
     async def _resolve(self, interaction: discord.Interaction, user_choice: str):
         if interaction.user.id != self.player.id:
@@ -215,7 +251,7 @@ class Connect4ColumnButton(discord.ui.Button):
         await view.handle_drop(interaction, self.column)
 
 
-class Connect4View(discord.ui.View):
+class Connect4View(TimeoutAwareView):
     def __init__(self, player_red: discord.Member, player_yellow: discord.Member, guild_id: int):
         super().__init__(timeout=300)
         self.player_red = player_red
@@ -321,8 +357,7 @@ class Connect4View(discord.ui.View):
         self.stop()
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        await self._disable_and_finalize("⏱️ This Connect Four game timed out — nobody dropped a piece in time.")
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +632,7 @@ class Games(commands.Cog):
             f"{interaction.user.mention} (X) vs {opponent.mention} (O) — {interaction.user.mention}'s turn (X)",
             view=view,
         )
+        view.message = await interaction.original_response()
 
     # -- Rock Paper Scissors --------------------------------------------------
 
@@ -604,6 +640,7 @@ class Games(commands.Cog):
     async def rps(self, interaction: discord.Interaction):
         view = RPSView(interaction.user, interaction.guild_id)
         await interaction.response.send_message("Pick your move:", view=view)
+        view.message = await interaction.original_response()
 
     # -- Guess the Number -----------------------------------------------------
 
@@ -762,6 +799,7 @@ class Games(commands.Cog):
             f"{interaction.user.mention}'s turn",
             view=view,
         )
+        view.message = await interaction.original_response()
 
     # -- Trivia ---------------------------------------------------------------
 

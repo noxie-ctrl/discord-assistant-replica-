@@ -22,6 +22,8 @@ from typing import Optional
 
 import aiohttp
 
+from utils import http
+
 logger = logging.getLogger("lucy.facts")
 
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -65,40 +67,41 @@ async def get_weather(location: str) -> str:
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                GEOCODE_URL, params={"name": location, "count": 1, "format": "json"}
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't look up '{location}' right now (geocoding service returned {resp.status})."
-                geo = await resp.json()
+        session = await http.get_session()
+        async with session.get(
+            GEOCODE_URL, params={"name": location, "count": 1, "format": "json"}, timeout=timeout
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't look up '{location}' right now (geocoding service returned {resp.status})."
+            geo = await resp.json()
 
-            results = geo.get("results") or []
-            if not results:
-                return f"Couldn't find a place called '{location}' to check the weather for."
+        results = geo.get("results") or []
+        if not results:
+            return f"Couldn't find a place called '{location}' to check the weather for."
 
-            place = results[0]
-            lat, lon = place.get("latitude"), place.get("longitude")
-            resolved_name = place.get("name") or location
-            admin = place.get("admin1")
-            country = place.get("country")
-            display_name = ", ".join(p for p in [resolved_name, admin, country] if p)
+        place = results[0]
+        lat, lon = place.get("latitude"), place.get("longitude")
+        resolved_name = place.get("name") or location
+        admin = place.get("admin1")
+        country = place.get("country")
+        display_name = ", ".join(p for p in [resolved_name, admin, country] if p)
 
-            if lat is None or lon is None:
-                return f"Couldn't resolve coordinates for '{location}'."
+        if lat is None or lon is None:
+            return f"Couldn't resolve coordinates for '{location}'."
 
-            async with session.get(
-                FORECAST_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
-                    "timezone": "auto",
-                },
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't fetch a forecast for {display_name} right now (status {resp.status})."
-                data = await resp.json()
+        async with session.get(
+            FORECAST_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "timezone": "auto",
+            },
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't fetch a forecast for {display_name} right now (status {resp.status})."
+            data = await resp.json()
 
         current = data.get("current") or {}
         temp = current.get("temperature_2m")
@@ -141,37 +144,39 @@ async def search_fact(query: str) -> str:
 
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                WIKI_SEARCH_URL,
-                params={
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "srlimit": 1,
-                    "format": "json",
-                },
-                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't search for that right now (status {resp.status})."
-                search_data = await resp.json()
+        session = await http.get_session()
+        async with session.get(
+            WIKI_SEARCH_URL,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": 1,
+                "format": "json",
+            },
+            headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't search for that right now (status {resp.status})."
+            search_data = await resp.json()
 
-            hits = ((search_data.get("query") or {}).get("search")) or []
-            if not hits:
-                return f"Couldn't find anything reliable on '{query}'."
+        hits = ((search_data.get("query") or {}).get("search")) or []
+        if not hits:
+            return f"Couldn't find anything reliable on '{query}'."
 
-            title = hits[0].get("title")
-            if not title:
-                return f"Couldn't find anything reliable on '{query}'."
+        title = hits[0].get("title")
+        if not title:
+            return f"Couldn't find anything reliable on '{query}'."
 
-            async with session.get(
-                WIKI_SUMMARY_URL.format(title=title.replace(" ", "_")),
-                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
-            ) as resp:
-                if resp.status != 200:
-                    return f"Found a matching topic ('{title}') but couldn't load details right now."
-                summary_data = await resp.json()
+        async with session.get(
+            WIKI_SUMMARY_URL.format(title=title.replace(" ", "_")),
+            headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Found a matching topic ('{title}') but couldn't load details right now."
+            summary_data = await resp.json()
 
         extract = (summary_data.get("extract") or "").strip()
         if not extract:

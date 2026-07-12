@@ -27,7 +27,15 @@ class Moderation(commands.Cog):
     @app_commands.command(name="kick", description="Kick a member from the server")
     @is_admin_or_mod()
     async def kick_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-        await member.kick(reason=reason)
+        try:
+            await member.kick(reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't kick {member.mention} — their role is at or above mine, or I'm missing "
+                "Kick Members permission.",
+                ephemeral=True,
+            )
+            return
         embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Moderator", value=interaction.user.mention)
@@ -38,7 +46,14 @@ class Moderation(commands.Cog):
     @commands.command(name="kick")
     @is_admin_or_mod_ctx()
     async def kick_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        await member.kick(reason=reason)
+        try:
+            await member.kick(reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't kick {member.mention} — their role is at or above mine, or I'm missing "
+                "Kick Members permission."
+            )
+            return
         embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Moderator", value=ctx.author.mention)
@@ -50,7 +65,15 @@ class Moderation(commands.Cog):
     @app_commands.command(name="ban", description="Ban a member from the server")
     @is_admin_or_mod()
     async def ban_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-        await member.ban(reason=reason)
+        try:
+            await member.ban(reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't ban {member.mention} — their role is at or above mine, or I'm missing "
+                "Ban Members permission.",
+                ephemeral=True,
+            )
+            return
         embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Moderator", value=interaction.user.mention)
@@ -61,7 +84,14 @@ class Moderation(commands.Cog):
     @commands.command(name="ban")
     @is_admin_or_mod_ctx()
     async def ban_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        await member.ban(reason=reason)
+        try:
+            await member.ban(reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't ban {member.mention} — their role is at or above mine, or I'm missing "
+                "Ban Members permission."
+            )
+            return
         embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Moderator", value=ctx.author.mention)
@@ -73,8 +103,31 @@ class Moderation(commands.Cog):
     @app_commands.command(name="unban", description="Unban a user by ID")
     @is_admin_or_mod()
     async def unban_slash(self, interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
-        user = discord.Object(id=int(user_id))
-        await interaction.guild.unban(user, reason=reason)
+        try:
+            parsed_id = int(user_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                f"⚠️ '{user_id}' isn't a valid user ID — it should be all digits "
+                "(right-click a name → Copy User ID, or check the ban list).",
+                ephemeral=True,
+            )
+            return
+
+        user = discord.Object(id=parsed_id)
+        try:
+            await interaction.guild.unban(user, reason=reason)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                f"⚠️ No ban found for user ID {parsed_id} — they may already be unbanned, or that ID is wrong.",
+                ephemeral=True,
+            )
+            return
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "🚫 I don't have permission to unban members here.", ephemeral=True
+            )
+            return
+
         embed = discord.Embed(title="✅ Member Unbanned", color=discord.Color.green())
         embed.add_field(name="User ID", value=user_id)
         embed.add_field(name="Moderator", value=interaction.user.mention)
@@ -83,9 +136,21 @@ class Moderation(commands.Cog):
 
     # ---------- MUTE (timeout) ----------
     @app_commands.command(name="mute", description="Timeout a member (minutes)")
+    @app_commands.describe(minutes="1 to 40320 (28 days) — Discord's own hard cap on timeouts")
     @is_admin_or_mod()
-    async def mute_slash(self, interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "No reason provided"):
-        await member.timeout(timedelta(minutes=minutes), reason=reason)
+    async def mute_slash(
+        self, interaction: discord.Interaction, member: discord.Member,
+        minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason provided",
+    ):
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't time out {member.mention} — their role is at or above mine, or I'm missing "
+                "Timeout Members permission.",
+                ephemeral=True,
+            )
+            return
         embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Duration", value=f"{minutes} min")
@@ -97,7 +162,20 @@ class Moderation(commands.Cog):
     @commands.command(name="mute")
     @is_admin_or_mod_ctx()
     async def mute_prefix(self, ctx: commands.Context, member: discord.Member, minutes: int, *, reason: str = "No reason provided"):
-        await member.timeout(timedelta(minutes=minutes), reason=reason)
+        # Discord's own hard cap on timeouts — the slash version bounds
+        # this via app_commands.Range, but the prefix version takes a
+        # plain int, so it needs the same check done by hand.
+        if not (1 <= minutes <= 40320):
+            await ctx.send("⚠️ Minutes must be between 1 and 40320 (28 days — Discord's own timeout cap).")
+            return
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't time out {member.mention} — their role is at or above mine, or I'm missing "
+                "Timeout Members permission."
+            )
+            return
         embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Duration", value=f"{minutes} min")
@@ -110,7 +188,15 @@ class Moderation(commands.Cog):
     @app_commands.command(name="unmute", description="Remove timeout from a member")
     @is_admin_or_mod()
     async def unmute_slash(self, interaction: discord.Interaction, member: discord.Member):
-        await member.timeout(None)
+        try:
+            await member.timeout(None)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't remove {member.mention}'s timeout — their role is at or above mine, or I'm "
+                "missing Timeout Members permission.",
+                ephemeral=True,
+            )
+            return
         embed = discord.Embed(title="🔊 Member Unmuted", color=discord.Color.green())
         embed.add_field(name="User", value=f"{member} ({member.id})")
         embed.add_field(name="Moderator", value=interaction.user.mention)
@@ -146,16 +232,40 @@ class Moderation(commands.Cog):
 
     # ---------- PURGE ----------
     @app_commands.command(name="purge", description="Delete a number of recent messages")
+    @app_commands.describe(amount="1 to 100 — Discord's own bulk-delete cap per request")
     @is_admin_or_mod()
-    async def purge_slash(self, interaction: discord.Interaction, amount: int):
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
         await interaction.response.defer(ephemeral=True)
-        deleted = await interaction.channel.purge(limit=amount)
+        try:
+            deleted = await interaction.channel.purge(limit=amount)
+        except discord.Forbidden:
+            await interaction.followup.send("🚫 I don't have permission to delete messages here.", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            # Most common real cause: some of those messages are older than
+            # 14 days — Discord's bulk-delete endpoint refuses those outright
+            # rather than silently skipping them.
+            await interaction.followup.send(
+                f"⚠️ Couldn't finish purging (messages older than 14 days can't be bulk-deleted): {e}",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(f"🧹 Deleted {len(deleted)} messages.", ephemeral=True)
 
     @commands.command(name="purge")
     @is_admin_or_mod_ctx()
     async def purge_prefix(self, ctx: commands.Context, amount: int):
-        deleted = await ctx.channel.purge(limit=amount + 1)
+        if not (1 <= amount <= 100):
+            await ctx.send("⚠️ Amount must be between 1 and 100 (Discord's own bulk-delete cap per request).")
+            return
+        try:
+            deleted = await ctx.channel.purge(limit=amount + 1)
+        except discord.Forbidden:
+            await ctx.send("🚫 I don't have permission to delete messages here.")
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"⚠️ Couldn't finish purging (messages older than 14 days can't be bulk-deleted): {e}")
+            return
         msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
         await msg.delete(delay=3)
 

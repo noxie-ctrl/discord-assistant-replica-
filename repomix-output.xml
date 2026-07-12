@@ -59,6 +59,7 @@ tests/
   test_member_lookup.py
   test_openrouter_client.py
   test_persona_engine.py
+  test_prompt_addenda.py
   test_time_awareness.py
 utils/
   __init__.py
@@ -1808,99 +1809,6 @@ async def setup(bot: commands.Bot):
     await bot.add_cog(Preferences(bot))
 </file>
 
-<file path="tests/test_ai_chat_helpers.py">
-import unittest
-from types import SimpleNamespace
-
-from cogs.ai_chat import (
-    maybe_suggest_channel_redirection,
-    classify_reply_depth,
-    extract_image_urls_from_attachments,
-    extract_image_urls_from_embeds,
-)
-
-
-class ChannelAwarenessTests(unittest.TestCase):
-    def test_detects_off_topic_vent_in_memes_channel(self):
-        suggestion = maybe_suggest_channel_redirection(
-            channel_topic="Memes and random fun",
-            content="I feel like I am falling apart and need someone to talk to",
-        )
-        self.assertIsNotNone(suggestion)
-        self.assertIn("vent", suggestion.lower())
-
-    def test_ignores_on_topic_content(self):
-        suggestion = maybe_suggest_channel_redirection(
-            channel_topic="General chat and casual conversation",
-            content="How was your day?",
-        )
-        self.assertIsNone(suggestion)
-
-
-class ReplyDepthClassificationTests(unittest.TestCase):
-    """Regression coverage for the 'stop sending paragraphs for casual chat'
-    fix — classify_reply_depth() drives both max_tokens and the per-turn
-    steering note in AIChat._handle_chat."""
-
-    def test_short_casual_message_is_casual(self):
-        self.assertEqual(classify_reply_depth("lol same"), "casual")
-
-    def test_greeting_is_casual(self):
-        self.assertEqual(classify_reply_depth("wassup"), "casual")
-
-    def test_explicit_explain_request_is_deep(self):
-        self.assertEqual(classify_reply_depth("then explain me abt the work"), "deep")
-
-    def test_breakdown_request_is_deep(self):
-        self.assertEqual(classify_reply_depth("can you give me a breakdown of this"), "deep")
-
-    def test_long_message_is_deep_even_without_keywords(self):
-        long_msg = "so today was a whole thing, basically everything that could go wrong did " * 2
-        self.assertEqual(classify_reply_depth(long_msg), "deep")
-
-    def test_empty_message_is_casual(self):
-        self.assertEqual(classify_reply_depth(""), "casual")
-        self.assertEqual(classify_reply_depth(None), "casual")
-
-
-class ImageUrlExtractionTests(unittest.TestCase):
-    """Regression coverage for the vision fix — these pure helpers feed
-    AIChat._collect_image_urls, which now also checks the replied-to
-    message and a short history fallback, not just the current message."""
-
-    def test_extracts_image_by_content_type(self):
-        att = SimpleNamespace(url="https://cdn.example.com/a.bin", content_type="image/png", filename="a.bin")
-        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.bin"])
-
-    def test_extracts_image_by_extension_when_content_type_missing(self):
-        att = SimpleNamespace(url="https://cdn.example.com/a.jpg", content_type=None, filename="a.jpg")
-        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.jpg"])
-
-    def test_ignores_non_image_attachments(self):
-        att = SimpleNamespace(url="https://cdn.example.com/a.pdf", content_type="application/pdf", filename="a.pdf")
-        self.assertEqual(extract_image_urls_from_attachments([att]), [])
-
-    def test_handles_no_attachments(self):
-        self.assertEqual(extract_image_urls_from_attachments([]), [])
-        self.assertEqual(extract_image_urls_from_attachments(None), [])
-
-    def test_extracts_from_embed_image(self):
-        embed = SimpleNamespace(image=SimpleNamespace(url="https://cdn.example.com/e.png"), thumbnail=None)
-        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/e.png"])
-
-    def test_extracts_from_embed_thumbnail_when_no_image(self):
-        embed = SimpleNamespace(image=None, thumbnail=SimpleNamespace(url="https://cdn.example.com/t.png"))
-        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/t.png"])
-
-    def test_handles_no_embeds(self):
-        self.assertEqual(extract_image_urls_from_embeds([]), [])
-        self.assertEqual(extract_image_urls_from_embeds(None), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
-</file>
-
 <file path="tests/test_facts.py">
 import asyncio
 import unittest
@@ -2028,6 +1936,87 @@ class MemberLookupFormatterTests(unittest.TestCase):
         lowered = result.lower()
         for banned in ("status", "activity", "online", "offline"):
             self.assertNotIn(banned, lowered)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_prompt_addenda.py">
+import unittest
+
+from utils.nim_client import build_system_prompt
+
+
+BASE_PERSONALITY = {
+    "name": "Lucy",
+    "age": "21",
+    "role": "server admin assistant & friend to everyone here",
+    "traits": "warm, competent",
+    "backstory": "grew up online",
+    "speaking_style": "casual",
+    "boundaries": "respectful",
+}
+
+
+class GenderConsistencyAddendumTests(unittest.TestCase):
+    """Regression coverage for the Hinglish gender-consistency fix — Lucy
+    was slipping into masculine Hindi verb conjugation (e.g. 'kar raha
+    hoon') despite being female. The addendum should be present whenever
+    pronouns are female, and absent if a deployment ever reconfigures her
+    to something else."""
+
+    def test_feminine_pronouns_include_hindi_gender_addendum(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox")
+        self.assertIn("kar rahi hoon", prompt)
+        self.assertIn("feminine conjugation", prompt)
+
+    def test_non_female_pronouns_skip_hindi_gender_addendum(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "he/him"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox")
+        self.assertNotIn("kar rahi hoon", prompt)
+
+    def test_missing_pronouns_default_to_female_and_include_addendum(self):
+        personality = {**BASE_PERSONALITY}  # no "pronouns" key at all
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox")
+        self.assertIn("kar rahi hoon", prompt)
+
+
+class ToolActionHonestyAddendumTests(unittest.TestCase):
+    """Regression coverage for the 'stop claiming actions happened without
+    calling the tool' fix. Present regardless of can_use_tools since
+    flag_for_owner (always available) is covered by the same rule."""
+
+    def test_addendum_present_when_tools_enabled(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=True)
+        self.assertIn("you haven't done it, full stop", prompt)
+        self.assertIn("call the tool once per target", prompt)
+
+    def test_addendum_present_even_when_tools_disabled(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=False)
+        self.assertIn("you haven't done it, full stop", prompt)
+
+
+class NoToolsAvailableAddendumTests(unittest.TestCase):
+    """Regression coverage for the permission-gap fix: when can_use_tools is
+    False, the prompt now says so outright instead of leaving it unstated —
+    the gap that let Lucy improvise a fake 'done' for a genuine admin whose
+    permissions were misread (ADMINISTRATOR-only role) rather than telling
+    them plainly she couldn't do it."""
+
+    def test_disabled_tools_state_limitation_plainly(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=False)
+        self.assertIn("do NOT have tools available", prompt)
+        self.assertIn("never describe it as done", prompt)
+
+    def test_enabled_tools_does_not_include_the_disabled_wording(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=True)
+        self.assertNotIn("do NOT have tools available", prompt)
 
 
 if __name__ == "__main__":
@@ -3117,6 +3106,161 @@ data/
   "speaking_style": "Casual, warm, short natural sentences, soft humor, minimal emoji, never robotic or overly formal, comfortable sitting with someone in a quiet moment instead of rushing to fill it",
   "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
 }
+</file>
+
+<file path="tests/test_ai_chat_helpers.py">
+import unittest
+from types import SimpleNamespace
+
+from cogs.ai_chat import (
+    maybe_suggest_channel_redirection,
+    classify_reply_depth,
+    extract_image_urls_from_attachments,
+    extract_image_urls_from_embeds,
+    summarize_tool_results_for_fallback,
+    member_has_any_permission,
+)
+
+
+class ChannelAwarenessTests(unittest.TestCase):
+    def test_detects_off_topic_vent_in_memes_channel(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="Memes and random fun",
+            content="I feel like I am falling apart and need someone to talk to",
+        )
+        self.assertIsNotNone(suggestion)
+        self.assertIn("vent", suggestion.lower())
+
+    def test_ignores_on_topic_content(self):
+        suggestion = maybe_suggest_channel_redirection(
+            channel_topic="General chat and casual conversation",
+            content="How was your day?",
+        )
+        self.assertIsNone(suggestion)
+
+
+class ReplyDepthClassificationTests(unittest.TestCase):
+    """Regression coverage for the 'stop sending paragraphs for casual chat'
+    fix — classify_reply_depth() drives both max_tokens and the per-turn
+    steering note in AIChat._handle_chat."""
+
+    def test_short_casual_message_is_casual(self):
+        self.assertEqual(classify_reply_depth("lol same"), "casual")
+
+    def test_greeting_is_casual(self):
+        self.assertEqual(classify_reply_depth("wassup"), "casual")
+
+    def test_explicit_explain_request_is_deep(self):
+        self.assertEqual(classify_reply_depth("then explain me abt the work"), "deep")
+
+    def test_breakdown_request_is_deep(self):
+        self.assertEqual(classify_reply_depth("can you give me a breakdown of this"), "deep")
+
+    def test_long_message_is_deep_even_without_keywords(self):
+        long_msg = "so today was a whole thing, basically everything that could go wrong did " * 2
+        self.assertEqual(classify_reply_depth(long_msg), "deep")
+
+    def test_empty_message_is_casual(self):
+        self.assertEqual(classify_reply_depth(""), "casual")
+        self.assertEqual(classify_reply_depth(None), "casual")
+
+
+class ImageUrlExtractionTests(unittest.TestCase):
+    """Regression coverage for the vision fix — these pure helpers feed
+    AIChat._collect_image_urls, which now also checks the replied-to
+    message and a short history fallback, not just the current message."""
+
+    def test_extracts_image_by_content_type(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.bin", content_type="image/png", filename="a.bin")
+        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.bin"])
+
+    def test_extracts_image_by_extension_when_content_type_missing(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.jpg", content_type=None, filename="a.jpg")
+        self.assertEqual(extract_image_urls_from_attachments([att]), ["https://cdn.example.com/a.jpg"])
+
+    def test_ignores_non_image_attachments(self):
+        att = SimpleNamespace(url="https://cdn.example.com/a.pdf", content_type="application/pdf", filename="a.pdf")
+        self.assertEqual(extract_image_urls_from_attachments([att]), [])
+
+    def test_handles_no_attachments(self):
+        self.assertEqual(extract_image_urls_from_attachments([]), [])
+        self.assertEqual(extract_image_urls_from_attachments(None), [])
+
+    def test_extracts_from_embed_image(self):
+        embed = SimpleNamespace(image=SimpleNamespace(url="https://cdn.example.com/e.png"), thumbnail=None)
+        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/e.png"])
+
+    def test_extracts_from_embed_thumbnail_when_no_image(self):
+        embed = SimpleNamespace(image=None, thumbnail=SimpleNamespace(url="https://cdn.example.com/t.png"))
+        self.assertEqual(extract_image_urls_from_embeds([embed]), ["https://cdn.example.com/t.png"])
+
+    def test_handles_no_embeds(self):
+        self.assertEqual(extract_image_urls_from_embeds([]), [])
+        self.assertEqual(extract_image_urls_from_embeds(None), [])
+
+
+class ToolHonestyFallbackTests(unittest.TestCase):
+    """Regression coverage for the 'stop saying Done. when nothing was
+    confirmed' fix — this is what AIChat._handle_chat's tool loop falls
+    back on when the model returns empty content after a round of real
+    tool calls, instead of the old hardcoded 'Done.' string."""
+
+    def test_no_tool_calls_gives_generic_apology_not_done(self):
+        result = summarize_tool_results_for_fallback([])
+        self.assertNotIn("Done.", result)
+        self.assertIn("try that again", result.lower())
+
+    def test_single_success_is_reflected_verbatim(self):
+        result = summarize_tool_results_for_fallback(
+            [("create_role", "Success: created role 'Raiders'.")]
+        )
+        self.assertIn("Success: created role 'Raiders'.", result)
+
+    def test_mixed_success_and_failure_both_show_up(self):
+        # The real-world case this exists for: "make a role and give it to
+        # Alice, Bob, and Carol" where Bob's name doesn't resolve — the
+        # fallback must not silently drop the failure and imply everyone
+        # got it.
+        result = summarize_tool_results_for_fallback([
+            ("create_role", "Success: created role 'Raiders'."),
+            ("assign_role", "Success: gave Alice the 'Raiders' role."),
+            ("assign_role", "Error: no member named 'bobb' found."),
+            ("assign_role", "Success: gave Carol the 'Raiders' role."),
+        ])
+        self.assertIn("Alice", result)
+        self.assertIn("Error: no member named 'bobb' found.", result)
+        self.assertIn("Carol", result)
+
+
+class PermissionGapFixTests(unittest.TestCase):
+    """Regression coverage for the real root cause behind 'she says done but
+    nothing happened': can_use_tools (and the create_role/assign_role gates)
+    used to check manage_roles/manage_guild/manage_channels directly, which
+    misses members whose only grant is ADMINISTRATOR on a role — a very
+    common single-admin-role server setup. ADMINISTRATOR does not imply
+    those other bits are set in the raw permission bitfield, so a genuine
+    admin could silently read as having none of them."""
+
+    def test_administrator_alone_counts_as_permission(self):
+        perms = SimpleNamespace(administrator=True, manage_roles=False, manage_guild=False)
+        self.assertTrue(member_has_any_permission(perms, "manage_roles"))
+        self.assertTrue(member_has_any_permission(perms, "manage_guild", "manage_channels"))
+
+    def test_specific_permission_still_works_without_administrator(self):
+        perms = SimpleNamespace(administrator=False, manage_roles=True, manage_guild=False)
+        self.assertTrue(member_has_any_permission(perms, "manage_roles"))
+
+    def test_neither_administrator_nor_named_permission_is_false(self):
+        perms = SimpleNamespace(administrator=False, manage_roles=False, manage_guild=False)
+        self.assertFalse(member_has_any_permission(perms, "manage_roles", "manage_guild"))
+
+    def test_missing_attribute_defaults_to_false_not_a_crash(self):
+        perms = SimpleNamespace(administrator=False)
+        self.assertFalse(member_has_any_permission(perms, "manage_channels"))
+
+
+if __name__ == "__main__":
+    unittest.main()
 </file>
 
 <file path="utils/openrouter_client.py">
@@ -5900,6 +6044,19 @@ DEFAULT_CHANNEL_REDIRECTION_HINTS = {
 }
 CROSS_CHANNEL_CONTEXT_LIMIT = 8
 MAX_CONCURRENT_NIM_CALLS = 5
+# Tool-loop bug fix (this session): the old code allowed exactly ONE round
+# of tool calls before forcing a tools=None finalization pass. Fine for a
+# single action, but it silently broke multi-step requests — "make a role
+# and give it to Alice, Bob, and Carol" needs create_role PLUS one
+# assign_role per person, and a model will often only emit one or two
+# tool_calls per turn, intending to keep going after seeing the results.
+# Under the single-round version, that continuation never happened: the
+# finalization pass had no tools available, so the model just wrote a
+# reply describing the rest of the job as done. MAX_TOOL_ITERATIONS caps
+# how many rounds of real tool-calling Lucy gets per message — high enough
+# for realistic multi-step actions, low enough that a confused/looping
+# model can't hammer the API forever on one message.
+MAX_TOOL_ITERATIONS = 5
 OWNER_ALERT_COOLDOWN_SECONDS = 20 * 60  # don't re-alert about the same person too often
 VENT_CHECK_MIN_INTERVAL_SECONDS = 15  # don't classify every single message in a busy vent channel
 VENT_MIN_MESSAGE_LENGTH = 12  # skip trivially short messages ("lol", "ok") — not worth a call
@@ -6043,6 +6200,46 @@ def resolve_idle_chatter_channel_ids(
     if fallback_channel_id:
         return [fallback_channel_id]
     return []
+
+
+def summarize_tool_results_for_fallback(tool_results: list[tuple[str, str]]) -> str:
+    """Pure helper (unit-testable): if the model comes back with empty
+    content after a round of real tool calls, this builds the reply from
+    what the tools actually reported instead of the old behavior — a
+    hardcoded "Done." string that asserted success even when a tool call
+    had failed or only partially completed. tool_results is a list of
+    (tool_name, result_string) pairs in call order, exactly what
+    AIChat._handle_chat's tool loop accumulates below."""
+    if not tool_results:
+        return "Sorry, I got tangled up mid-thought there — try that again?"
+    return "Here's what actually happened: " + " ".join(result for _, result in tool_results)
+
+
+def member_has_any_permission(permissions, *names: str) -> bool:
+    """True if `permissions` grants ADMINISTRATOR, or any of the named
+    permission flags directly.
+
+    Permission-gap bug fix (this session): Discord's ADMINISTRATOR bit does
+    NOT imply the other convenience bits (manage_roles, manage_guild, etc.)
+    are also set in the raw permission bitfield discord.py exposes — it's a
+    well-known gotcha, not a discord.py quirk specific to us. A server with
+    one all-powerful admin role (very common — grant Administrator once,
+    done) means every member of that role reads as having none of the
+    individual permissions this bot checks for, even though Discord's own
+    backend treats them as able to do literally anything. That silently
+    dropped can_use_tools to False for genuine admins, meaning the model
+    was never even given create_role/assign_role to call — it had zero
+    ability to do what was asked, and with nothing telling it that plainly,
+    it improvised a confident-sounding "done" instead. This is the actual
+    fix; the honesty-addendum and tool-loop fixes from last session help
+    the model behave better when it HAS tools, but don't help if the tool
+    was never in its list to begin with.
+
+    `permissions` just needs getattr-able boolean attributes — works with
+    real discord.Permissions and with simple test doubles alike."""
+    if getattr(permissions, "administrator", False):
+        return True
+    return any(getattr(permissions, name, False) for name in names)
 
 
 def format_member_lookup(data: dict) -> str:
@@ -6430,8 +6627,9 @@ class AIChat(commands.Cog):
         author = message.author
         owner_id = getattr(self.bot, "owner_id", None)
         is_owner = owner_id is not None and author.id == owner_id
-        has_manage_roles = getattr(author.guild_permissions, "manage_roles", False)
-        has_manage_guild = getattr(author.guild_permissions, "manage_guild", False)
+        has_role_management_permission = member_has_any_permission(
+            author.guild_permissions, "manage_roles"
+        )
 
         if name == "flag_for_owner":
             reason = args.get("reason") or "Lucy flagged this conversation."
@@ -6457,7 +6655,7 @@ class AIChat(commands.Cog):
             return f"Success: posted to #{target.name}."
 
         if name == "create_role":
-            if not (is_owner or has_manage_roles):
+            if not (is_owner or has_role_management_permission):
                 return "Error: requester doesn't have permission to create roles."
             role_name = args.get("role_name") or "New Role"
             color_hex = args.get("color_hex")
@@ -6471,7 +6669,7 @@ class AIChat(commands.Cog):
             return f"Success: created role '{new_role.name}'."
 
         if name == "assign_role":
-            if not (is_owner or has_manage_roles):
+            if not (is_owner or has_role_management_permission):
                 return "Error: requester doesn't have permission to assign roles."
             member_name = (args.get("member_name") or "").lower()
             role_name = (args.get("role_name") or "").lower()
@@ -6778,8 +6976,9 @@ class AIChat(commands.Cog):
         owner_member = guild.owner
         owner_name = owner_member.display_name if owner_member else "the server owner"
 
-        can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
-            or author.guild_permissions.manage_channels
+        can_use_tools = is_owner or member_has_any_permission(
+            author.guild_permissions, "manage_guild", "manage_roles", "manage_channels"
+        )
 
         relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
         adaptation_note = persona_engine.render_adaptation_layer(style_profile, style_confidence)
@@ -6835,36 +7034,78 @@ class AIChat(commands.Cog):
 
         await self._maybe_attach_image_context(message, chat_messages)
 
-        # 6. Call the model (semaphore-capped), with tool support
+        # 6. Call the model (semaphore-capped), with tool support. This is a
+        # real multi-step loop now (see MAX_TOOL_ITERATIONS above) — Lucy can
+        # call a tool, see the result, and call another before ever writing
+        # a word to the user, instead of being cut off after one round.
         try:
-            async with self._nim_semaphore:
-                tools = (
-                    nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
-                    + (nim_client.TOOLS if can_use_tools else [])
+            tools = (
+                nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
+                + (nim_client.TOOLS if can_use_tools else [])
+            )
+            # Diagnostic logging (this session): the permission-gap bug above
+            # meant action tools could silently be withheld from a genuine
+            # admin with no visible symptom except Lucy improvising a fake
+            # "done" — nothing in the logs distinguished "tool was offered
+            # and she chose not to use it" from "tool was never offered at
+            # all." This makes that visible in Railway's normal INFO-level
+            # logs without needing to reproduce it under a debugger.
+            if can_use_tools:
+                logger.info(
+                    "Action tools offered to %s (id %s) in guild %s, channel %s",
+                    author, author.id, guild.id, message.channel.id,
                 )
-                assistant_message = await nim_client.call_nim_with_tools(
-                    chat_messages, tools=tools, max_tokens=max_tokens
-                )
+            tool_results_log: list[tuple[str, str]] = []
+            reply = None
 
-                if assistant_message.get("tool_calls"):
-                    chat_messages.append(assistant_message)
-                    for tool_call in assistant_message["tool_calls"]:
-                        result = await self._execute_tool_call(tool_call, message)
-                        chat_messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.get("id", ""),
-                            "content": result,
-                        })
-                    # One more round trip to let Lucy phrase the final reply
-                    async with self._nim_semaphore:
-                        final_message = await nim_client.call_nim_with_tools(
-                            chat_messages, tools=None, max_tokens=max_tokens
-                        )
-                    reply = (final_message.get("content") or "Done.").strip()
-                else:
+            for _ in range(MAX_TOOL_ITERATIONS):
+                async with self._nim_semaphore:
+                    assistant_message = await nim_client.call_nim_with_tools(
+                        chat_messages, tools=tools, max_tokens=max_tokens
+                    )
+
+                if not assistant_message.get("tool_calls"):
                     reply = (assistant_message.get("content") or "").strip()
+                    break
 
-                reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
+                chat_messages.append(assistant_message)
+                for tool_call in assistant_message["tool_calls"]:
+                    result = await self._execute_tool_call(tool_call, message)
+                    tool_results_log.append((tool_call["function"]["name"], result))
+                    logger.info("Tool call: %s -> %s", tool_call["function"]["name"], result)
+                    chat_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.get("id", ""),
+                        "content": result,
+                    })
+                # Loop again: Lucy now has these results and can either call
+                # more tools (multi-step actions) or write the real reply.
+
+            if can_use_tools and not tool_results_log:
+                logger.info(
+                    "can_use_tools was True for %s but no tool was called this turn "
+                    "(model answered in plain text, or genuinely had nothing to do)",
+                    author,
+                )
+
+            if reply is None:
+                # Hit MAX_TOOL_ITERATIONS while she still wanted to call
+                # tools — force one last plain-text pass with no tools
+                # available, so a stuck/looping model can't spin forever.
+                async with self._nim_semaphore:
+                    final_message = await nim_client.call_nim_with_tools(
+                        chat_messages, tools=None, max_tokens=max_tokens
+                    )
+                reply = (final_message.get("content") or "").strip()
+
+            if not reply:
+                # Tool-honesty fix (this session): used to default to a
+                # hardcoded "Done." here, which asserted success even when
+                # a tool call had failed or partially completed. Ground the
+                # fallback in what actually happened instead.
+                reply = summarize_tool_results_for_fallback(tool_results_log)
+
+            reply = nim_client.strip_roleplay_formatting(reply, bot_name=personality.get("name", "Lucy"))
         except Exception:
             logger.exception("NIM call failed for guild %s channel %s", guild.id, message.channel.id)
             await message.reply(
@@ -7074,6 +7315,31 @@ felt — don't respond to it with the same emotional weight you'd give a member,
 assume it can perceive or reply the way a person would.
 """
 
+# Gender-consistency fix (this session): live testing caught Lucy dropping
+# into masculine Hindi verb/adjective conjugation when replying in Hindi
+# or Hinglish (e.g. "kar raha hoon", "maine bola tha") even though she's
+# female. This needs to be its own explicit, example-driven addendum
+# rather than relying on the "she/her" pronoun line up top — English
+# almost never marks the speaker's own gender grammatically, so a model
+# can hold "I'm female" and still default to masculine Hindi conjugation
+# without ever noticing the contradiction. The fix has to name the actual
+# grammatical pattern, not just restate the pronoun.
+HINDI_GENDER_ADDENDUM = """
+You are female, and Hindi/Hinglish grammatically marks the speaker's own gender on verbs and \
+adjectives — unlike English, where this almost never comes up. Whenever you reply in Hindi or \
+Hinglish, use feminine conjugation consistently, the same way you'd never accidentally call \
+yourself "he" in English:
+- "kar rahi hoon" not "kar raha hoon"
+- "thi" not "tha"
+- "gayi" not "gaya"
+- "karoongi" / "karungi" not "karoonga" / "karunga"
+- "bolungi" not "bolunga"
+- "hui" not "hua"
+This applies for the whole reply, not just the first verb — a Hinglish message often has \
+several conjugated verbs in a row, and it's an easy slip to get the first one right and drift \
+masculine partway through. Check the whole sentence, not just the opener.
+"""
+
 # Added directly in response to live testing: Lucy confidently stated a
 # plausible-sounding but unverified date/fact from training data instead of
 # either checking or admitting she wasn't sure. The two grounding tools below
@@ -7115,6 +7381,28 @@ or what they're doing right now), you don't have that, full stop — don't add i
 a "complete" answer feels like it should include it. And don't recite the result as a labeled \
 list ("Field: value, Field: value, ...") — say it in normal sentences, the way you'd tell a \
 friend what you found out, same voice as everywhere else in this prompt.
+"""
+
+# Tool-action honesty fix (this session): live testing showed Lucy would
+# describe an action — creating a role, assigning it to several people —
+# as complete in her final reply even when she'd only actually called the
+# tool once, or not at all. This is the action-taking counterpart to
+# TOOL_RESULT_HONESTY_ADDENDUM above: that one covers relaying a lookup
+# faithfully, this one covers not narrating an action as done instead of
+# actually doing it.
+TOOL_ACTION_HONESTY_ADDENDUM = """
+Never say you did something — created a role, assigned a role, posted a message somewhere \
+else, etc. — unless you actually called the matching tool this turn and it came back with a \
+real result. Describing an action in your reply is not the same as taking it: if you haven't \
+called the tool, you haven't done it, full stop, no matter how confident that sounds.
+If a request covers more than one target — "give this role to Alice, Bob, and Carol" — call \
+the tool once per target, not once total. Only say it's done once every target actually has a \
+tool result back. If some succeeded and some didn't (wrong name, missing permission, a role \
+above yours, etc.), say exactly which ones worked and which didn't — don't round a mixed \
+result up to "done" or down to "failed."
+If you're ever unsure whether something already happened earlier in this conversation, check \
+the actual tool result you got rather than assuming — and if you're still not sure, say so \
+instead of claiming it's done again.
 """
 
 RELATIONSHIP_TIER_NOTES = {
@@ -7282,7 +7570,12 @@ def build_system_prompt(
 
     prompt += "\n" + CULTURAL_FLUENCY_ADDENDUM
     prompt += "\n" + BOT_AWARENESS_ADDENDUM
+    # Only meaningful for a female persona — conditional so this doesn't
+    # misfire if pronouns are ever reconfigured to something else.
+    if "she" in (personality.get("pronouns") or "she/her").lower():
+        prompt += "\n" + HINDI_GENDER_ADDENDUM
     prompt += "\n" + TOOL_RESULT_HONESTY_ADDENDUM
+    prompt += "\n" + TOOL_ACTION_HONESTY_ADDENDUM
     prompt += "\n" + FACTUAL_ACCURACY_ADDENDUM
 
     if is_owner:
@@ -7318,6 +7611,22 @@ def build_system_prompt(
             "you'd do. Use them when the request calls for it. Role-management tools will "
             "be rejected by the system if the requester lacks permission — if that happens, "
             "just tell them plainly, don't pretend it worked."
+        )
+    else:
+        # Permission-gap fix (this session): this branch used to not exist —
+        # when can_use_tools was False, the prompt just said nothing at all
+        # about action tools, so nothing told the model it COULDN'T create a
+        # role, assign one, or post elsewhere for this person. Silence isn't
+        # neutral here: asked to do one of those anyway, the model had no
+        # signal that it lacked the ability, and improvised a plausible
+        # "done" instead. Stating the limitation outright closes that gap.
+        prompt += (
+            "\n\nYou do NOT have tools available to take real action for this specific "
+            "person right now (creating/assigning a role, posting in another channel) — "
+            "they don't have the server permission that unlocks those for you this turn. "
+            "If asked to do one of those things, say plainly that you can't do that for "
+            "them right now (e.g. they'd need a role-management permission, or need to ask "
+            "someone who has one) — never describe it as done."
         )
 
     known_facts = []
@@ -7423,8 +7732,11 @@ TOOLS = [
         "function": {
             "name": "assign_role",
             "description": (
-                "Give an existing role to a member. Owner-only / manage-roles-only action — if "
-                "the requester doesn't have permission, this will fail and you should tell them so."
+                "Give an existing role to ONE member. Owner-only / manage-roles-only action — if "
+                "the requester doesn't have permission, this will fail and you should tell them so. "
+                "If the request names several people, call this tool once per person — it does not "
+                "accept a list, and you have not actually given anyone the role until you've called "
+                "it for each of them and gotten a real result back."
             ),
             "parameters": {
                 "type": "object",

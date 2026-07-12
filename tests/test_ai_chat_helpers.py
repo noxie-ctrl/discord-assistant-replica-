@@ -8,6 +8,7 @@ from cogs.ai_chat import (
     extract_image_urls_from_embeds,
     summarize_tool_results_for_fallback,
     member_has_any_permission,
+    AIChat,
 )
 
 
@@ -146,6 +147,38 @@ class PermissionGapFixTests(unittest.TestCase):
     def test_missing_attribute_defaults_to_false_not_a_crash(self):
         perms = SimpleNamespace(administrator=False)
         self.assertFalse(member_has_any_permission(perms, "manage_channels"))
+
+
+class BoundedCacheWiringTests(unittest.TestCase):
+    """Regression coverage for swapping the plain, unboundedly-growing
+    tracking dicts (_recent_replies, _last_alert, _last_activity_at,
+    _last_idle_chatter_at, _last_vent_check) for cachetools caches that
+    clean themselves up over a long-running process, without changing how
+    any call site reads/writes them."""
+
+    def setUp(self):
+        self.cog = AIChat(bot=SimpleNamespace())
+
+    def test_recent_replies_is_bounded_lru(self):
+        for i in range(600):
+            self.cog._recent_replies[i] = (1, 2, 3, "snippet")
+        self.assertLessEqual(len(self.cog._recent_replies), 500)
+        # The most recently inserted entries should have survived eviction.
+        self.assertIn(599, self.cog._recent_replies)
+
+    def test_recent_replies_still_behaves_like_a_dict(self):
+        self.cog._recent_replies[42] = (1, 2, 3, "hi")
+        self.assertEqual(self.cog._recent_replies.get(42), (1, 2, 3, "hi"))
+        self.assertIsNone(self.cog._recent_replies.get(999))
+
+    def test_last_alert_and_activity_caches_support_dict_style_get(self):
+        self.cog._last_alert[(1, 2)] = 100.0
+        self.assertEqual(self.cog._last_alert.get((1, 2)), 100.0)
+        self.assertIsNone(self.cog._last_alert.get((9, 9)))
+
+        self.cog._last_activity_at[555] = 42.0
+        self.assertEqual(self.cog._last_activity_at.get(555, 0.0), 42.0)
+        self.assertEqual(self.cog._last_activity_at.get(999, 0.0), 0.0)
 
 
 if __name__ == "__main__":

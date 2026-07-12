@@ -18,6 +18,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils import database as db
+from utils import http
 
 logger = logging.getLogger("lucy.news")
 
@@ -33,11 +34,11 @@ FEEDS = {
 async def _fetch_feed(category: str, limit: int = 5) -> list[dict]:
     url = FEEDS.get(category, FEEDS["top"])
     timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Feed request failed with status {resp.status}")
-            raw = await resp.text()
+    session = await http.get_session()
+    async with session.get(url, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Feed request failed with status {resp.status}")
+        raw = await resp.text()
 
     root = ET.fromstring(raw)
     items = []

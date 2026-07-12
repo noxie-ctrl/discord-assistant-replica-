@@ -26,6 +26,8 @@ import logging
 
 import aiohttp
 
+from utils import http
+
 logger = logging.getLogger("lucy.groq_client")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -73,14 +75,14 @@ async def _call_one(model: str, messages: list[dict], max_tokens: int, temperatu
         "Content-Type": "application/json",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(GROQ_API_URL, json=payload, headers=headers) as resp:
-            if resp.status == 429:
-                raise _RateLimited(f"Groq key rate-limited on {model}")
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"Groq {model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
+    session = await http.get_session()
+    async with session.post(GROQ_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise _RateLimited(f"Groq key rate-limited on {model}")
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"Groq {model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
         content = (data["choices"][0]["message"].get("content") or "").strip()

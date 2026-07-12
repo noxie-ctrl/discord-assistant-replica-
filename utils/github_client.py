@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 
 import aiohttp
 
+from utils import http
+
 logger = logging.getLogger("lucy.github_client")
 
 API_BASE = "https://api.github.com"
@@ -70,8 +72,16 @@ def _headers() -> dict:
     return headers
 
 
-async def _get(session: aiohttp.ClientSession, url: str, params: dict | None = None):
-    async with session.get(url, params=params, headers=_headers()) as resp:
+async def _get(url: str, params: dict | None = None, timeout_seconds: int = 10):
+    """Shared-session GET fixed up in the HTTP-pooling pass (this session)
+    — this used to take a `session` argument that every one of the 9 call
+    sites below created via its own `async with aiohttp.ClientSession(...)`,
+    meaning every GitHub API call opened a fresh TCP+TLS connection instead
+    of reusing one. Now it just asks for the process-wide pooled session and
+    keeps its own per-call timeout, same as before."""
+    session = await http.get_session()
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with session.get(url, params=params, headers=_headers(), timeout=timeout) as resp:
         if resp.status == 404:
             raise RepoNotFound(url)
         if resp.status == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
@@ -85,9 +95,7 @@ async def _get(session: aiohttp.ClientSession, url: str, params: dict | None = N
 async def get_repo_info(owner: str, repo: str) -> dict:
     """Validates the repo exists (and is reachable with current auth) and
     returns a small dict: default_branch, description, html_url, private, stars."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}")
+    data = await _get(f"{API_BASE}/repos/{owner}/{repo}")
     return {
         "default_branch": data.get("default_branch") or "main",
         "description": data.get("description") or "",
@@ -98,12 +106,10 @@ async def get_repo_info(owner: str, repo: str) -> dict:
 
 
 async def get_latest_commit_sha(owner: str, repo: str, branch: str) -> str | None:
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/commits/{branch}")
-        except RepoNotFound:
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/commits/{branch}")
+    except RepoNotFound:
+        return None
     return data.get("sha")
 
 
@@ -111,13 +117,11 @@ async def get_new_commits(owner: str, repo: str, base_sha: str, head_sha: str, l
     """Commits reachable from head_sha but not base_sha, newest first. Falls
     back to an empty list (rather than raising) if the compare fails — e.g.
     base_sha was force-pushed away — so the caller can just resync quietly."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}")
-        except GitHubError as e:
-            logger.warning("Compare failed for %s/%s (%s...%s): %s", owner, repo, base_sha, head_sha, e)
-            return []
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}")
+    except GitHubError as e:
+        logger.warning("Compare failed for %s/%s (%s...%s): %s", owner, repo, base_sha, head_sha, e)
+        return []
 
     commits = data.get("commits", [])[-limit:]
     out = []
@@ -138,13 +142,11 @@ async def get_pull_request(owner: str, repo: str, number: int) -> dict | None:
     """Full PR details — body/description and diff stats — used for the AI
     summary and size label. Returns None on any failure rather than raising,
     since callers treat this as a best-effort enrichment."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
-        except GitHubError as e:
-            logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+    except GitHubError as e:
+        logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
+        return None
     return {
         "body": data.get("body") or "",
         "merged": bool(data.get("merged_at")),
@@ -173,46 +175,43 @@ async def get_recent_pull_events(owner: str, repo: str, since: datetime, limit: 
     `since`) filtered down to items that are actually PRs, then resolves
     closed ones against /pulls/{number} to distinguish merged vs closed."""
     since_iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    timeout = aiohttp.ClientTimeout(total=10)
     events: list[dict] = []
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            issues = await _get(
-                session,
-                f"{API_BASE}/repos/{owner}/{repo}/issues",
-                params={"since": since_iso, "state": "all", "sort": "updated",
-                        "direction": "asc", "per_page": str(limit * 2)},
-            )
-        except GitHubError as e:
-            logger.warning("Issue/PR listing failed for %s/%s: %s", owner, repo, e)
-            return []
+    try:
+        issues = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/issues",
+            params={"since": since_iso, "state": "all", "sort": "updated",
+                    "direction": "asc", "per_page": str(limit * 2)},
+        )
+    except GitHubError as e:
+        logger.warning("Issue/PR listing failed for %s/%s: %s", owner, repo, e)
+        return []
 
-        prs = [i for i in issues if "pull_request" in i][-limit:]
+    prs = [i for i in issues if "pull_request" in i][-limit:]
 
-        for pr in prs:
-            number = pr["number"]
-            created_at = _parse_ts(pr.get("created_at"))
-            closed_at = _parse_ts(pr.get("closed_at"))
+    for pr in prs:
+        number = pr["number"]
+        created_at = _parse_ts(pr.get("created_at"))
+        closed_at = _parse_ts(pr.get("closed_at"))
 
-            if created_at and created_at > since:
-                events.append({
-                    "type": "opened", "number": number, "title": pr.get("title", ""),
-                    "url": pr.get("html_url", ""), "user": (pr.get("user") or {}).get("login", "someone"),
-                })
-                continue  # don't also report it as closed in the same cycle
+        if created_at and created_at > since:
+            events.append({
+                "type": "opened", "number": number, "title": pr.get("title", ""),
+                "url": pr.get("html_url", ""), "user": (pr.get("user") or {}).get("login", "someone"),
+            })
+            continue  # don't also report it as closed in the same cycle
 
-            if pr.get("state") == "closed" and closed_at and closed_at > since:
-                try:
-                    full = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
-                    merged = bool(full.get("merged_at"))
-                except GitHubError:
-                    merged = False
-                events.append({
-                    "type": "merged" if merged else "closed", "number": number,
-                    "title": pr.get("title", ""), "url": pr.get("html_url", ""),
-                    "user": (pr.get("user") or {}).get("login", "someone"),
-                })
+        if pr.get("state") == "closed" and closed_at and closed_at > since:
+            try:
+                full = await _get(f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+                merged = bool(full.get("merged_at"))
+            except GitHubError:
+                merged = False
+            events.append({
+                "type": "merged" if merged else "closed", "number": number,
+                "title": pr.get("title", ""), "url": pr.get("html_url", ""),
+                "user": (pr.get("user") or {}).get("login", "someone"),
+            })
 
     return events
 
@@ -244,12 +243,10 @@ NOISE_FILE_SUFFIXES = (".lock", ".min.js", ".map", ".png", ".jpg", ".jpeg", ".gi
 async def get_readme(owner: str, repo: str) -> str | None:
     """Decoded README text (any of the names GitHub recognizes), or None if
     the repo has none / it can't be fetched."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/readme")
-        except GitHubError:
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/readme")
+    except GitHubError:
+        return None
     return _decode_content(data)
 
 
@@ -257,16 +254,14 @@ async def get_repo_tree(owner: str, repo: str, branch: str) -> list[str]:
     """Every file path in the repo at `branch` (recursive git tree), minus
     obvious noise directories/files, capped to MAX_TREE_ENTRIES. Used to
     give the model a sense of project layout for broad questions."""
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(
-                session, f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
-                params={"recursive": "1"},
-            )
-        except GitHubError as e:
-            logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
-            return []
+    try:
+        data = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
+            params={"recursive": "1"}, timeout_seconds=15,
+        )
+    except GitHubError as e:
+        logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
+        return []
 
     paths = []
     for entry in data.get("tree", []):
@@ -287,16 +282,14 @@ async def get_file_content(owner: str, repo: str, path: str, ref: str) -> str | 
     """Decoded text content of a single file at `path`, truncated to
     MAX_FILE_CHARS. Returns None if the file doesn't exist, is binary, or
     is too large to be worth returning."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(
-                session, f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
-                params={"ref": ref},
-            )
-        except GitHubError as e:
-            logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
-            return None
+    try:
+        data = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
+            params={"ref": ref},
+        )
+    except GitHubError as e:
+        logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
+        return None
 
     if isinstance(data, list):
         return None  # path was a directory, not a file
@@ -328,12 +321,11 @@ async def search_code(owner: str, repo: str, query: str, limit: int = 5) -> list
             "unauthenticated requests) — the repo link and update features still work without one."
         )
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        data = await _get(
-            session, f"{API_BASE}/search/code",
-            params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
-        )
+    data = await _get(
+        f"{API_BASE}/search/code",
+        params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
+        timeout_seconds=15,
+    )
 
     results = []
     for item in data.get("items", [])[:limit]:
