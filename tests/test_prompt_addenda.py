@@ -55,5 +55,24 @@ class ToolActionHonestyAddendumTests(unittest.TestCase):
         self.assertIn("you haven't done it, full stop", prompt)
 
 
+class NoToolsAvailableAddendumTests(unittest.TestCase):
+    """Regression coverage for the permission-gap fix: when can_use_tools is
+    False, the prompt now says so outright instead of leaving it unstated —
+    the gap that let Lucy improvise a fake 'done' for a genuine admin whose
+    permissions were misread (ADMINISTRATOR-only role) rather than telling
+    them plainly she couldn't do it."""
+
+    def test_disabled_tools_state_limitation_plainly(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=False)
+        self.assertIn("do NOT have tools available", prompt)
+        self.assertIn("never describe it as done", prompt)
+
+    def test_enabled_tools_does_not_include_the_disabled_wording(self):
+        personality = {**BASE_PERSONALITY, "pronouns": "she/her"}
+        prompt = build_system_prompt(personality, "NERV-HQ", "Nox", can_use_tools=True)
+        self.assertNotIn("do NOT have tools available", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -454,6 +454,22 @@ def build_system_prompt(
             "be rejected by the system if the requester lacks permission — if that happens, "
             "just tell them plainly, don't pretend it worked."
         )
+    else:
+        # Permission-gap fix (this session): this branch used to not exist —
+        # when can_use_tools was False, the prompt just said nothing at all
+        # about action tools, so nothing told the model it COULDN'T create a
+        # role, assign one, or post elsewhere for this person. Silence isn't
+        # neutral here: asked to do one of those anyway, the model had no
+        # signal that it lacked the ability, and improvised a plausible
+        # "done" instead. Stating the limitation outright closes that gap.
+        prompt += (
+            "\n\nYou do NOT have tools available to take real action for this specific "
+            "person right now (creating/assigning a role, posting in another channel) — "
+            "they don't have the server permission that unlocks those for you this turn. "
+            "If asked to do one of those things, say plainly that you can't do that for "
+            "them right now (e.g. they'd need a role-management permission, or need to ask "
+            "someone who has one) — never describe it as done."
+        )
 
     known_facts = []
     now_utc = datetime.now(timezone.utc)

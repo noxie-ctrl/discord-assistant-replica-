@@ -7,6 +7,7 @@ from cogs.ai_chat import (
     extract_image_urls_from_attachments,
     extract_image_urls_from_embeds,
     summarize_tool_results_for_fallback,
+    member_has_any_permission,
 )
 
 
@@ -118,6 +119,33 @@ class ToolHonestyFallbackTests(unittest.TestCase):
         self.assertIn("Alice", result)
         self.assertIn("Error: no member named 'bobb' found.", result)
         self.assertIn("Carol", result)
+
+
+class PermissionGapFixTests(unittest.TestCase):
+    """Regression coverage for the real root cause behind 'she says done but
+    nothing happened': can_use_tools (and the create_role/assign_role gates)
+    used to check manage_roles/manage_guild/manage_channels directly, which
+    misses members whose only grant is ADMINISTRATOR on a role — a very
+    common single-admin-role server setup. ADMINISTRATOR does not imply
+    those other bits are set in the raw permission bitfield, so a genuine
+    admin could silently read as having none of them."""
+
+    def test_administrator_alone_counts_as_permission(self):
+        perms = SimpleNamespace(administrator=True, manage_roles=False, manage_guild=False)
+        self.assertTrue(member_has_any_permission(perms, "manage_roles"))
+        self.assertTrue(member_has_any_permission(perms, "manage_guild", "manage_channels"))
+
+    def test_specific_permission_still_works_without_administrator(self):
+        perms = SimpleNamespace(administrator=False, manage_roles=True, manage_guild=False)
+        self.assertTrue(member_has_any_permission(perms, "manage_roles"))
+
+    def test_neither_administrator_nor_named_permission_is_false(self):
+        perms = SimpleNamespace(administrator=False, manage_roles=False, manage_guild=False)
+        self.assertFalse(member_has_any_permission(perms, "manage_roles", "manage_guild"))
+
+    def test_missing_attribute_defaults_to_false_not_a_crash(self):
+        perms = SimpleNamespace(administrator=False)
+        self.assertFalse(member_has_any_permission(perms, "manage_channels"))
 
 
 if __name__ == "__main__":

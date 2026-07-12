@@ -239,6 +239,33 @@ def summarize_tool_results_for_fallback(tool_results: list[tuple[str, str]]) -> 
     return "Here's what actually happened: " + " ".join(result for _, result in tool_results)
 
 
+def member_has_any_permission(permissions, *names: str) -> bool:
+    """True if `permissions` grants ADMINISTRATOR, or any of the named
+    permission flags directly.
+
+    Permission-gap bug fix (this session): Discord's ADMINISTRATOR bit does
+    NOT imply the other convenience bits (manage_roles, manage_guild, etc.)
+    are also set in the raw permission bitfield discord.py exposes — it's a
+    well-known gotcha, not a discord.py quirk specific to us. A server with
+    one all-powerful admin role (very common — grant Administrator once,
+    done) means every member of that role reads as having none of the
+    individual permissions this bot checks for, even though Discord's own
+    backend treats them as able to do literally anything. That silently
+    dropped can_use_tools to False for genuine admins, meaning the model
+    was never even given create_role/assign_role to call — it had zero
+    ability to do what was asked, and with nothing telling it that plainly,
+    it improvised a confident-sounding "done" instead. This is the actual
+    fix; the honesty-addendum and tool-loop fixes from last session help
+    the model behave better when it HAS tools, but don't help if the tool
+    was never in its list to begin with.
+
+    `permissions` just needs getattr-able boolean attributes — works with
+    real discord.Permissions and with simple test doubles alike."""
+    if getattr(permissions, "administrator", False):
+        return True
+    return any(getattr(permissions, name, False) for name in names)
+
+
 def format_member_lookup(data: dict) -> str:
     """Pure formatter for the lookup_member tool (Max Awareness, Phase 1) —
     takes a plain dict of already-extracted fields so it's unit-testable
@@ -624,8 +651,9 @@ class AIChat(commands.Cog):
         author = message.author
         owner_id = getattr(self.bot, "owner_id", None)
         is_owner = owner_id is not None and author.id == owner_id
-        has_manage_roles = getattr(author.guild_permissions, "manage_roles", False)
-        has_manage_guild = getattr(author.guild_permissions, "manage_guild", False)
+        has_role_management_permission = member_has_any_permission(
+            author.guild_permissions, "manage_roles"
+        )
 
         if name == "flag_for_owner":
             reason = args.get("reason") or "Lucy flagged this conversation."
@@ -651,7 +679,7 @@ class AIChat(commands.Cog):
             return f"Success: posted to #{target.name}."
 
         if name == "create_role":
-            if not (is_owner or has_manage_roles):
+            if not (is_owner or has_role_management_permission):
                 return "Error: requester doesn't have permission to create roles."
             role_name = args.get("role_name") or "New Role"
             color_hex = args.get("color_hex")
@@ -665,7 +693,7 @@ class AIChat(commands.Cog):
             return f"Success: created role '{new_role.name}'."
 
         if name == "assign_role":
-            if not (is_owner or has_manage_roles):
+            if not (is_owner or has_role_management_permission):
                 return "Error: requester doesn't have permission to assign roles."
             member_name = (args.get("member_name") or "").lower()
             role_name = (args.get("role_name") or "").lower()
@@ -972,8 +1000,9 @@ class AIChat(commands.Cog):
         owner_member = guild.owner
         owner_name = owner_member.display_name if owner_member else "the server owner"
 
-        can_use_tools = is_owner or author.guild_permissions.manage_guild or author.guild_permissions.manage_roles \
-            or author.guild_permissions.manage_channels
+        can_use_tools = is_owner or member_has_any_permission(
+            author.guild_permissions, "manage_guild", "manage_roles", "manage_channels"
+        )
 
         relationship_tier = db.get_relationship_tier(profile.get("relationship_score") or 0)
         adaptation_note = persona_engine.render_adaptation_layer(style_profile, style_confidence)
@@ -1038,6 +1067,18 @@ class AIChat(commands.Cog):
                 nim_client.CONCERN_TOOLS + nim_client.INFO_TOOLS + nim_client.GROUNDING_TOOLS
                 + (nim_client.TOOLS if can_use_tools else [])
             )
+            # Diagnostic logging (this session): the permission-gap bug above
+            # meant action tools could silently be withheld from a genuine
+            # admin with no visible symptom except Lucy improvising a fake
+            # "done" — nothing in the logs distinguished "tool was offered
+            # and she chose not to use it" from "tool was never offered at
+            # all." This makes that visible in Railway's normal INFO-level
+            # logs without needing to reproduce it under a debugger.
+            if can_use_tools:
+                logger.info(
+                    "Action tools offered to %s (id %s) in guild %s, channel %s",
+                    author, author.id, guild.id, message.channel.id,
+                )
             tool_results_log: list[tuple[str, str]] = []
             reply = None
 
@@ -1055,6 +1096,7 @@ class AIChat(commands.Cog):
                 for tool_call in assistant_message["tool_calls"]:
                     result = await self._execute_tool_call(tool_call, message)
                     tool_results_log.append((tool_call["function"]["name"], result))
+                    logger.info("Tool call: %s -> %s", tool_call["function"]["name"], result)
                     chat_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.get("id", ""),
@@ -1062,6 +1104,13 @@ class AIChat(commands.Cog):
                     })
                 # Loop again: Lucy now has these results and can either call
                 # more tools (multi-step actions) or write the real reply.
+
+            if can_use_tools and not tool_results_log:
+                logger.info(
+                    "can_use_tools was True for %s but no tool was called this turn "
+                    "(model answered in plain text, or genuinely had nothing to do)",
+                    author,
+                )
 
             if reply is None:
                 # Hit MAX_TOOL_ITERATIONS while she still wanted to call
