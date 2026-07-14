@@ -224,7 +224,19 @@ async def init_pool():
     if dsn.startswith("postgres://"):
         dsn = dsn.replace("postgres://", "postgresql://", 1)
 
-    _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+    # Portability fix: Render/Koyeb (and some other hosts) require SSL for
+    # their managed Postgres, but Railway's internal Postgres does not. Rather
+    # than hardcoding per-platform behavior, we let asyncpg auto-negotiate:
+    # passing ssl="require" when the DSN doesn't already specify it covers the
+    # common case where a host enforces SSL but the connection string omits
+    # the parameter. If sslmode is already in the DSN, asyncpg respects it.
+    # This is a no-op on Railway (same connection either way) and required on
+    # Render/Koyeb free-tier Postgres.
+    connect_kwargs = {"min_size": 1, "max_size": 10}
+    if "sslmode=" not in dsn and "?ssl=" not in dsn:
+        connect_kwargs["ssl"] = "require"
+
+    _pool = await asyncpg.create_pool(dsn=dsn, **connect_kwargs)
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA)
         await conn.execute(MIGRATIONS)

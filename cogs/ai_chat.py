@@ -54,6 +54,8 @@ from utils import facts
 from utils import github_client
 from utils import persona_engine
 
+from utils.rate_limiter import is_chat_rate_limited
+
 logger = logging.getLogger("lucy.ai_chat")
 
 NOTES_UPDATE_INTERVAL = 15  # messages between long-term memory refreshes
@@ -510,8 +512,10 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
+        if is_chat_rate_limited(message.author.id):
+            return  # silently drop — don't even acknowledge
+
         self._last_activity_at[message.channel.id] = asyncio.get_running_loop().time()
-        will_reply = await self._should_respond(message)
 
         settings = await db.get_guild_settings(message.guild.id)
         if not will_reply and settings.get("channel_redirection_enabled"):

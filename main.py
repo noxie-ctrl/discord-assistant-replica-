@@ -124,6 +124,21 @@ class Lucy(commands.Bot):
         await db.init_pool()
         logger.info("Postgres pool ready.")
 
+        # Rate-limit all slash commands globally: 1 command / 5s / user.
+        # Owner bypasses. Cog-level checks (is_admin_or_mod, etc.) still
+        # run after this, so permission gates aren't affected.
+        from utils.rate_limiter import is_slash_rate_limited
+
+        async def _interaction_check(interaction: discord.Interaction) -> bool:
+            if is_slash_rate_limited(interaction.user.id):
+                await interaction.response.send_message(
+                    "You're using commands too fast — slow down.", ephemeral=True
+                )
+                return False
+            return True
+
+        self.tree.interaction_check = _interaction_check
+
         for cog in COGS:
             try:
                 await self.load_extension(cog)
@@ -154,14 +169,67 @@ class Lucy(commands.Bot):
         await super().close()
 
 
+# ---------------------------------------------------------------------------
+# Health-check HTTP endpoint (aiohttp.web, in-process)
+# ---------------------------------------------------------------------------
+# Render/Koyeb/Railway all inject PORT. A free pinger service (UptimeRobot)
+# hits this every few minutes to keep the dyno awake. Bound to the same
+# event loop as the bot — starts alongside the gateway connection, doesn't
+# block it, and shuts down cleanly when the bot closes.
+# ---------------------------------------------------------------------------
+
+from aiohttp import web
+
+
+async def _health_handler(request: web.Request) -> web.Response:
+    """Lightweight health check: gateway connected + DB reachable."""
+    bot: Lucy = request.app["bot"]
+    status = {"gateway": "connected" if bot.is_ready() else "connecting"}
+
+    try:
+        pool = db._require_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        status["database"] = "ok"
+    except Exception as e:
+        status["database"] = f"error: {e}"
+
+    http_status = 200 if status["database"] == "ok" else 503
+    return web.json_response(status, status=http_status)
+
+
+async def _start_health_server(bot: Lucy) -> web.AppRunner:
+    """Start the aiohttp.web health endpoint on $PORT (default 8080).
+    Returns the runner so the caller can clean it up on shutdown."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_get("/health", _health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info("Health endpoint listening on 0.0.0.0:%s/health", port)
+    return runner
+
+
 async def main():
     token = os.getenv("DISCORD_TOKEN", "").strip()
     if not token:
         raise RuntimeError("DISCORD_TOKEN is not set.")
 
     bot = Lucy()
-    async with bot:
-        await bot.start(token)
+    runner = None
+    try:
+        # Start the health endpoint first so it's ready before the gateway
+        # connect (Render's health probe may fire immediately).
+        runner = await _start_health_server(bot)
+        async with bot:
+            await bot.start(token)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+            logger.info("Health endpoint shut down.")
 
 
 if __name__ == "__main__":

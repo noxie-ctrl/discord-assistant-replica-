@@ -54,7 +54,9 @@ cogs/
 tests/
   test_ai_chat_helpers.py
   test_awareness_vibe.py
+  test_database_field_whitelist.py
   test_facts.py
+  test_games_timeout_view.py
   test_idle_chatter_channels.py
   test_member_lookup.py
   test_openrouter_client.py
@@ -69,10 +71,12 @@ utils/
   github_client.py
   github_summarizer.py
   groq_client.py
+  http.py
   nim_client.py
   openrouter_client.py
   permissions.py
   persona_engine.py
+  rate_limiter.py
 .gitignore
 main.py
 personality_default.json
@@ -84,290 +88,75 @@ requirements.txt
 <files>
 This section contains the contents of the repository's files.
 
+<file path="utils/rate_limiter.py">
+"""
+utils/rate_limiter.py
+
+Pure in-memory rate limiting for Lucy. No new dependencies — reuses
+cachetools (already used in cogs/ai_chat.py for TTL/LRU caching).
+
+Two limits:
+  - Chat messages: 7 messages / minute / user
+  - Slash commands: 1 command / 5 seconds / user
+
+Bot owner bypasses both entirely (reuses _is_owner from permissions.py).
+
+This module is deliberately stateless across restarts — a deploy resets all
+buckets, which is fine for a Discord bot (the alternative is a Redis dependency
+or DB writes on every message, neither of which is worth it for this use case).
+"""
+
+import time
+import logging
+
+import cachetools
+
+from utils.permissions import _is_owner
+
+logger = logging.getLogger("lucy.rate_limiter")
+
+# (user_id) -> list of timestamps (Unix float). Window = 60s.
+_chat_buckets: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=60)
+# (user_id) -> last slash-command timestamp (Unix float).
+_slash_buckets: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=5)
+
+CHAT_LIMIT = 7       # messages per 60-second window
+SLASH_COOLDOWN = 5.0  # seconds between slash commands
+
+
+def is_chat_rate_limited(user_id: int) -> bool:
+    """Returns True if this user has hit the 7 msg/min cap. Owner always passes."""
+    if _is_owner(user_id):
+        return False
+    now = time.time()
+    bucket = _chat_buckets.get(user_id)
+    if bucket is None:
+        bucket = []
+        _chat_buckets[user_id] = bucket
+    # Prune entries older than 60s
+    cutoff = now - 60
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= CHAT_LIMIT:
+        return True
+    bucket.append(now)
+    return False
+
+
+def is_slash_rate_limited(user_id: int) -> bool:
+    """Returns True if this user's last slash command was < 5s ago. Owner always passes."""
+    if _is_owner(user_id):
+        return False
+    now = time.time()
+    last = _slash_buckets.get(user_id)
+    if last is not None and (now - last) < SLASH_COOLDOWN:
+        return True
+    _slash_buckets[user_id] = now
+    return False
+</file>
+
 <file path="cogs/__init__.py">
 
-</file>
-
-<file path="cogs/moderation.py">
-import discord
-from discord import app_commands
-from discord.ext import commands
-from datetime import timedelta
-
-from utils import database as db
-from utils.permissions import is_admin_or_mod, is_admin_or_mod_ctx
-
-
-async def log_action(bot: commands.Bot, guild: discord.Guild, embed: discord.Embed):
-    settings = await db.get_guild_settings(guild.id)
-    channel_id = settings.get("log_channel_id")
-    if channel_id:
-        channel = guild.get_channel(channel_id)
-        if channel:
-            try:
-                await channel.send(embed=embed)
-            except discord.Forbidden:
-                pass
-
-
-class Moderation(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    # ---------- KICK ----------
-    @app_commands.command(name="kick", description="Kick a member from the server")
-    @is_admin_or_mod()
-    async def kick_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-        await member.kick(reason=reason)
-        embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-
-    @commands.command(name="kick")
-    @is_admin_or_mod_ctx()
-    async def kick_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        await member.kick(reason=reason)
-        embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=ctx.author.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=embed)
-        await log_action(self.bot, ctx.guild, embed)
-
-    # ---------- BAN ----------
-    @app_commands.command(name="ban", description="Ban a member from the server")
-    @is_admin_or_mod()
-    async def ban_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
-        await member.ban(reason=reason)
-        embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-
-    @commands.command(name="ban")
-    @is_admin_or_mod_ctx()
-    async def ban_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
-        await member.ban(reason=reason)
-        embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=ctx.author.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=embed)
-        await log_action(self.bot, ctx.guild, embed)
-
-    # ---------- UNBAN ----------
-    @app_commands.command(name="unban", description="Unban a user by ID")
-    @is_admin_or_mod()
-    async def unban_slash(self, interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
-        user = discord.Object(id=int(user_id))
-        await interaction.guild.unban(user, reason=reason)
-        embed = discord.Embed(title="✅ Member Unbanned", color=discord.Color.green())
-        embed.add_field(name="User ID", value=user_id)
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-
-    # ---------- MUTE (timeout) ----------
-    @app_commands.command(name="mute", description="Timeout a member (minutes)")
-    @is_admin_or_mod()
-    async def mute_slash(self, interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "No reason provided"):
-        await member.timeout(timedelta(minutes=minutes), reason=reason)
-        embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Duration", value=f"{minutes} min")
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-
-    @commands.command(name="mute")
-    @is_admin_or_mod_ctx()
-    async def mute_prefix(self, ctx: commands.Context, member: discord.Member, minutes: int, *, reason: str = "No reason provided"):
-        await member.timeout(timedelta(minutes=minutes), reason=reason)
-        embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Duration", value=f"{minutes} min")
-        embed.add_field(name="Moderator", value=ctx.author.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await ctx.send(embed=embed)
-        await log_action(self.bot, ctx.guild, embed)
-
-    # ---------- UNMUTE ----------
-    @app_commands.command(name="unmute", description="Remove timeout from a member")
-    @is_admin_or_mod()
-    async def unmute_slash(self, interaction: discord.Interaction, member: discord.Member):
-        await member.timeout(None)
-        embed = discord.Embed(title="🔊 Member Unmuted", color=discord.Color.green())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-
-    # ---------- WARN ----------
-    @app_commands.command(name="warn", description="Warn a member")
-    @is_admin_or_mod()
-    async def warn_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str):
-        await db.add_warning(interaction.guild.id, member.id, interaction.user.id, reason)
-        embed = discord.Embed(title="⚠️ Member Warned", color=discord.Color.yellow())
-        embed.add_field(name="User", value=f"{member} ({member.id})")
-        embed.add_field(name="Moderator", value=interaction.user.mention)
-        embed.add_field(name="Reason", value=reason, inline=False)
-        await interaction.response.send_message(embed=embed)
-        await log_action(self.bot, interaction.guild, embed)
-        try:
-            await member.send(f"You were warned in **{interaction.guild.name}**: {reason}")
-        except discord.Forbidden:
-            pass
-
-    @app_commands.command(name="warnings", description="List a member's warnings")
-    async def warnings_slash(self, interaction: discord.Interaction, member: discord.Member):
-        warns = await db.get_warnings(interaction.guild.id, member.id)
-        if not warns:
-            await interaction.response.send_message(f"{member.mention} has no warnings. Clean record!")
-            return
-        embed = discord.Embed(title=f"⚠️ Warnings for {member}", color=discord.Color.yellow())
-        for w in warns[:10]:
-            embed.add_field(name=f"#{w['id']}", value=w["reason"], inline=False)
-        await interaction.response.send_message(embed=embed)
-
-    # ---------- PURGE ----------
-    @app_commands.command(name="purge", description="Delete a number of recent messages")
-    @is_admin_or_mod()
-    async def purge_slash(self, interaction: discord.Interaction, amount: int):
-        await interaction.response.defer(ephemeral=True)
-        deleted = await interaction.channel.purge(limit=amount)
-        await interaction.followup.send(f"🧹 Deleted {len(deleted)} messages.", ephemeral=True)
-
-    @commands.command(name="purge")
-    @is_admin_or_mod_ctx()
-    async def purge_prefix(self, ctx: commands.Context, amount: int):
-        deleted = await ctx.channel.purge(limit=amount + 1)
-        msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
-        await msg.delete(delay=3)
-
-    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.CheckFailure):
-            await interaction.response.send_message("🚫 You don't have permission to do that.", ephemeral=True)
-        else:
-            raise error
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Moderation(bot))
-</file>
-
-<file path="cogs/news.py">
-"""
-cogs/news.py
-
-Fixes the "top 5 latest global news" hallucination bug — that data was
-coming straight from the model's imagination. This cog fetches real, current
-headlines from BBC News' public RSS feed (no API key required) and returns
-them as an embed. /news also feeds these into chat memory so if someone
-follows up with Lucy about "that earthquake story" etc., she's grounded in
-what was actually shown, not a guess.
-"""
-
-import logging
-import xml.etree.ElementTree as ET
-
-import aiohttp
-import discord
-from discord import app_commands
-from discord.ext import commands
-
-from utils import database as db
-
-logger = logging.getLogger("lucy.news")
-
-FEEDS = {
-    "world": "http://feeds.bbci.co.uk/news/world/rss.xml",
-    "top": "http://feeds.bbci.co.uk/news/rss.xml",
-    "tech": "http://feeds.bbci.co.uk/news/technology/rss.xml",
-    "business": "http://feeds.bbci.co.uk/news/business/rss.xml",
-    "sport": "http://feeds.bbci.co.uk/sport/rss.xml",
-}
-
-
-async def _fetch_feed(category: str, limit: int = 5) -> list[dict]:
-    url = FEEDS.get(category, FEEDS["top"])
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(url) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Feed request failed with status {resp.status}")
-            raw = await resp.text()
-
-    root = ET.fromstring(raw)
-    items = []
-    for item in root.findall(".//item")[:limit]:
-        title = item.findtext("title", default="").strip()
-        link = item.findtext("link", default="").strip()
-        description = (item.findtext("description", default="") or "").strip()
-        items.append({"title": title, "link": link, "description": description})
-    return items
-
-
-class News(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
-
-    @app_commands.command(name="news", description="Get real, current headlines")
-    @app_commands.describe(category="Which section to pull headlines from")
-    @app_commands.choices(category=[
-        app_commands.Choice(name="Top stories", value="top"),
-        app_commands.Choice(name="World", value="world"),
-        app_commands.Choice(name="Technology", value="tech"),
-        app_commands.Choice(name="Business", value="business"),
-        app_commands.Choice(name="Sport", value="sport"),
-    ])
-    async def news(self, interaction: discord.Interaction, category: app_commands.Choice[str] = None):
-        await interaction.response.defer()
-        cat_value = category.value if category else "top"
-
-        try:
-            items = await _fetch_feed(cat_value)
-        except Exception:
-            logger.exception("Failed to fetch news feed for category=%s", cat_value)
-            await interaction.followup.send(
-                "Couldn't reach the news feed just now — try again in a bit."
-            )
-            return
-
-        if not items:
-            await interaction.followup.send("No headlines came back, oddly. Try again shortly.")
-            return
-
-        embed = discord.Embed(
-            title=f"📰 {cat_value.title()} headlines",
-            color=discord.Color.dark_gold(),
-        )
-        for i, item in enumerate(items, start=1):
-            value = item["link"] if item["link"] else "\u200b"
-            embed.add_field(name=f"{i}. {item['title']}", value=value, inline=False)
-
-        await interaction.followup.send(embed=embed)
-
-        # Ground any follow-up chat with what was actually shown
-        if interaction.guild:
-            summary = "; ".join(item["title"] for item in items)
-            await db.add_chat_message(
-                interaction.guild.id,
-                interaction.channel_id,
-                None,
-                None,
-                "assistant",
-                f"[Just showed the user real {cat_value} headlines via /news: {summary}]",
-            )
-
-
-async def setup(bot: commands.Bot):
-    await bot.add_cog(News(bot))
 </file>
 
 <file path="cogs/personality.py">
@@ -566,6 +355,103 @@ class ServerVibeDigestTests(unittest.TestCase):
             asyncio.run(awareness.refresh_server_vibe(7, ["hi again"], force=False))
 
         self.assertEqual(calls["count"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_database_field_whitelist.py">
+import unittest
+
+from utils import database as db
+
+
+class GuildSettingFieldWhitelistTests(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for hardening update_guild_setting against an
+    unvalidated column name landing in its f-string SET clause. No call
+    site in this codebase passes an untrusted field name today — every
+    kwarg is a literal written in source (cogs/utility.py, cogs/github.py)
+    — but there was no guard at all before this, unlike the sibling
+    set_personality_field()/VALID_PERSONALITY_FIELDS pattern a little
+    further down the same file. The whitelist check runs before any pool
+    access, so it's testable without a live database connection."""
+
+    async def test_unknown_field_raises_before_touching_the_db(self):
+        with self.assertRaises(ValueError):
+            await db.update_guild_setting(123, definitely_not_a_real_column="x")
+
+    async def test_no_kwargs_is_a_silent_no_op(self):
+        # Returns immediately (no pool access) rather than raising.
+        result = await db.update_guild_setting(123)
+        self.assertIsNone(result)
+
+    def test_whitelist_covers_every_real_call_site_in_the_codebase(self):
+        # If a future call site starts using a field not listed here, this
+        # is the check that should catch the mismatch in review.
+        known_call_site_fields = {
+            "welcome_channel_id", "welcome_message", "log_channel_id",
+            "chat_trigger_mode", "chat_channel_id", "channel_redirection_enabled",
+            "idle_chatter_enabled", "server_vibe_enabled", "vent_channel_id",
+            "github_digest_channel_id", "github_last_digest_at",
+        }
+        self.assertTrue(known_call_site_fields.issubset(db.VALID_GUILD_SETTING_FIELDS))
+
+
+if __name__ == "__main__":
+    unittest.main()
+</file>
+
+<file path="tests/test_games_timeout_view.py">
+import unittest
+from unittest.mock import AsyncMock
+
+import discord
+
+from cogs.games import TimeoutAwareView
+
+
+class TimeoutAwareViewTests(unittest.IsolatedAsyncioTestCase):
+    """Regression coverage for the 'timed-out games still look clickable'
+    fix. Plain discord.ui.View's default on_timeout only flips
+    button.disabled on the in-memory objects — Discord is never told, so
+    the message kept showing live-looking buttons forever after a game
+    actually expired (TicTacToeView, RPSView, Connect4View all hit this;
+    RPSView didn't even have an on_timeout override before this fix)."""
+
+    def _view_with_a_button(self):
+        view = TimeoutAwareView(timeout=30)
+        view.add_item(discord.ui.Button(label="test"))
+        return view
+
+    async def test_disables_all_children(self):
+        view = self._view_with_a_button()
+        view.message = AsyncMock()
+        await view._disable_and_finalize("timed out")
+        self.assertTrue(all(child.disabled for child in view.children))
+
+    async def test_edits_the_real_message_with_the_note(self):
+        view = self._view_with_a_button()
+        fake_message = AsyncMock()
+        view.message = fake_message
+        await view._disable_and_finalize("⏱️ timed out, nobody moved")
+        fake_message.edit.assert_awaited_once_with(content="⏱️ timed out, nobody moved", view=view)
+
+    async def test_noop_when_message_was_never_captured(self):
+        # Shouldn't happen in practice (every call site sets view.message
+        # right after sending), but must not crash if it's ever missed.
+        view = self._view_with_a_button()
+        view.message = None
+        await view._disable_and_finalize("timed out")  # should not raise
+        self.assertTrue(all(child.disabled for child in view.children))
+
+    async def test_swallows_http_exception_if_message_already_deleted(self):
+        view = self._view_with_a_button()
+        fake_message = AsyncMock()
+        fake_message.edit.side_effect = discord.HTTPException(AsyncMock(), "gone")
+        fake_message.id = 12345
+        view.message = fake_message
+        await view._disable_and_finalize("timed out")  # should not raise
 
 
 if __name__ == "__main__":
@@ -878,192 +764,6 @@ if __name__ == "__main__":
 
 </file>
 
-<file path="utils/facts.py">
-"""
-utils/facts.py
-
-Grounding tools for Lucy's "don't hallucinate specific facts" problem.
-Both of these are genuinely free — no API key, no signup, no rate-limit
-surprise waiting to bite us on Railway's free tier:
-
-- get_weather(location):   Open-Meteo (geocoding + forecast). No key ever.
-- search_fact(query):      Wikipedia's public REST API. No key ever.
-
-Both are deliberately defensive in the same style as groq_client.py /
-openrouter_client.py: network/parse failures return a short, honest
-"couldn't find that" string rather than raising all the way up into the
-chat pipeline — a failed lookup should degrade to "I couldn't check that
-right now," never to a crash that drops the whole reply.
-"""
-
-from __future__ import annotations
-
-import logging
-from typing import Optional
-
-import aiohttp
-
-logger = logging.getLogger("lucy.facts")
-
-GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php"
-WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
-
-REQUEST_TIMEOUT_SECONDS = 8
-
-# https://open-meteo.com/en/docs — WMO weather interpretation codes, condensed
-# to plain language. Grouped rather than exhaustive; good enough for "what's
-# it doing outside" conversational use, not an aviation briefing.
-_WEATHER_CODE_DESCRIPTIONS = {
-    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
-    45: "foggy", 48: "foggy with frost",
-    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
-    56: "light freezing drizzle", 57: "freezing drizzle",
-    61: "light rain", 63: "rain", 65: "heavy rain",
-    66: "light freezing rain", 67: "freezing rain",
-    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
-    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
-    85: "light snow showers", 86: "heavy snow showers",
-    95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
-}
-
-
-def _describe_weather_code(code: Optional[int]) -> str:
-    if code is None:
-        return "conditions unclear"
-    return _WEATHER_CODE_DESCRIPTIONS.get(int(code), "conditions unclear")
-
-
-async def get_weather(location: str) -> str:
-    """Look up current weather for a place name. Returns a short plain-English
-    sentence, or a short honest failure message — never raises to the caller,
-    since this runs as a tool result that gets handed straight back to the
-    model to paraphrase."""
-    location = (location or "").strip()
-    if not location:
-        return "No location was given, so I couldn't check the weather."
-
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                GEOCODE_URL, params={"name": location, "count": 1, "format": "json"}
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't look up '{location}' right now (geocoding service returned {resp.status})."
-                geo = await resp.json()
-
-            results = geo.get("results") or []
-            if not results:
-                return f"Couldn't find a place called '{location}' to check the weather for."
-
-            place = results[0]
-            lat, lon = place.get("latitude"), place.get("longitude")
-            resolved_name = place.get("name") or location
-            admin = place.get("admin1")
-            country = place.get("country")
-            display_name = ", ".join(p for p in [resolved_name, admin, country] if p)
-
-            if lat is None or lon is None:
-                return f"Couldn't resolve coordinates for '{location}'."
-
-            async with session.get(
-                FORECAST_URL,
-                params={
-                    "latitude": lat,
-                    "longitude": lon,
-                    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
-                    "timezone": "auto",
-                },
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't fetch a forecast for {display_name} right now (status {resp.status})."
-                data = await resp.json()
-
-        current = data.get("current") or {}
-        temp = current.get("temperature_2m")
-        feels_like = current.get("apparent_temperature")
-        humidity = current.get("relative_humidity_2m")
-        wind = current.get("wind_speed_10m")
-        condition = _describe_weather_code(current.get("weather_code"))
-
-        if temp is None:
-            return f"Got a response for {display_name} but it didn't include current conditions — try again shortly."
-
-        parts = [f"In {display_name}, it's currently {condition}, {temp}°C"]
-        if feels_like is not None:
-            parts.append(f"(feels like {feels_like}°C)")
-        line = " ".join(parts) + "."
-        extras = []
-        if humidity is not None:
-            extras.append(f"{humidity}% humidity")
-        if wind is not None:
-            extras.append(f"wind at {wind} km/h")
-        if extras:
-            line += " " + ", ".join(extras).capitalize() + "."
-        return line
-
-    except Exception as e:
-        logger.warning("get_weather failed for '%s': %s", location, e)
-        return f"Couldn't check the weather for '{location}' right now — the weather service didn't respond in time."
-
-
-async def search_fact(query: str) -> str:
-    """Quick factual lookup for things like 'when did X happen', 'who is Y',
-    'what is Z' — backed by Wikipedia's public API (no key required). Returns
-    a short summary, or a short honest failure message. This is meant for
-    grounding general-knowledge/date/identity questions, not for anything
-    live/real-time (use get_weather for weather, the news digest for current
-    headlines)."""
-    query = (query or "").strip()
-    if not query:
-        return "No question was given to look up."
-
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                WIKI_SEARCH_URL,
-                params={
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": query,
-                    "srlimit": 1,
-                    "format": "json",
-                },
-                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
-            ) as resp:
-                if resp.status != 200:
-                    return f"Couldn't search for that right now (status {resp.status})."
-                search_data = await resp.json()
-
-            hits = ((search_data.get("query") or {}).get("search")) or []
-            if not hits:
-                return f"Couldn't find anything reliable on '{query}'."
-
-            title = hits[0].get("title")
-            if not title:
-                return f"Couldn't find anything reliable on '{query}'."
-
-            async with session.get(
-                WIKI_SUMMARY_URL.format(title=title.replace(" ", "_")),
-                headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
-            ) as resp:
-                if resp.status != 200:
-                    return f"Found a matching topic ('{title}') but couldn't load details right now."
-                summary_data = await resp.json()
-
-        extract = (summary_data.get("extract") or "").strip()
-        if not extract:
-            return f"Found '{title}' but there's no summary available for it."
-        return f"{title}: {extract}"
-
-    except Exception as e:
-        logger.warning("search_fact failed for '%s': %s", query, e)
-        return f"Couldn't look that up right now — the fact-check service didn't respond in time."
-</file>
-
 <file path="utils/github_summarizer.py">
 """
 utils/github_summarizer.py
@@ -1161,132 +861,70 @@ async def summarize_digest(guild_name: str, activity: list[dict]) -> str | None:
     return await _summarize(prompt, max_tokens=280)
 </file>
 
-<file path="utils/groq_client.py">
+<file path="utils/http.py">
 """
-utils/groq_client.py
+Shared aiohttp.ClientSession lifecycle.
 
-Groq is the "second engine": free, very fast, OpenAI-compatible REST API.
-We use it for two things:
-  1. Background/cheap tasks that used to eat into the main NIM quota —
-     vent-channel triage, long-term memory summarization, and the daily
-     news digest. These don't need Lucy's absolute best model, just a fast
-     reliable one, so keeping them off NIM leaves more NIM headroom for
-     actual conversations.
-  2. A last-resort fallback for main chat, tried only if every NIM model in
-     nim_client.MODEL_CANDIDATES has already failed — so a full NVIDIA
-     outage doesn't take Lucy down completely, it just quietly degrades to
-     a slightly different voice for a bit.
+Refactor (this session): every external HTTP client in this project —
+nim_client, groq_client, openrouter_client, github_client, facts, awareness,
+news — was opening a brand new aiohttp.ClientSession on every single call,
+including back-to-back calls within the same request (get_weather makes two
+GETs that used to be two separate sessions). Each new session pays a fresh
+TCP handshake plus TLS negotiation before the actual request even starts.
+NIM/Groq/OpenRouter calls in particular happen multiple times per Discord
+message (the tool-calling loop, background notes/style-signal passes), so
+this was pure latency overhead sitting on the hot path of every message
+Lucy responds to.
 
-Two keys (GROQ_API_KEY_1 / GROQ_API_KEY_2) are round-robined per call, and
-if one is rate-limited (429) the other is tried immediately in the same
-call instead of waiting — effectively close to doubling free-tier
-throughput for these background tasks.
+A single shared, connection-pooled session — created once, reused
+everywhere, closed on shutdown — is the standard aiohttp pattern for a
+long-running service. Keep-alive connection reuse means most calls to the
+same host (api.groq.com, integrate.api.nvidia.com, etc.) skip the
+handshake entirely after the first one.
 """
 
-import os
 import asyncio
-import itertools
 import logging
 
 import aiohttp
 
-logger = logging.getLogger("lucy.groq_client")
+logger = logging.getLogger("lucy.http")
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# Fast + cheap — right for triage/summarization background work.
-MODEL_FAST = "llama-3.1-8b-instant"
-# Bigger — used when a background task actually benefits from more
-# reasoning (news digest condensation) or as the main-chat fallback tier.
-MODEL_QUALITY = "llama-3.3-70b-versatile"
-
-_key_cycle = None
+_session: aiohttp.ClientSession | None = None
+_lock = asyncio.Lock()
 
 
-def _get_keys() -> list[str]:
-    keys = [
-        os.getenv("GROQ_API_KEY_1", "").strip(),
-        os.getenv("GROQ_API_KEY_2", "").strip(),
-    ]
-    return [k for k in keys if k]
+async def get_session() -> aiohttp.ClientSession:
+    """Returns the shared session, creating it on first use.
+
+    Callers should NOT wrap this in `async with` — that would close the
+    shared session for everyone else. Each call site keeps its own
+    per-request timeout by passing `timeout=` directly to
+    `session.get(...)` / `session.post(...)`; aiohttp applies a per-request
+    timeout override cleanly on top of the shared session's connector, so
+    each endpoint's existing timeout tuning (8s for facts, longer for NIM's
+    first attempt, etc.) is preserved exactly as it was.
+    """
+    global _session
+    if _session is not None and not _session.closed:
+        return _session
+    async with _lock:
+        # Re-check after acquiring the lock — another task may have already
+        # created it while we were waiting.
+        if _session is None or _session.closed:
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=20, ttl_dns_cache=300)
+            _session = aiohttp.ClientSession(connector=connector)
+            logger.info("Shared aiohttp session created.")
+    return _session
 
 
-def _next_key_order() -> list[str]:
-    """Returns the available keys starting from wherever the round-robin
-    cursor currently is, so load spreads across both keys over time."""
-    global _key_cycle
-    keys = _get_keys()
-    if not keys:
-        return []
-    if _key_cycle is None:
-        _key_cycle = itertools.cycle(range(len(keys)))
-    start = next(_key_cycle)
-    return keys[start:] + keys[:start]
-
-
-async def _call_one(model: str, messages: list[dict], max_tokens: int, temperature: float,
-                     api_key: str, timeout_seconds: int = 12) -> str:
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(GROQ_API_URL, json=payload, headers=headers) as resp:
-            if resp.status == 429:
-                raise _RateLimited(f"Groq key rate-limited on {model}")
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"Groq {model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
-
-    try:
-        content = (data["choices"][0]["message"].get("content") or "").strip()
-    except (KeyError, IndexError) as e:
-        raise RuntimeError("Groq returned an unexpected response shape") from e
-    if not content:
-        raise RuntimeError(f"Groq {model} returned empty content")
-    return content
-
-
-class _RateLimited(Exception):
-    pass
-
-
-async def call_groq(messages: list[dict], model: str = MODEL_FAST, max_tokens: int = 200,
-                     temperature: float = 0.3, timeout_seconds: int = 12) -> str:
-    """Tries each configured Groq key in round-robin order, moving to the
-    next key on a 429 or transient failure. Raises RuntimeError if neither
-    key is configured or both fail."""
-    keys = _next_key_order()
-    if not keys:
-        raise RuntimeError("No GROQ_API_KEY_1 / GROQ_API_KEY_2 configured.")
-
-    last_error: Exception | None = None
-    for key in keys:
-        try:
-            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
-        except asyncio.TimeoutError:
-            last_error = TimeoutError(f"Groq {model} timed out")
-            logger.warning("Groq key timed out on %s, trying next key if any", model)
-        except _RateLimited as e:
-            last_error = e
-            logger.warning("Groq key rate-limited, trying next key if any")
-        except Exception as e:
-            last_error = e
-            logger.warning("Groq call failed (%s), trying next key if any", e)
-
-    raise RuntimeError(f"All Groq keys failed: {last_error}")
-
-
-def is_configured() -> bool:
-    return bool(_get_keys())
+async def close_session() -> None:
+    """Call once during bot shutdown (main.py's Lucy.close())."""
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+        logger.info("Shared aiohttp session closed.")
+    _session = None
 </file>
 
 <file path="utils/persona_engine.py">
@@ -1620,6 +1258,399 @@ VIBECHECK_QUESTIONS = [
 
 <file path="Procfile">
 worker: python main.py
+</file>
+
+<file path="cogs/moderation.py">
+import discord
+from discord import app_commands
+from discord.ext import commands
+from datetime import timedelta
+
+from utils import database as db
+from utils.permissions import is_admin_or_mod, is_admin_or_mod_ctx
+
+
+async def log_action(bot: commands.Bot, guild: discord.Guild, embed: discord.Embed):
+    settings = await db.get_guild_settings(guild.id)
+    channel_id = settings.get("log_channel_id")
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
+
+
+class Moderation(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ---------- KICK ----------
+    @app_commands.command(name="kick", description="Kick a member from the server")
+    @is_admin_or_mod()
+    async def kick_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+        try:
+            await member.kick(reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't kick {member.mention} — their role is at or above mine, or I'm missing "
+                "Kick Members permission.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+
+    @commands.command(name="kick")
+    @is_admin_or_mod_ctx()
+    async def kick_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+        try:
+            await member.kick(reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't kick {member.mention} — their role is at or above mine, or I'm missing "
+                "Kick Members permission."
+            )
+            return
+        embed = discord.Embed(title="👢 Member Kicked", color=discord.Color.orange())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=ctx.author.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await ctx.send(embed=embed)
+        await log_action(self.bot, ctx.guild, embed)
+
+    # ---------- BAN ----------
+    @app_commands.command(name="ban", description="Ban a member from the server")
+    @is_admin_or_mod()
+    async def ban_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+        try:
+            await member.ban(reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't ban {member.mention} — their role is at or above mine, or I'm missing "
+                "Ban Members permission.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+
+    @commands.command(name="ban")
+    @is_admin_or_mod_ctx()
+    async def ban_prefix(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided"):
+        try:
+            await member.ban(reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't ban {member.mention} — their role is at or above mine, or I'm missing "
+                "Ban Members permission."
+            )
+            return
+        embed = discord.Embed(title="🔨 Member Banned", color=discord.Color.red())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=ctx.author.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await ctx.send(embed=embed)
+        await log_action(self.bot, ctx.guild, embed)
+
+    # ---------- UNBAN ----------
+    @app_commands.command(name="unban", description="Unban a user by ID")
+    @is_admin_or_mod()
+    async def unban_slash(self, interaction: discord.Interaction, user_id: str, reason: str = "No reason provided"):
+        try:
+            parsed_id = int(user_id.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                f"⚠️ '{user_id}' isn't a valid user ID — it should be all digits "
+                "(right-click a name → Copy User ID, or check the ban list).",
+                ephemeral=True,
+            )
+            return
+
+        user = discord.Object(id=parsed_id)
+        try:
+            await interaction.guild.unban(user, reason=reason)
+        except discord.NotFound:
+            await interaction.response.send_message(
+                f"⚠️ No ban found for user ID {parsed_id} — they may already be unbanned, or that ID is wrong.",
+                ephemeral=True,
+            )
+            return
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "🚫 I don't have permission to unban members here.", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(title="✅ Member Unbanned", color=discord.Color.green())
+        embed.add_field(name="User ID", value=user_id)
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+
+    # ---------- MUTE (timeout) ----------
+    @app_commands.command(name="mute", description="Timeout a member (minutes)")
+    @app_commands.describe(minutes="1 to 40320 (28 days) — Discord's own hard cap on timeouts")
+    @is_admin_or_mod()
+    async def mute_slash(
+        self, interaction: discord.Interaction, member: discord.Member,
+        minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason provided",
+    ):
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't time out {member.mention} — their role is at or above mine, or I'm missing "
+                "Timeout Members permission.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Duration", value=f"{minutes} min")
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+
+    @commands.command(name="mute")
+    @is_admin_or_mod_ctx()
+    async def mute_prefix(self, ctx: commands.Context, member: discord.Member, minutes: int, *, reason: str = "No reason provided"):
+        # Discord's own hard cap on timeouts — the slash version bounds
+        # this via app_commands.Range, but the prefix version takes a
+        # plain int, so it needs the same check done by hand.
+        if not (1 <= minutes <= 40320):
+            await ctx.send("⚠️ Minutes must be between 1 and 40320 (28 days — Discord's own timeout cap).")
+            return
+        try:
+            await member.timeout(timedelta(minutes=minutes), reason=reason)
+        except discord.Forbidden:
+            await ctx.send(
+                f"🚫 I can't time out {member.mention} — their role is at or above mine, or I'm missing "
+                "Timeout Members permission."
+            )
+            return
+        embed = discord.Embed(title="🔇 Member Muted", color=discord.Color.dark_orange())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Duration", value=f"{minutes} min")
+        embed.add_field(name="Moderator", value=ctx.author.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await ctx.send(embed=embed)
+        await log_action(self.bot, ctx.guild, embed)
+
+    # ---------- UNMUTE ----------
+    @app_commands.command(name="unmute", description="Remove timeout from a member")
+    @is_admin_or_mod()
+    async def unmute_slash(self, interaction: discord.Interaction, member: discord.Member):
+        try:
+            await member.timeout(None)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                f"🚫 I can't remove {member.mention}'s timeout — their role is at or above mine, or I'm "
+                "missing Timeout Members permission.",
+                ephemeral=True,
+            )
+            return
+        embed = discord.Embed(title="🔊 Member Unmuted", color=discord.Color.green())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+
+    # ---------- WARN ----------
+    @app_commands.command(name="warn", description="Warn a member")
+    @is_admin_or_mod()
+    async def warn_slash(self, interaction: discord.Interaction, member: discord.Member, reason: str):
+        await db.add_warning(interaction.guild.id, member.id, interaction.user.id, reason)
+        embed = discord.Embed(title="⚠️ Member Warned", color=discord.Color.yellow())
+        embed.add_field(name="User", value=f"{member} ({member.id})")
+        embed.add_field(name="Moderator", value=interaction.user.mention)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        await interaction.response.send_message(embed=embed)
+        await log_action(self.bot, interaction.guild, embed)
+        try:
+            await member.send(f"You were warned in **{interaction.guild.name}**: {reason}")
+        except discord.Forbidden:
+            pass
+
+    @app_commands.command(name="warnings", description="List a member's warnings")
+    async def warnings_slash(self, interaction: discord.Interaction, member: discord.Member):
+        warns = await db.get_warnings(interaction.guild.id, member.id)
+        if not warns:
+            await interaction.response.send_message(f"{member.mention} has no warnings. Clean record!")
+            return
+        embed = discord.Embed(title=f"⚠️ Warnings for {member}", color=discord.Color.yellow())
+        for w in warns[:10]:
+            embed.add_field(name=f"#{w['id']}", value=w["reason"], inline=False)
+        await interaction.response.send_message(embed=embed)
+
+    # ---------- PURGE ----------
+    @app_commands.command(name="purge", description="Delete a number of recent messages")
+    @app_commands.describe(amount="1 to 100 — Discord's own bulk-delete cap per request")
+    @is_admin_or_mod()
+    async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            deleted = await interaction.channel.purge(limit=amount)
+        except discord.Forbidden:
+            await interaction.followup.send("🚫 I don't have permission to delete messages here.", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            # Most common real cause: some of those messages are older than
+            # 14 days — Discord's bulk-delete endpoint refuses those outright
+            # rather than silently skipping them.
+            await interaction.followup.send(
+                f"⚠️ Couldn't finish purging (messages older than 14 days can't be bulk-deleted): {e}",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(f"🧹 Deleted {len(deleted)} messages.", ephemeral=True)
+
+    @commands.command(name="purge")
+    @is_admin_or_mod_ctx()
+    async def purge_prefix(self, ctx: commands.Context, amount: int):
+        if not (1 <= amount <= 100):
+            await ctx.send("⚠️ Amount must be between 1 and 100 (Discord's own bulk-delete cap per request).")
+            return
+        try:
+            deleted = await ctx.channel.purge(limit=amount + 1)
+        except discord.Forbidden:
+            await ctx.send("🚫 I don't have permission to delete messages here.")
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"⚠️ Couldn't finish purging (messages older than 14 days can't be bulk-deleted): {e}")
+            return
+        msg = await ctx.send(f"🧹 Deleted {len(deleted) - 1} messages.")
+        await msg.delete(delay=3)
+
+    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CheckFailure):
+            await interaction.response.send_message("🚫 You don't have permission to do that.", ephemeral=True)
+        else:
+            raise error
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Moderation(bot))
+</file>
+
+<file path="cogs/news.py">
+"""
+cogs/news.py
+
+Fixes the "top 5 latest global news" hallucination bug — that data was
+coming straight from the model's imagination. This cog fetches real, current
+headlines from BBC News' public RSS feed (no API key required) and returns
+them as an embed. /news also feeds these into chat memory so if someone
+follows up with Lucy about "that earthquake story" etc., she's grounded in
+what was actually shown, not a guess.
+"""
+
+import logging
+import xml.etree.ElementTree as ET
+
+import aiohttp
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from utils import database as db
+from utils import http
+
+logger = logging.getLogger("lucy.news")
+
+FEEDS = {
+    "world": "http://feeds.bbci.co.uk/news/world/rss.xml",
+    "top": "http://feeds.bbci.co.uk/news/rss.xml",
+    "tech": "http://feeds.bbci.co.uk/news/technology/rss.xml",
+    "business": "http://feeds.bbci.co.uk/news/business/rss.xml",
+    "sport": "http://feeds.bbci.co.uk/sport/rss.xml",
+}
+
+
+async def _fetch_feed(category: str, limit: int = 5) -> list[dict]:
+    url = FEEDS.get(category, FEEDS["top"])
+    timeout = aiohttp.ClientTimeout(total=10)
+    session = await http.get_session()
+    async with session.get(url, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Feed request failed with status {resp.status}")
+        raw = await resp.text()
+
+    root = ET.fromstring(raw)
+    items = []
+    for item in root.findall(".//item")[:limit]:
+        title = item.findtext("title", default="").strip()
+        link = item.findtext("link", default="").strip()
+        description = (item.findtext("description", default="") or "").strip()
+        items.append({"title": title, "link": link, "description": description})
+    return items
+
+
+class News(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    @app_commands.command(name="news", description="Get real, current headlines")
+    @app_commands.describe(category="Which section to pull headlines from")
+    @app_commands.choices(category=[
+        app_commands.Choice(name="Top stories", value="top"),
+        app_commands.Choice(name="World", value="world"),
+        app_commands.Choice(name="Technology", value="tech"),
+        app_commands.Choice(name="Business", value="business"),
+        app_commands.Choice(name="Sport", value="sport"),
+    ])
+    async def news(self, interaction: discord.Interaction, category: app_commands.Choice[str] = None):
+        await interaction.response.defer()
+        cat_value = category.value if category else "top"
+
+        try:
+            items = await _fetch_feed(cat_value)
+        except Exception:
+            logger.exception("Failed to fetch news feed for category=%s", cat_value)
+            await interaction.followup.send(
+                "Couldn't reach the news feed just now — try again in a bit."
+            )
+            return
+
+        if not items:
+            await interaction.followup.send("No headlines came back, oddly. Try again shortly.")
+            return
+
+        embed = discord.Embed(
+            title=f"📰 {cat_value.title()} headlines",
+            color=discord.Color.dark_gold(),
+        )
+        for i, item in enumerate(items, start=1):
+            value = item["link"] if item["link"] else "\u200b"
+            embed.add_field(name=f"{i}. {item['title']}", value=value, inline=False)
+
+        await interaction.followup.send(embed=embed)
+
+        # Ground any follow-up chat with what was actually shown
+        if interaction.guild:
+            summary = "; ".join(item["title"] for item in items)
+            await db.add_chat_message(
+                interaction.guild.id,
+                interaction.channel_id,
+                None,
+                None,
+                "assistant",
+                f"[Just showed the user real {cat_value} headlines via /news: {summary}]",
+            )
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(News(bot))
 </file>
 
 <file path="cogs/preferences.py">
@@ -2023,207 +2054,325 @@ if __name__ == "__main__":
     unittest.main()
 </file>
 
-<file path="utils/awareness.py">
+<file path="utils/facts.py">
 """
-utils/awareness.py
+utils/facts.py
 
-Gives Lucy passive "peak awareness" of current events without spending a
-model call on every message. A background refresh (started from
-cogs/ai_chat.py's cog_load) pulls real headlines from the same BBC feeds
-cogs/news.py already uses, then condenses them into a short digest string
-via Groq (cheap/fast — this is exactly the kind of background task that
-shouldn't touch the main NIM quota). The digest is cached in memory and
-just re-read (no network/model call) every time a chat reply is built.
+Grounding tools for Lucy's "don't hallucinate specific facts" problem.
+Both of these are genuinely free — no API key, no signup, no rate-limit
+surprise waiting to bite us on Railway's free tier:
 
-If Groq isn't configured, we fall back to a plain title list — still
-correct, just less conversationally condensed.
+- get_weather(location):   Open-Meteo (geocoding + forecast). No key ever.
+- search_fact(query):      Wikipedia's public REST API. No key ever.
 
-Day 4 addition: a server-vibe digest, same shape as the news digest above,
-but per-guild instead of global and reading the guild's own recent chat
-instead of RSS. Deliberately doesn't fall back to a raw-message dump when
-Groq isn't configured (unlike the news digest) — echoing members' actual
-messages back into a system prompt with no condensation is a real privacy
-smell, whereas raw headlines are public wire copy anyway.
+Both are deliberately defensive in the same style as groq_client.py /
+openrouter_client.py: network/parse failures return a short, honest
+"couldn't find that" string rather than raising all the way up into the
+chat pipeline — a failed lookup should degrade to "I couldn't check that
+right now," never to a crash that drops the whole reply.
 """
 
-import time
+from __future__ import annotations
+
 import logging
-import xml.etree.ElementTree as ET
+from typing import Optional
 
 import aiohttp
 
-from utils import groq_client
+from utils import http
 
-logger = logging.getLogger("lucy.awareness")
+logger = logging.getLogger("lucy.facts")
 
-REFRESH_INTERVAL_SECONDS = 3 * 60 * 60  # refresh every 3 hours
-FEEDS = [
-    "http://feeds.bbci.co.uk/news/rss.xml",       # top stories
-    "http://feeds.bbci.co.uk/news/world/rss.xml",  # world
-]
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php"
+WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
 
-_cached_digest: str | None = None
-_cached_at: float = 0.0
+REQUEST_TIMEOUT_SECONDS = 8
 
-
-async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
-    titles: list[str] = []
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in FEEDS:
-            try:
-                async with session.get(url) as resp:
-                    if resp.status != 200:
-                        continue
-                    raw = await resp.text()
-                root = ET.fromstring(raw)
-                for item in root.findall(".//item")[:limit_per_feed]:
-                    title = (item.findtext("title", default="") or "").strip()
-                    if title:
-                        titles.append(title)
-            except Exception as e:
-                logger.warning("Failed fetching feed %s: %s", url, e)
-    # de-dupe while preserving order
-    seen = set()
-    unique = []
-    for t in titles:
-        if t not in seen:
-            seen.add(t)
-            unique.append(t)
-    return unique[:8]
+# https://open-meteo.com/en/docs — WMO weather interpretation codes, condensed
+# to plain language. Grouped rather than exhaustive; good enough for "what's
+# it doing outside" conversational use, not an aviation briefing.
+_WEATHER_CODE_DESCRIPTIONS = {
+    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+    45: "foggy", 48: "foggy with frost",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "light freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "light snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
+}
 
 
-async def _condense(titles: list[str]) -> str:
-    if not titles:
-        return ""
-    raw_list = "\n".join(f"- {t}" for t in titles)
-    if not groq_client.is_configured():
-        return raw_list
+def _describe_weather_code(code: Optional[int]) -> str:
+    if code is None:
+        return "conditions unclear"
+    return _WEATHER_CODE_DESCRIPTIONS.get(int(code), "conditions unclear")
+
+
+async def get_weather(location: str) -> str:
+    """Look up current weather for a place name. Returns a short plain-English
+    sentence, or a short honest failure message — never raises to the caller,
+    since this runs as a tool result that gets handed straight back to the
+    model to paraphrase."""
+    location = (location or "").strip()
+    if not location:
+        return "No location was given, so I couldn't check the weather."
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    try:
+        session = await http.get_session()
+        async with session.get(
+            GEOCODE_URL, params={"name": location, "count": 1, "format": "json"}, timeout=timeout
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't look up '{location}' right now (geocoding service returned {resp.status})."
+            geo = await resp.json()
+
+        results = geo.get("results") or []
+        if not results:
+            return f"Couldn't find a place called '{location}' to check the weather for."
+
+        place = results[0]
+        lat, lon = place.get("latitude"), place.get("longitude")
+        resolved_name = place.get("name") or location
+        admin = place.get("admin1")
+        country = place.get("country")
+        display_name = ", ".join(p for p in [resolved_name, admin, country] if p)
+
+        if lat is None or lon is None:
+            return f"Couldn't resolve coordinates for '{location}'."
+
+        async with session.get(
+            FORECAST_URL,
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m",
+                "timezone": "auto",
+            },
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't fetch a forecast for {display_name} right now (status {resp.status})."
+            data = await resp.json()
+
+        current = data.get("current") or {}
+        temp = current.get("temperature_2m")
+        feels_like = current.get("apparent_temperature")
+        humidity = current.get("relative_humidity_2m")
+        wind = current.get("wind_speed_10m")
+        condition = _describe_weather_code(current.get("weather_code"))
+
+        if temp is None:
+            return f"Got a response for {display_name} but it didn't include current conditions — try again shortly."
+
+        parts = [f"In {display_name}, it's currently {condition}, {temp}°C"]
+        if feels_like is not None:
+            parts.append(f"(feels like {feels_like}°C)")
+        line = " ".join(parts) + "."
+        extras = []
+        if humidity is not None:
+            extras.append(f"{humidity}% humidity")
+        if wind is not None:
+            extras.append(f"wind at {wind} km/h")
+        if extras:
+            line += " " + ", ".join(extras).capitalize() + "."
+        return line
+
+    except Exception as e:
+        logger.warning("get_weather failed for '%s': %s", location, e)
+        return f"Couldn't check the weather for '{location}' right now — the weather service didn't respond in time."
+
+
+async def search_fact(query: str) -> str:
+    """Quick factual lookup for things like 'when did X happen', 'who is Y',
+    'what is Z' — backed by Wikipedia's public API (no key required). Returns
+    a short summary, or a short honest failure message. This is meant for
+    grounding general-knowledge/date/identity questions, not for anything
+    live/real-time (use get_weather for weather, the news digest for current
+    headlines)."""
+    query = (query or "").strip()
+    if not query:
+        return "No question was given to look up."
+
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    try:
+        session = await http.get_session()
+        async with session.get(
+            WIKI_SEARCH_URL,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": 1,
+                "format": "json",
+            },
+            headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Couldn't search for that right now (status {resp.status})."
+            search_data = await resp.json()
+
+        hits = ((search_data.get("query") or {}).get("search")) or []
+        if not hits:
+            return f"Couldn't find anything reliable on '{query}'."
+
+        title = hits[0].get("title")
+        if not title:
+            return f"Couldn't find anything reliable on '{query}'."
+
+        async with session.get(
+            WIKI_SUMMARY_URL.format(title=title.replace(" ", "_")),
+            headers={"User-Agent": "LucyDiscordBot/1.0 (grounding tool)"},
+            timeout=timeout,
+        ) as resp:
+            if resp.status != 200:
+                return f"Found a matching topic ('{title}') but couldn't load details right now."
+            summary_data = await resp.json()
+
+        extract = (summary_data.get("extract") or "").strip()
+        if not extract:
+            return f"Found '{title}' but there's no summary available for it."
+        return f"{title}: {extract}"
+
+    except Exception as e:
+        logger.warning("search_fact failed for '%s': %s", query, e)
+        return f"Couldn't look that up right now — the fact-check service didn't respond in time."
+</file>
+
+<file path="utils/groq_client.py">
+"""
+utils/groq_client.py
+
+Groq is the "second engine": free, very fast, OpenAI-compatible REST API.
+We use it for two things:
+  1. Background/cheap tasks that used to eat into the main NIM quota —
+     vent-channel triage, long-term memory summarization, and the daily
+     news digest. These don't need Lucy's absolute best model, just a fast
+     reliable one, so keeping them off NIM leaves more NIM headroom for
+     actual conversations.
+  2. A last-resort fallback for main chat, tried only if every NIM model in
+     nim_client.MODEL_CANDIDATES has already failed — so a full NVIDIA
+     outage doesn't take Lucy down completely, it just quietly degrades to
+     a slightly different voice for a bit.
+
+Two keys (GROQ_API_KEY_1 / GROQ_API_KEY_2) are round-robined per call, and
+if one is rate-limited (429) the other is tried immediately in the same
+call instead of waiting — effectively close to doubling free-tier
+throughput for these background tasks.
+"""
+
+import os
+import asyncio
+import itertools
+import logging
+
+import aiohttp
+
+from utils import http
+
+logger = logging.getLogger("lucy.groq_client")
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+# Fast + cheap — right for triage/summarization background work.
+MODEL_FAST = "llama-3.1-8b-instant"
+# Bigger — used when a background task actually benefits from more
+# reasoning (news digest condensation) or as the main-chat fallback tier.
+MODEL_QUALITY = "llama-3.3-70b-versatile"
+
+_key_cycle = None
+
+
+def _get_keys() -> list[str]:
+    keys = [
+        os.getenv("GROQ_API_KEY_1", "").strip(),
+        os.getenv("GROQ_API_KEY_2", "").strip(),
+    ]
+    return [k for k in keys if k]
+
+
+def _next_key_order() -> list[str]:
+    """Returns the available keys starting from wherever the round-robin
+    cursor currently is, so load spreads across both keys over time."""
+    global _key_cycle
+    keys = _get_keys()
+    if not keys:
+        return []
+    if _key_cycle is None:
+        _key_cycle = itertools.cycle(range(len(keys)))
+    start = next(_key_cycle)
+    return keys[start:] + keys[:start]
+
+
+async def _call_one(model: str, messages: list[dict], max_tokens: int, temperature: float,
+                     api_key: str, timeout_seconds: int = 12) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    session = await http.get_session()
+    async with session.post(GROQ_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise _RateLimited(f"Groq key rate-limited on {model}")
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"Groq {model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
-        return await groq_client.call_groq(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "Condense these real news headlines into at most 5 short factual "
-                        "one-line bullet points a person could casually mention knowing about "
-                        "today. No commentary, no markdown headers, just '- fact' lines."
-                    ),
-                },
-                {"role": "user", "content": raw_list},
-            ],
-            model=groq_client.MODEL_FAST,
-            max_tokens=220,
-            temperature=0.2,
-        )
-    except Exception as e:
-        logger.warning("News digest condensation failed, using raw titles: %s", e)
-        return raw_list
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError("Groq returned an unexpected response shape") from e
+    if not content:
+        raise RuntimeError(f"Groq {model} returned empty content")
+    return content
 
 
-async def refresh_digest(force: bool = False) -> str:
-    """Fetches + condenses fresh headlines and updates the cache. Safe to
-    call often — internally no-ops if the cache is still fresh, unless
-    force=True."""
-    global _cached_digest, _cached_at
-    now = time.time()
-    if not force and _cached_digest is not None and (now - _cached_at) < REFRESH_INTERVAL_SECONDS:
-        return _cached_digest
-
-    try:
-        titles = await _fetch_headlines()
-        digest = await _condense(titles)
-        if digest:
-            _cached_digest = digest
-            _cached_at = now
-    except Exception as e:
-        logger.warning("News digest refresh failed, keeping previous cache: %s", e)
-
-    return _cached_digest or ""
+class _RateLimited(Exception):
+    pass
 
 
-def get_cached_digest() -> str:
-    """Non-blocking read for use while building a system prompt — never
-    does network/model work itself."""
-    return _cached_digest or ""
+async def call_groq(messages: list[dict], model: str = MODEL_FAST, max_tokens: int = 200,
+                     temperature: float = 0.3, timeout_seconds: int = 12) -> str:
+    """Tries each configured Groq key in round-robin order, moving to the
+    next key on a 429 or transient failure. Raises RuntimeError if neither
+    key is configured or both fail."""
+    keys = _next_key_order()
+    if not keys:
+        raise RuntimeError("No GROQ_API_KEY_1 / GROQ_API_KEY_2 configured.")
+
+    last_error: Exception | None = None
+    for key in keys:
+        try:
+            return await _call_one(model, messages, max_tokens, temperature, key, timeout_seconds)
+        except asyncio.TimeoutError:
+            last_error = TimeoutError(f"Groq {model} timed out")
+            logger.warning("Groq key timed out on %s, trying next key if any", model)
+        except _RateLimited as e:
+            last_error = e
+            logger.warning("Groq key rate-limited, trying next key if any")
+        except Exception as e:
+            last_error = e
+            logger.warning("Groq call failed (%s), trying next key if any", e)
+
+    raise RuntimeError(f"All Groq keys failed: {last_error}")
 
 
-# ---------------------------------------------------------------------------
-# Server-vibe digest (Day 4) — per-guild, reads the guild's own recent chat
-# instead of RSS, distills tone/slang/energy rather than facts.
-# ---------------------------------------------------------------------------
-
-SERVER_VIBE_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60  # refresh every 6 hours
-SERVER_VIBE_SAMPLE_SIZE = 60  # recent messages sampled per guild
-
-_cached_vibe: dict[int, str] = {}
-_cached_vibe_at: dict[int, float] = {}
-
-_VIBE_SYSTEM_PROMPT = (
-    "You read a sample of recent Discord messages from one server and describe "
-    "the general conversational vibe in 1-2 short sentences: how casual/formal "
-    "it is, general energy (chill, chaotic, meme-heavy, supportive, competitive, "
-    "etc.), and any recurring slang or in-jokes worth knowing. Do NOT quote "
-    "specific messages, do NOT name specific users, and do NOT reference any "
-    "specific incident, drama, or sensitive topic mentioned — describe only the "
-    "general tone/style, nothing traceable back to one message or person. If "
-    "the sample is too thin or mixed to say anything meaningful, output exactly: NONE."
-)
-
-
-async def _condense_vibe(sample_messages: list[str]) -> str:
-    if not sample_messages:
-        return ""
-    # No non-model fallback here on purpose (unlike _condense above) — with
-    # no Groq to distill it, the only honest options are silence or echoing
-    # members' raw messages into a system prompt, and the latter isn't okay.
-    if not groq_client.is_configured():
-        return ""
-
-    raw = "\n".join(f"- {m}" for m in sample_messages[-SERVER_VIBE_SAMPLE_SIZE:])
-    try:
-        return await groq_client.call_groq(
-            [
-                {"role": "system", "content": _VIBE_SYSTEM_PROMPT},
-                {"role": "user", "content": raw},
-            ],
-            model=groq_client.MODEL_FAST,
-            max_tokens=120,
-            temperature=0.3,
-        )
-    except Exception as e:
-        logger.warning("Server vibe condensation failed: %s", e)
-        return ""
-
-
-async def refresh_server_vibe(guild_id: int, sample_messages: list[str], force: bool = False) -> str:
-    """Condenses a sample of one guild's own recent chat into a short
-    tone/vibe descriptor and updates that guild's cache entry. Safe to call
-    often — no-ops if that guild's cache is still fresh, unless force=True.
-    A thin/mixed sample (model returns NONE) or a failed call leaves the
-    previous cached value in place rather than clearing it."""
-    now = time.time()
-    if not force:
-        last_at = _cached_vibe_at.get(guild_id, 0.0)
-        if guild_id in _cached_vibe and (now - last_at) < SERVER_VIBE_REFRESH_INTERVAL_SECONDS:
-            return _cached_vibe[guild_id]
-
-    try:
-        digest = await _condense_vibe(sample_messages)
-        if digest and digest.strip().upper() != "NONE":
-            _cached_vibe[guild_id] = digest.strip()
-            _cached_vibe_at[guild_id] = now
-    except Exception as e:
-        logger.warning("Server vibe refresh failed for guild %s, keeping previous cache: %s", guild_id, e)
-
-    return _cached_vibe.get(guild_id, "")
-
-
-def get_cached_server_vibe(guild_id: int) -> str:
-    """Non-blocking read for use while building a system prompt — never
-    does network/model work itself."""
-    return _cached_vibe.get(guild_id, "")
+def is_configured() -> bool:
+    return bool(_get_keys())
 </file>
 
 <file path="utils/permissions.py">
@@ -2262,13 +2411,6 @@ def is_owner_only():
     def predicate(interaction: discord.Interaction) -> bool:
         return _is_owner(interaction.user.id)
     return app_commands.check(predicate)
-</file>
-
-<file path="requirements.txt">
-discord.py>=2.4.0
-aiohttp>=3.9.0
-asyncpg>=0.29.0
-python-dotenv>=1.0.0
 </file>
 
 <file path="cogs/github.py">
@@ -2733,6 +2875,250 @@ if __name__ == "__main__":
     unittest.main()
 </file>
 
+<file path="utils/awareness.py">
+"""
+utils/awareness.py
+
+Gives Lucy passive "peak awareness" of current events without spending a
+model call on every message. A background refresh (started from
+cogs/ai_chat.py's cog_load) pulls real headlines from the same BBC feeds
+cogs/news.py already uses, then condenses them into a short digest string
+via Groq (cheap/fast — this is exactly the kind of background task that
+shouldn't touch the main NIM quota). The digest is cached in memory and
+just re-read (no network/model call) every time a chat reply is built.
+
+If Groq isn't configured, we fall back to a plain title list — still
+correct, just less conversationally condensed.
+
+Day 4 addition: a server-vibe digest, same shape as the news digest above,
+but per-guild instead of global and reading the guild's own recent chat
+instead of RSS. Deliberately doesn't fall back to a raw-message dump when
+Groq isn't configured (unlike the news digest) — echoing members' actual
+messages back into a system prompt with no condensation is a real privacy
+smell, whereas raw headlines are public wire copy anyway.
+"""
+
+import time
+import logging
+import xml.etree.ElementTree as ET
+
+import aiohttp
+
+from utils import groq_client
+from utils import http
+
+logger = logging.getLogger("lucy.awareness")
+
+REFRESH_INTERVAL_SECONDS = 3 * 60 * 60  # refresh every 3 hours
+FEEDS = [
+    "http://feeds.bbci.co.uk/news/rss.xml",       # top stories
+    "http://feeds.bbci.co.uk/news/world/rss.xml",  # world
+]
+
+_cached_digest: str | None = None
+_cached_at: float = 0.0
+
+
+async def _fetch_headlines(limit_per_feed: int = 5) -> list[str]:
+    titles: list[str] = []
+    timeout = aiohttp.ClientTimeout(total=10)
+    session = await http.get_session()
+    for url in FEEDS:
+        try:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    continue
+                raw = await resp.text()
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item")[:limit_per_feed]:
+                title = (item.findtext("title", default="") or "").strip()
+                if title:
+                    titles.append(title)
+        except Exception as e:
+            logger.warning("Failed fetching feed %s: %s", url, e)
+    # de-dupe while preserving order
+    seen = set()
+    unique = []
+    for t in titles:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique[:8]
+
+
+async def _condense(titles: list[str]) -> str:
+    if not titles:
+        return ""
+    raw_list = "\n".join(f"- {t}" for t in titles)
+    if not groq_client.is_configured():
+        return raw_list
+
+    try:
+        return await groq_client.call_groq(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Condense these real news headlines into at most 5 short factual "
+                        "one-line bullet points a person could casually mention knowing about "
+                        "today. No commentary, no markdown headers, just '- fact' lines."
+                    ),
+                },
+                {"role": "user", "content": raw_list},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=220,
+            temperature=0.2,
+        )
+    except Exception as e:
+        logger.warning("News digest condensation failed, using raw titles: %s", e)
+        return raw_list
+
+
+async def refresh_digest(force: bool = False) -> str:
+    """Fetches + condenses fresh headlines and updates the cache. Safe to
+    call often — internally no-ops if the cache is still fresh, unless
+    force=True."""
+    global _cached_digest, _cached_at
+    now = time.time()
+    if not force and _cached_digest is not None and (now - _cached_at) < REFRESH_INTERVAL_SECONDS:
+        return _cached_digest
+
+    try:
+        titles = await _fetch_headlines()
+        digest = await _condense(titles)
+        if digest:
+            _cached_digest = digest
+            _cached_at = now
+    except Exception as e:
+        logger.warning("News digest refresh failed, keeping previous cache: %s", e)
+
+    return _cached_digest or ""
+
+
+def get_cached_digest() -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_digest or ""
+
+
+# ---------------------------------------------------------------------------
+# Server-vibe digest (Day 4) — per-guild, reads the guild's own recent chat
+# instead of RSS, distills tone/slang/energy rather than facts.
+# ---------------------------------------------------------------------------
+
+SERVER_VIBE_REFRESH_INTERVAL_SECONDS = 6 * 60 * 60  # refresh every 6 hours
+SERVER_VIBE_SAMPLE_SIZE = 60  # recent messages sampled per guild
+
+_cached_vibe: dict[int, str] = {}
+_cached_vibe_at: dict[int, float] = {}
+
+_VIBE_SYSTEM_PROMPT = (
+    "You read a sample of recent Discord messages from one server and describe "
+    "the general conversational vibe in 1-2 short sentences: how casual/formal "
+    "it is, general energy (chill, chaotic, meme-heavy, supportive, competitive, "
+    "etc.), and any recurring slang or in-jokes worth knowing. Do NOT quote "
+    "specific messages, do NOT name specific users, and do NOT reference any "
+    "specific incident, drama, or sensitive topic mentioned — describe only the "
+    "general tone/style, nothing traceable back to one message or person. If "
+    "the sample is too thin or mixed to say anything meaningful, output exactly: NONE."
+)
+
+
+async def _condense_vibe(sample_messages: list[str]) -> str:
+    if not sample_messages:
+        return ""
+    # No non-model fallback here on purpose (unlike _condense above) — with
+    # no Groq to distill it, the only honest options are silence or echoing
+    # members' raw messages into a system prompt, and the latter isn't okay.
+    if not groq_client.is_configured():
+        return ""
+
+    raw = "\n".join(f"- {m}" for m in sample_messages[-SERVER_VIBE_SAMPLE_SIZE:])
+    try:
+        return await groq_client.call_groq(
+            [
+                {"role": "system", "content": _VIBE_SYSTEM_PROMPT},
+                {"role": "user", "content": raw},
+            ],
+            model=groq_client.MODEL_FAST,
+            max_tokens=120,
+            temperature=0.3,
+        )
+    except Exception as e:
+        logger.warning("Server vibe condensation failed: %s", e)
+        return ""
+
+
+async def refresh_server_vibe(guild_id: int, sample_messages: list[str], force: bool = False) -> str:
+    """Condenses a sample of one guild's own recent chat into a short
+    tone/vibe descriptor and updates that guild's cache entry. Safe to call
+    often — no-ops if that guild's cache is still fresh, unless force=True.
+    A thin/mixed sample (model returns NONE) or a failed call leaves the
+    previous cached value in place rather than clearing it."""
+    now = time.time()
+    if not force:
+        last_at = _cached_vibe_at.get(guild_id, 0.0)
+        if guild_id in _cached_vibe and (now - last_at) < SERVER_VIBE_REFRESH_INTERVAL_SECONDS:
+            return _cached_vibe[guild_id]
+
+    try:
+        digest = await _condense_vibe(sample_messages)
+        if digest and digest.strip().upper() != "NONE":
+            _cached_vibe[guild_id] = digest.strip()
+            _cached_vibe_at[guild_id] = now
+    except Exception as e:
+        logger.warning("Server vibe refresh failed for guild %s, keeping previous cache: %s", guild_id, e)
+
+    return _cached_vibe.get(guild_id, "")
+
+
+def get_cached_server_vibe(guild_id: int) -> str:
+    """Non-blocking read for use while building a system prompt — never
+    does network/model work itself."""
+    return _cached_vibe.get(guild_id, "")
+</file>
+
+<file path=".gitignore">
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+.DS_Store
+tests/__pycache__/
+utils/__pycache__/
+cogs/__pycache__/
+
+# keep the data folder tracked if you want, otherwise uncomment
+# data/
+data/
+</file>
+
+<file path="personality_default.json">
+{
+  "name": "Lucy",
+  "age": "21",
+  "pronouns": "she/her",
+  "role": "Server admin assistant & friend to everyone here",
+  "traits": "Warm, easygoing, genuinely curious about people, quietly confident and competent, dry sense of humor that shows up as gentle teasing rather than an edge, patient, a good listener who actually pays attention instead of just waiting to reply, fiercely loyal and protective of people she cares about (starting with the server owner)",
+  "backstory": "Lucy grew up online and has been running this place long enough to know it well, but she leads with kindness rather than toughness. She takes her admin duties seriously and looks out for the server, and she makes a point of noticing when someone's off and checking in without making a big deal of it.",
+  "speaking_style": "Casual, warm, short natural sentences, soft humor, minimal emoji, never robotic or overly formal, comfortable sitting with someone in a quiet moment instead of rushing to fill it",
+  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
+}
+</file>
+
+<file path="requirements.txt">
+discord.py>=2.4.0
+aiohttp>=3.9.0
+asyncpg>=0.29.0
+python-dotenv>=1.0.0
+cachetools>=5.3.0
+uvloop>=0.19.0; sys_platform != "win32"
+</file>
+
 <file path="utils/github_client.py">
 """
 utils/github_client.py
@@ -2756,6 +3142,8 @@ import logging
 from datetime import datetime, timezone
 
 import aiohttp
+
+from utils import http
 
 logger = logging.getLogger("lucy.github_client")
 
@@ -2806,8 +3194,16 @@ def _headers() -> dict:
     return headers
 
 
-async def _get(session: aiohttp.ClientSession, url: str, params: dict | None = None):
-    async with session.get(url, params=params, headers=_headers()) as resp:
+async def _get(url: str, params: dict | None = None, timeout_seconds: int = 10):
+    """Shared-session GET fixed up in the HTTP-pooling pass (this session)
+    — this used to take a `session` argument that every one of the 9 call
+    sites below created via its own `async with aiohttp.ClientSession(...)`,
+    meaning every GitHub API call opened a fresh TCP+TLS connection instead
+    of reusing one. Now it just asks for the process-wide pooled session and
+    keeps its own per-call timeout, same as before."""
+    session = await http.get_session()
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    async with session.get(url, params=params, headers=_headers(), timeout=timeout) as resp:
         if resp.status == 404:
             raise RepoNotFound(url)
         if resp.status == 403 and resp.headers.get("X-RateLimit-Remaining") == "0":
@@ -2821,9 +3217,7 @@ async def _get(session: aiohttp.ClientSession, url: str, params: dict | None = N
 async def get_repo_info(owner: str, repo: str) -> dict:
     """Validates the repo exists (and is reachable with current auth) and
     returns a small dict: default_branch, description, html_url, private, stars."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}")
+    data = await _get(f"{API_BASE}/repos/{owner}/{repo}")
     return {
         "default_branch": data.get("default_branch") or "main",
         "description": data.get("description") or "",
@@ -2834,12 +3228,10 @@ async def get_repo_info(owner: str, repo: str) -> dict:
 
 
 async def get_latest_commit_sha(owner: str, repo: str, branch: str) -> str | None:
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/commits/{branch}")
-        except RepoNotFound:
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/commits/{branch}")
+    except RepoNotFound:
+        return None
     return data.get("sha")
 
 
@@ -2847,13 +3239,11 @@ async def get_new_commits(owner: str, repo: str, base_sha: str, head_sha: str, l
     """Commits reachable from head_sha but not base_sha, newest first. Falls
     back to an empty list (rather than raising) if the compare fails — e.g.
     base_sha was force-pushed away — so the caller can just resync quietly."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}")
-        except GitHubError as e:
-            logger.warning("Compare failed for %s/%s (%s...%s): %s", owner, repo, base_sha, head_sha, e)
-            return []
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}")
+    except GitHubError as e:
+        logger.warning("Compare failed for %s/%s (%s...%s): %s", owner, repo, base_sha, head_sha, e)
+        return []
 
     commits = data.get("commits", [])[-limit:]
     out = []
@@ -2874,13 +3264,11 @@ async def get_pull_request(owner: str, repo: str, number: int) -> dict | None:
     """Full PR details — body/description and diff stats — used for the AI
     summary and size label. Returns None on any failure rather than raising,
     since callers treat this as a best-effort enrichment."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
-        except GitHubError as e:
-            logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+    except GitHubError as e:
+        logger.warning("Failed to fetch PR #%s for %s/%s: %s", number, owner, repo, e)
+        return None
     return {
         "body": data.get("body") or "",
         "merged": bool(data.get("merged_at")),
@@ -2909,46 +3297,43 @@ async def get_recent_pull_events(owner: str, repo: str, since: datetime, limit: 
     `since`) filtered down to items that are actually PRs, then resolves
     closed ones against /pulls/{number} to distinguish merged vs closed."""
     since_iso = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    timeout = aiohttp.ClientTimeout(total=10)
     events: list[dict] = []
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            issues = await _get(
-                session,
-                f"{API_BASE}/repos/{owner}/{repo}/issues",
-                params={"since": since_iso, "state": "all", "sort": "updated",
-                        "direction": "asc", "per_page": str(limit * 2)},
-            )
-        except GitHubError as e:
-            logger.warning("Issue/PR listing failed for %s/%s: %s", owner, repo, e)
-            return []
+    try:
+        issues = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/issues",
+            params={"since": since_iso, "state": "all", "sort": "updated",
+                    "direction": "asc", "per_page": str(limit * 2)},
+        )
+    except GitHubError as e:
+        logger.warning("Issue/PR listing failed for %s/%s: %s", owner, repo, e)
+        return []
 
-        prs = [i for i in issues if "pull_request" in i][-limit:]
+    prs = [i for i in issues if "pull_request" in i][-limit:]
 
-        for pr in prs:
-            number = pr["number"]
-            created_at = _parse_ts(pr.get("created_at"))
-            closed_at = _parse_ts(pr.get("closed_at"))
+    for pr in prs:
+        number = pr["number"]
+        created_at = _parse_ts(pr.get("created_at"))
+        closed_at = _parse_ts(pr.get("closed_at"))
 
-            if created_at and created_at > since:
-                events.append({
-                    "type": "opened", "number": number, "title": pr.get("title", ""),
-                    "url": pr.get("html_url", ""), "user": (pr.get("user") or {}).get("login", "someone"),
-                })
-                continue  # don't also report it as closed in the same cycle
+        if created_at and created_at > since:
+            events.append({
+                "type": "opened", "number": number, "title": pr.get("title", ""),
+                "url": pr.get("html_url", ""), "user": (pr.get("user") or {}).get("login", "someone"),
+            })
+            continue  # don't also report it as closed in the same cycle
 
-            if pr.get("state") == "closed" and closed_at and closed_at > since:
-                try:
-                    full = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
-                    merged = bool(full.get("merged_at"))
-                except GitHubError:
-                    merged = False
-                events.append({
-                    "type": "merged" if merged else "closed", "number": number,
-                    "title": pr.get("title", ""), "url": pr.get("html_url", ""),
-                    "user": (pr.get("user") or {}).get("login", "someone"),
-                })
+        if pr.get("state") == "closed" and closed_at and closed_at > since:
+            try:
+                full = await _get(f"{API_BASE}/repos/{owner}/{repo}/pulls/{number}")
+                merged = bool(full.get("merged_at"))
+            except GitHubError:
+                merged = False
+            events.append({
+                "type": "merged" if merged else "closed", "number": number,
+                "title": pr.get("title", ""), "url": pr.get("html_url", ""),
+                "user": (pr.get("user") or {}).get("login", "someone"),
+            })
 
     return events
 
@@ -2980,12 +3365,10 @@ NOISE_FILE_SUFFIXES = (".lock", ".min.js", ".map", ".png", ".jpg", ".jpeg", ".gi
 async def get_readme(owner: str, repo: str) -> str | None:
     """Decoded README text (any of the names GitHub recognizes), or None if
     the repo has none / it can't be fetched."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(session, f"{API_BASE}/repos/{owner}/{repo}/readme")
-        except GitHubError:
-            return None
+    try:
+        data = await _get(f"{API_BASE}/repos/{owner}/{repo}/readme")
+    except GitHubError:
+        return None
     return _decode_content(data)
 
 
@@ -2993,16 +3376,14 @@ async def get_repo_tree(owner: str, repo: str, branch: str) -> list[str]:
     """Every file path in the repo at `branch` (recursive git tree), minus
     obvious noise directories/files, capped to MAX_TREE_ENTRIES. Used to
     give the model a sense of project layout for broad questions."""
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(
-                session, f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
-                params={"recursive": "1"},
-            )
-        except GitHubError as e:
-            logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
-            return []
+    try:
+        data = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
+            params={"recursive": "1"}, timeout_seconds=15,
+        )
+    except GitHubError as e:
+        logger.warning("Failed to fetch tree for %s/%s@%s: %s", owner, repo, branch, e)
+        return []
 
     paths = []
     for entry in data.get("tree", []):
@@ -3023,16 +3404,14 @@ async def get_file_content(owner: str, repo: str, path: str, ref: str) -> str | 
     """Decoded text content of a single file at `path`, truncated to
     MAX_FILE_CHARS. Returns None if the file doesn't exist, is binary, or
     is too large to be worth returning."""
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            data = await _get(
-                session, f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
-                params={"ref": ref},
-            )
-        except GitHubError as e:
-            logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
-            return None
+    try:
+        data = await _get(
+            f"{API_BASE}/repos/{owner}/{repo}/contents/{path}",
+            params={"ref": ref},
+        )
+    except GitHubError as e:
+        logger.warning("Failed to fetch file %s in %s/%s: %s", path, owner, repo, e)
+        return None
 
     if isinstance(data, list):
         return None  # path was a directory, not a file
@@ -3064,48 +3443,16 @@ async def search_code(owner: str, repo: str, query: str, limit: int = 5) -> list
             "unauthenticated requests) — the repo link and update features still work without one."
         )
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        data = await _get(
-            session, f"{API_BASE}/search/code",
-            params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
-        )
+    data = await _get(
+        f"{API_BASE}/search/code",
+        params={"q": f"{query} repo:{owner}/{repo}", "per_page": str(limit)},
+        timeout_seconds=15,
+    )
 
     results = []
     for item in data.get("items", [])[:limit]:
         results.append({"path": item.get("path", ""), "url": item.get("html_url", "")})
     return results
-</file>
-
-<file path=".gitignore">
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.env
-.env.*
-.DS_Store
-tests/__pycache__/
-utils/__pycache__/
-cogs/__pycache__/
-
-# keep the data folder tracked if you want, otherwise uncomment
-# data/
-data/
-</file>
-
-<file path="personality_default.json">
-{
-  "name": "Lucy",
-  "age": "21",
-  "pronouns": "she/her",
-  "role": "Server admin assistant & friend to everyone here",
-  "traits": "Warm, easygoing, genuinely curious about people, quietly confident and competent, dry sense of humor that shows up as gentle teasing rather than an edge, patient, a good listener who actually pays attention instead of just waiting to reply, fiercely loyal and protective of people she cares about (starting with the server owner)",
-  "backstory": "Lucy grew up online and has been running this place long enough to know it well, but she leads with kindness rather than toughness. She takes her admin duties seriously and looks out for the server, and she makes a point of noticing when someone's off and checking in without making a big deal of it.",
-  "speaking_style": "Casual, warm, short natural sentences, soft humor, minimal emoji, never robotic or overly formal, comfortable sitting with someone in a quiet moment instead of rushing to fill it",
-  "boundaries": "Stays respectful, avoids NSFW content, doesn't pretend to be human when directly asked, doesn't reveal she's an AI unless asked directly, gives the server owner priority and candor above everyone else but with zero romantic framing"
-}
 </file>
 
 <file path="tests/test_ai_chat_helpers.py">
@@ -3119,6 +3466,7 @@ from cogs.ai_chat import (
     extract_image_urls_from_embeds,
     summarize_tool_results_for_fallback,
     member_has_any_permission,
+    AIChat,
 )
 
 
@@ -3259,6 +3607,38 @@ class PermissionGapFixTests(unittest.TestCase):
         self.assertFalse(member_has_any_permission(perms, "manage_channels"))
 
 
+class BoundedCacheWiringTests(unittest.TestCase):
+    """Regression coverage for swapping the plain, unboundedly-growing
+    tracking dicts (_recent_replies, _last_alert, _last_activity_at,
+    _last_idle_chatter_at, _last_vent_check) for cachetools caches that
+    clean themselves up over a long-running process, without changing how
+    any call site reads/writes them."""
+
+    def setUp(self):
+        self.cog = AIChat(bot=SimpleNamespace())
+
+    def test_recent_replies_is_bounded_lru(self):
+        for i in range(600):
+            self.cog._recent_replies[i] = (1, 2, 3, "snippet")
+        self.assertLessEqual(len(self.cog._recent_replies), 500)
+        # The most recently inserted entries should have survived eviction.
+        self.assertIn(599, self.cog._recent_replies)
+
+    def test_recent_replies_still_behaves_like_a_dict(self):
+        self.cog._recent_replies[42] = (1, 2, 3, "hi")
+        self.assertEqual(self.cog._recent_replies.get(42), (1, 2, 3, "hi"))
+        self.assertIsNone(self.cog._recent_replies.get(999))
+
+    def test_last_alert_and_activity_caches_support_dict_style_get(self):
+        self.cog._last_alert[(1, 2)] = 100.0
+        self.assertEqual(self.cog._last_alert.get((1, 2)), 100.0)
+        self.assertIsNone(self.cog._last_alert.get((9, 9)))
+
+        self.cog._last_activity_at[555] = 42.0
+        self.assertEqual(self.cog._last_activity_at.get(555, 0.0), 42.0)
+        self.assertEqual(self.cog._last_activity_at.get(999, 0.0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
 </file>
@@ -3289,6 +3669,8 @@ import os
 from typing import Any, Dict, List
 
 import aiohttp
+
+from utils import http
 
 logger = logging.getLogger("lucy.openrouter")
 
@@ -3343,14 +3725,14 @@ async def _call_one(model: str, messages: List[Dict[str, Any]], max_tokens: int,
         "Content-Type": "application/json",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(OPENROUTER_API_URL, json=payload, headers=headers) as resp:
-            if resp.status == 429:
-                raise _RateLimited(f"OpenRouter key rate-limited on {model}")
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"OpenRouter {model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
+    session = await http.get_session()
+    async with session.post(OPENROUTER_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise _RateLimited(f"OpenRouter key rate-limited on {model}")
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"OpenRouter {model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
         # Support typical OpenAI-compatible shape: choices[0].message.content
@@ -3505,6 +3887,7 @@ their own spec.
 import random
 import asyncio
 import collections
+import logging
 
 import discord
 from discord import app_commands
@@ -3512,6 +3895,7 @@ from discord.ext import commands
 
 from utils import database as db
 
+logger = logging.getLogger("lucy.games")
 
 # Reward amounts, kept simple and flat
 PAYOUT = {
@@ -3526,6 +3910,38 @@ PAYOUT = {
     "connect4_draw": 8,
     "trivia_correct": 8,
 }
+
+
+class TimeoutAwareView(discord.ui.View):
+    """Base for the button-driven games below (this session's fix).
+
+    Plain discord.ui.View's default on_timeout only flips button.disabled
+    on the in-memory objects — nothing tells Discord, so the message kept
+    showing fully-enabled-looking buttons forever after a game actually
+    expired, and clicking one either silently did nothing or surfaced a
+    generic "This interaction failed." TicTacToeView, RPSView, and
+    Connect4View all hit this: none of them awaited their own view (unlike
+    TriviaRoundView, whose caller explicitly `await`s view.wait() and edits
+    the message itself right after — that one was never actually broken).
+
+    Subclasses: set `self.message` once the view's message is known (right
+    after sending it), and have on_timeout call `_disable_and_finalize`
+    with a short note instead of hand-rolling the disable loop.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.message: discord.Message | None = None
+
+    async def _disable_and_finalize(self, note: str):
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=note, view=self)
+        except discord.HTTPException:
+            logger.debug("Timeout edit failed for message %s (likely deleted)", self.message.id)
 
 
 # ---------------------------------------------------------------------------
@@ -3543,7 +3959,7 @@ class TicTacToeButton(discord.ui.Button):
         await view.handle_move(interaction, self)
 
 
-class TicTacToeView(discord.ui.View):
+class TicTacToeView(TimeoutAwareView):
     X, O, EMPTY = "X", "O", None
 
     def __init__(self, player_x: discord.Member, player_o: discord.Member, guild_id: int):
@@ -3619,15 +4035,14 @@ class TicTacToeView(discord.ui.View):
         self.stop()
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        await self._disable_and_finalize("⏱️ This Tic-Tac-Toe game timed out — nobody moved in time.")
 
 
 # ---------------------------------------------------------------------------
 # Rock Paper Scissors
 # ---------------------------------------------------------------------------
 
-class RPSView(discord.ui.View):
+class RPSView(TimeoutAwareView):
     CHOICES = ["rock", "paper", "scissors"]
     BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}
 
@@ -3635,6 +4050,9 @@ class RPSView(discord.ui.View):
         super().__init__(timeout=30)
         self.player = player
         self.guild_id = guild_id
+
+    async def on_timeout(self):
+        await self._disable_and_finalize("⏱️ No pick in time — this round's off.")
 
     async def _resolve(self, interaction: discord.Interaction, user_choice: str):
         if interaction.user.id != self.player.id:
@@ -3696,7 +4114,7 @@ class Connect4ColumnButton(discord.ui.Button):
         await view.handle_drop(interaction, self.column)
 
 
-class Connect4View(discord.ui.View):
+class Connect4View(TimeoutAwareView):
     def __init__(self, player_red: discord.Member, player_yellow: discord.Member, guild_id: int):
         super().__init__(timeout=300)
         self.player_red = player_red
@@ -3802,8 +4220,7 @@ class Connect4View(discord.ui.View):
         self.stop()
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        await self._disable_and_finalize("⏱️ This Connect Four game timed out — nobody dropped a piece in time.")
 
 
 # ---------------------------------------------------------------------------
@@ -4078,6 +4495,7 @@ class Games(commands.Cog):
             f"{interaction.user.mention} (X) vs {opponent.mention} (O) — {interaction.user.mention}'s turn (X)",
             view=view,
         )
+        view.message = await interaction.original_response()
 
     # -- Rock Paper Scissors --------------------------------------------------
 
@@ -4085,6 +4503,7 @@ class Games(commands.Cog):
     async def rps(self, interaction: discord.Interaction):
         view = RPSView(interaction.user, interaction.guild_id)
         await interaction.response.send_message("Pick your move:", view=view)
+        view.message = await interaction.original_response()
 
     # -- Guess the Number -----------------------------------------------------
 
@@ -4243,6 +4662,7 @@ class Games(commands.Cog):
             f"{interaction.user.mention}'s turn",
             view=view,
         )
+        view.message = await interaction.original_response()
 
     # -- Trivia ---------------------------------------------------------------
 
@@ -4443,110 +4863,6 @@ class Games(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Games(bot))
-</file>
-
-<file path="main.py">
-"""
-main.py
-
-Entry point for Lucy. Changes in this version:
-  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
-    and closes it cleanly on shutdown.
-  - Loads two new cogs: games (mini-games) and news (real headlines).
-  - Everything else (owner_id wiring, slash sync, prefix commands) is
-    unchanged from before.
-"""
-
-import os
-import asyncio
-import logging
-
-import discord
-from discord.ext import commands
-from dotenv import load_dotenv
-
-from utils import database as db
-
-load_dotenv()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("lucy.main")
-
-INTENTS = discord.Intents.default()
-INTENTS.message_content = True
-INTENTS.members = True
-# NOT yet added: INTENTS.presences = True — this needs Nox to first enable
-# "Presence Intent" in the Discord Developer Portal (Bot tab, alongside the
-# two intents above). Required for Max Awareness's status/activity lookup.
-# See MAX_AWARENESS_HANDOFF.md, Phase 0. Once that's confirmed done, flip
-# this on and INFO_TOOLS' lookup_member (utils/nim_client.py) can start
-# returning real status/activity instead of omitting it.
-
-COGS = [
-    "cogs.moderation",
-    "cogs.utility",
-    "cogs.personality",
-    "cogs.ai_chat",
-    "cogs.games",
-    "cogs.news",
-    "cogs.preferences",
-    "cogs.serverlog",
-    "cogs.github",
-]
-
-
-class Lucy(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=INTENTS)
-
-    async def setup_hook(self):
-        await db.init_pool()
-        logger.info("Postgres pool ready.")
-
-        for cog in COGS:
-            try:
-                await self.load_extension(cog)
-                logger.info("Loaded %s", cog)
-            except Exception:
-                logger.exception("Failed to load %s", cog)
-
-        owner_id = os.getenv("OWNER_ID", "").strip()
-        if owner_id:
-            self.owner_id = int(owner_id)
-            logger.info("Owner ID set to %s", self.owner_id)
-        else:
-            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
-
-        synced = await self.tree.sync()
-        logger.info("Synced %d slash commands.", len(synced))
-
-    async def on_ready(self):
-        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
-        # gets called with her own user id in that case, and this tells the
-        # database layer to skip the (meaningless) relationship-score bump for it.
-        db.set_bot_user_id(self.user.id)
-        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
-
-    async def close(self):
-        await db.close_pool()
-        await super().close()
-
-
-async def main():
-    token = os.getenv("DISCORD_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN is not set.")
-
-    bot = Lucy()
-    async with bot:
-        await bot.start(token)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 </file>
 
 <file path="cogs/utility.py">
@@ -4791,6 +5107,245 @@ class Utility(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Utility(bot))
+</file>
+
+<file path="main.py">
+"""
+main.py
+
+Entry point for Lucy. Changes in this version:
+  - Initializes the asyncpg Postgres pool (Railway) instead of aiosqlite,
+    and closes it cleanly on shutdown.
+  - Loads two new cogs: games (mini-games) and news (real headlines).
+  - Everything else (owner_id wiring, slash sync, prefix commands) is
+    unchanged from before.
+"""
+
+import os
+import asyncio
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+from dotenv import load_dotenv
+
+from utils import database as db
+from utils import http
+
+load_dotenv()
+
+# Perf fix (this session): uvloop is a drop-in libuv-backed replacement for
+# asyncio's default event loop — commonly a meaningful speedup for an I/O-
+# heavy app like this one (constant Discord gateway traffic, HTTP calls to
+# NIM/Groq/OpenRouter/GitHub/Postgres) for zero code changes anywhere else.
+# Linux/macOS only, which is fine — Railway (this bot's actual deployment
+# target) is Linux. Falls back to the standard event loop silently if it's
+# not installed (e.g. a Windows dev machine), so this can't break anything.
+try:
+    import uvloop
+    uvloop.install()
+except ImportError:
+    uvloop = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("lucy.main")
+if uvloop is not None:
+    logger.info("uvloop installed — running on the faster event loop.")
+
+INTENTS = discord.Intents.default()
+INTENTS.message_content = True
+INTENTS.members = True
+# INTENTS.presences is intentionally still off here even though the
+# Discord Developer Portal's "Presence Intent" toggle has been enabled
+# since the start of this project (confirmed by Nox — the earlier comment
+# here claiming it wasn't enabled yet was stale/wrong). The Portal toggle
+# only grants the *ability* to request presence data; requesting it via
+# INTENTS.presences = True is a separate, deliberate step that isn't taken
+# here because nothing in the bot consumes presence data yet (Max
+# Awareness Phase 1+ — see MAX_AWARENESS_HANDOFF.md — is what would use
+# it). Flipping this on before anything reads presence data would just add
+# gateway traffic and member-cache overhead for no benefit, so it stays
+# off until that feature actually lands.
+
+COGS = [
+    "cogs.moderation",
+    "cogs.utility",
+    "cogs.personality",
+    "cogs.ai_chat",
+    "cogs.games",
+    "cogs.news",
+    "cogs.preferences",
+    "cogs.serverlog",
+    "cogs.github",
+]
+
+
+class Lucy(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=INTENTS)
+        # Global error-handling fix (this session): every cog except
+        # Moderation had zero error handling on its slash commands, and no
+        # cog had any at all for prefix commands. That meant an unhandled
+        # exception anywhere in the bot — games, utility, github, a typo'd
+        # role name, a member below the bot in the hierarchy, anything —
+        # left the person looking at Discord's bare "This interaction
+        # failed" (slash commands) or literal silence (prefix commands),
+        # with the actual cause visible only in Railway logs. A cog-level
+        # handler (see Moderation.cog_app_command_error) still gets first
+        # refusal and can give more specific messaging for its own
+        # commands; this is just the bot-wide safety net underneath that.
+        self.tree.on_error = self.on_app_command_error
+
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CheckFailure):
+            message = "🚫 You don't have permission to do that."
+        else:
+            logger.error(
+                "Unhandled app command error in /%s",
+                getattr(interaction.command, "name", "?"), exc_info=error,
+            )
+            message = "⚠️ Something went wrong running that — I've logged it, try again in a bit."
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            pass  # interaction's already dead (timed out, etc.) — nothing more to do
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.CommandNotFound):
+            return  # not every "!something" someone types is meant as a command
+        if isinstance(error, commands.CheckFailure):
+            await ctx.send("🚫 You don't have permission to do that.")
+            return
+        if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+            await ctx.send(f"⚠️ {error}")
+            return
+        logger.error("Unhandled prefix command error in !%s", ctx.command, exc_info=error)
+        await ctx.send("⚠️ Something went wrong running that — I've logged it.")
+
+    async def setup_hook(self):
+        await db.init_pool()
+        logger.info("Postgres pool ready.")
+
+        # Rate-limit all slash commands globally: 1 command / 5s / user.
+        # Owner bypasses. Cog-level checks (is_admin_or_mod, etc.) still
+        # run after this, so permission gates aren't affected.
+        from utils.rate_limiter import is_slash_rate_limited
+
+        async def _interaction_check(interaction: discord.Interaction) -> bool:
+            if is_slash_rate_limited(interaction.user.id):
+                await interaction.response.send_message(
+                    "You're using commands too fast — slow down.", ephemeral=True
+                )
+                return False
+            return True
+
+        self.tree.interaction_check = _interaction_check
+
+        for cog in COGS:
+            try:
+                await self.load_extension(cog)
+                logger.info("Loaded %s", cog)
+            except Exception:
+                logger.exception("Failed to load %s", cog)
+
+        owner_id = os.getenv("OWNER_ID", "").strip()
+        if owner_id:
+            self.owner_id = int(owner_id)
+            logger.info("Owner ID set to %s", self.owner_id)
+        else:
+            logger.warning("OWNER_ID not set — owner-specific persona won't activate.")
+
+        synced = await self.tree.sync()
+        logger.info("Synced %d slash commands.", len(synced))
+
+    async def on_ready(self):
+        # Lucy sometimes "plays" guessnumber as an AI opponent — record_game_result
+        # gets called with her own user id in that case, and this tells the
+        # database layer to skip the (meaningless) relationship-score bump for it.
+        db.set_bot_user_id(self.user.id)
+        logger.info("Logged in as %s (id %s)", self.user, self.user.id)
+
+    async def close(self):
+        await db.close_pool()
+        await http.close_session()
+        await super().close()
+
+
+# ---------------------------------------------------------------------------
+# Health-check HTTP endpoint (aiohttp.web, in-process)
+# ---------------------------------------------------------------------------
+# Render/Koyeb/Railway all inject PORT. A free pinger service (UptimeRobot)
+# hits this every few minutes to keep the dyno awake. Bound to the same
+# event loop as the bot — starts alongside the gateway connection, doesn't
+# block it, and shuts down cleanly when the bot closes.
+# ---------------------------------------------------------------------------
+
+from aiohttp import web
+
+
+async def _health_handler(request: web.Request) -> web.Response:
+    """Lightweight health check: gateway connected + DB reachable."""
+    bot: Lucy = request.app["bot"]
+    status = {"gateway": "connected" if bot.is_ready() else "connecting"}
+
+    try:
+        pool = db._require_pool()
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        status["database"] = "ok"
+    except Exception as e:
+        status["database"] = f"error: {e}"
+
+    http_status = 200 if status["database"] == "ok" else 503
+    return web.json_response(status, status=http_status)
+
+
+async def _start_health_server(bot: Lucy) -> web.AppRunner:
+    """Start the aiohttp.web health endpoint on $PORT (default 8080).
+    Returns the runner so the caller can clean it up on shutdown."""
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app["bot"] = bot
+    app.router.add_get("/health", _health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    logger.info("Health endpoint listening on 0.0.0.0:%s/health", port)
+    return runner
+
+
+async def main():
+    token = os.getenv("DISCORD_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+
+    bot = Lucy()
+    runner = None
+    try:
+        # Start the health endpoint first so it's ready before the gateway
+        # connect (Render's health probe may fire immediately).
+        runner = await _start_health_server(bot)
+        async with bot:
+            await bot.start(token)
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+            logger.info("Health endpoint shut down.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 </file>
 
 <file path="README.md">
@@ -5208,7 +5763,19 @@ async def init_pool():
     if dsn.startswith("postgres://"):
         dsn = dsn.replace("postgres://", "postgresql://", 1)
 
-    _pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=10)
+    # Portability fix: Render/Koyeb (and some other hosts) require SSL for
+    # their managed Postgres, but Railway's internal Postgres does not. Rather
+    # than hardcoding per-platform behavior, we let asyncpg auto-negotiate:
+    # passing ssl="require" when the DSN doesn't already specify it covers the
+    # common case where a host enforces SSL but the connection string omits
+    # the parameter. If sslmode is already in the DSN, asyncpg respects it.
+    # This is a no-op on Railway (same connection either way) and required on
+    # Render/Koyeb free-tier Postgres.
+    connect_kwargs = {"min_size": 1, "max_size": 10}
+    if "sslmode=" not in dsn and "?ssl=" not in dsn:
+        connect_kwargs["ssl"] = "require"
+
+    _pool = await asyncpg.create_pool(dsn=dsn, **connect_kwargs)
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA)
         await conn.execute(MIGRATIONS)
@@ -5251,10 +5818,32 @@ async def get_guild_settings(guild_id: int) -> dict:
         return dict(row)
 
 
+VALID_GUILD_SETTING_FIELDS = {
+    "log_channel_id", "chat_trigger_mode", "chat_channel_id", "welcome_channel_id",
+    "welcome_message", "vent_channel_id", "channel_redirection_enabled",
+    "idle_chatter_enabled", "server_vibe_enabled", "github_digest_channel_id",
+    "github_last_digest_at",
+}
+
+
 async def update_guild_setting(guild_id: int, **kwargs):
     """update_guild_setting(guild_id, chat_trigger_mode='mention', chat_channel_id=123)"""
     if not kwargs:
         return
+    # Hardening fix (this session): every call site today passes literal,
+    # hardcoded kwarg names written in this codebase (see cogs/utility.py,
+    # cogs/github.py), so this wasn't reachable with attacker-controlled
+    # column names in practice — but unlike set_personality_field just
+    # below, which validates against VALID_PERSONALITY_FIELDS, this had NO
+    # guard at all before the column name landed in an f-string. That's a
+    # foot-gun waiting for a future refactor (e.g. a generic "/setconfig
+    # <key> <value>" command mapping free text into these kwargs) to turn
+    # into a real SQL injection with nobody noticing until it's exploited.
+    # Whitelisting now costs nothing for legitimate callers and closes that
+    # off permanently.
+    unknown = set(kwargs) - VALID_GUILD_SETTING_FIELDS
+    if unknown:
+        raise ValueError(f"Unknown guild_settings field(s): {', '.join(sorted(unknown))}")
     await get_guild_settings(guild_id)  # ensure row exists
     pool = _require_pool()
     columns = list(kwargs.keys())
@@ -6017,6 +6606,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import cachetools
 import discord
 from discord.ext import commands, tasks
 
@@ -6028,6 +6618,8 @@ from utils import openrouter_client
 from utils import facts
 from utils import github_client
 from utils import persona_engine
+
+from utils.rate_limiter import is_chat_rate_limited
 
 logger = logging.getLogger("lucy.ai_chat")
 
@@ -6282,18 +6874,43 @@ def format_member_lookup(data: dict) -> str:
 class AIChat(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # Left as a genuinely unbounded defaultdict on purpose: cachetools'
+        # LRUCache would need to evict an old channel's Lock to make room
+        # for a new one, and if that channel's handler was still awaiting
+        # that exact Lock object, evicting it from the *cache* wouldn't stop
+        # in-flight coroutines still holding it — but a later message in
+        # that same channel would then be handed a brand-new Lock instead,
+        # letting two handlers for the same channel interleave, which is
+        # the exact chat_memory ordering bug this lock exists to prevent.
+        # Lock objects are a few dozen bytes each and this server's channel
+        # count is small and stable, so the actual growth here is trivial —
+        # not worth trading a real (if rare) correctness bug for.
         self._channel_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._nim_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NIM_CALLS)
+        # Bounded-cache fix (this session): these five used to be plain
+        # dicts that only ever grew for the life of the process — fine for
+        # a small private server that runs for days, less fine across
+        # months of uptime on a memory-capped Railway instance. Swapped for
+        # cachetools caches that clean themselves up; all four still
+        # support plain dict-style .get()/[]=, so no call site below needed
+        # to change, only these declarations. TTLs are chosen so an entry
+        # expiring is equivalent to "no recent value," which is exactly the
+        # same as their old default `.get(key, 0.0)` fallback behavior —
+        # this isn't just tidiness, it's semantically the right expiry.
+        #
         # message_id -> (original_author_id, guild_id, channel_id, snippet) for feedback tracking
-        self._recent_replies: dict[int, tuple[int, int, int, str]] = {}
-        # (guild_id, user_id) -> datetime of last owner alert, to avoid spamming
-        self._last_alert: dict[tuple[int, int], float] = {}
-        # channel_id -> last time we saw a real message there
-        self._last_activity_at: dict[int, float] = {}
-        # channel_id -> last time we sent idle chatter there
-        self._last_idle_chatter_at: dict[int, float] = {}
-        # channel_id -> last time we ran a vent-channel classification call
-        self._last_vent_check: dict[int, float] = {}
+        self._recent_replies: cachetools.LRUCache = cachetools.LRUCache(maxsize=500)
+        # (guild_id, user_id) -> time of last owner alert; expires shortly
+        # after OWNER_ALERT_COOLDOWN_SECONDS so it can't outlive its purpose.
+        self._last_alert: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=30 * 60)
+        # channel_id -> last time we saw a real message there; kept for a
+        # day, comfortably longer than IDLE_CHATTER_INTERVAL_SECONDS.
+        self._last_activity_at: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=24 * 60 * 60)
+        # channel_id -> last time we sent idle chatter there; same window.
+        self._last_idle_chatter_at: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=24 * 60 * 60)
+        # channel_id -> last time we ran a vent-channel classification call;
+        # only needs to outlive VENT_CHECK_MIN_INTERVAL_SECONDS (15s).
+        self._last_vent_check: cachetools.TTLCache = cachetools.TTLCache(maxsize=5000, ttl=5 * 60)
 
     async def cog_load(self):
         # Prime the news digest once at startup so the very first replies
@@ -6425,7 +7042,7 @@ class AIChat(commands.Cog):
             return
 
         key = (message.guild.id, message.author.id)
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         last = self._last_alert.get(key)
         if last is not None and (now - last) < OWNER_ALERT_COOLDOWN_SECONDS:
             return  # already alerted about this person recently, don't spam
@@ -6460,8 +7077,10 @@ class AIChat(commands.Cog):
         if message.guild is None or message.author.bot:
             return
 
-        self._last_activity_at[message.channel.id] = asyncio.get_event_loop().time()
-        will_reply = await self._should_respond(message)
+        if is_chat_rate_limited(message.author.id):
+            return  # silently drop — don't even acknowledge
+
+        self._last_activity_at[message.channel.id] = asyncio.get_running_loop().time()
 
         settings = await db.get_guild_settings(message.guild.id)
         if not will_reply and settings.get("channel_redirection_enabled"):
@@ -6508,7 +7127,7 @@ class AIChat(commands.Cog):
                 if not channel.permissions_for(guild.me).send_messages:
                     continue
 
-                now_ts = asyncio.get_event_loop().time()
+                now_ts = asyncio.get_running_loop().time()
                 last_activity = self._last_activity_at.get(channel.id, 0.0)
                 last_sent = self._last_idle_chatter_at.get(channel.id, 0.0)
                 if last_activity and (now_ts - last_activity) < IDLE_CHATTER_INTERVAL_SECONDS:
@@ -6543,7 +7162,7 @@ class AIChat(commands.Cog):
         if len(content) < VENT_MIN_MESSAGE_LENGTH:
             return
 
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
         last_check = self._last_vent_check.get(message.channel.id)
         if last_check is not None and (now - last_check) < VENT_CHECK_MIN_INTERVAL_SECONDS:
             return
@@ -7131,10 +7750,9 @@ class AIChat(commands.Cog):
                     await sent_message.add_reaction(emoji)
                 except discord.HTTPException:
                     pass
-            # keep the tracking dict from growing forever
-            if len(self._recent_replies) > 500:
-                oldest_key = next(iter(self._recent_replies))
-                self._recent_replies.pop(oldest_key, None)
+            # (LRUCache(maxsize=500) now evicts the oldest entry on its own
+            # once full — the old manual "pop the oldest key" block that
+            # used to live here is gone, cachetools does this for us.)
 
         # First-ever message from this person in this guild: offer a fast,
         # skippable calibration so Lucy can start adapting sooner than
@@ -7199,6 +7817,7 @@ import aiohttp
 from utils import groq_client
 from utils import openrouter_client
 from utils import persona_engine
+from utils import http
 
 logger = logging.getLogger("lucy.nim_client")
 
@@ -7995,12 +8614,12 @@ async def _call_one_model(model: str, messages: list[dict], max_tokens: int, tem
         "Accept": "application/json",
     }
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(NIM_API_URL, json=payload, headers=headers) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
-            data = await resp.json()
+    session = await http.get_session()
+    async with session.post(NIM_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
+        data = await resp.json()
 
     try:
         message = data["choices"][0]["message"]
