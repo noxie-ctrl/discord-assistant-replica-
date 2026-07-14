@@ -20,6 +20,7 @@ import hashlib
 import itertools
 import logging
 import os
+import re
 from typing import Any, Dict, List
 
 import aiohttp
@@ -151,11 +152,43 @@ def _make_cache_key(urls: List[str]) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
+# "openrouter/free" auto-routes to whatever's currently free, and that
+# rotation includes models that DON'T actually support vision. When one of
+# those gets picked for an image request, it doesn't error — it answers
+# with something that looks like real output but never looked at the image:
+# a bare safety/moderation classification ("User Safety: safe"), a refusal,
+# or a generic non-answer. If describe_images returned that as-is, the
+# caller (and the model composing the final chat reply) has no way to tell
+# it apart from a real description — and live testing showed the model
+# will confabulate a plausible-sounding description from the filename/
+# username instead of relaying the honest garbage, which is exactly the
+# failure TOOL_RESULT_HONESTY_ADDENDUM is supposed to prevent. This check
+# is a floor, not a guarantee: catches the two failure shapes actually
+# observed, real descriptions are almost never this short or this-shaped.
+_NON_DESCRIPTION_PATTERNS = (
+    re.compile(r"^\s*(user\s+)?safety\s*:", re.IGNORECASE),
+    re.compile(r"^\s*(the\s+)?content\s+is\s+safe\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*(i\s+)?(can'?t|cannot|am unable to)\s+(see|view|access|analyze)", re.IGNORECASE),
+)
+_MIN_DESCRIPTION_LENGTH = 15
+
+
+def _looks_like_real_description(text: str) -> bool:
+    stripped = (text or "").strip()
+    if len(stripped) < _MIN_DESCRIPTION_LENGTH:
+        return False
+    return not any(pattern.match(stripped) for pattern in _NON_DESCRIPTION_PATTERNS)
+
+
 async def describe_images(image_urls: List[str], prompt: str = "Describe the image(s) plainly and briefly.") -> str:
     """Return a short description for the given image URLs.
 
     Uses the DB cache if available, and stores results back into the cache.
-    Raises RuntimeError if the model signals the content is blocked.
+    Raises RuntimeError if the model signals the content is blocked, or if
+    every retry came back looking like a non-vision-model artifact rather
+    than a real description (see _looks_like_real_description above) — the
+    caller (ai_chat.py's describe_member_avatar branch) turns that into an
+    honest "couldn't look at it right now" instead of relaying garbage.
     """
     if not image_urls:
         return ""
@@ -193,10 +226,34 @@ async def describe_images(image_urls: List[str], prompt: str = "Describe the ima
         },
     ]
 
-    result = await call_openrouter(messages, model=DEFAULT_VISION_MODEL, max_tokens=220, temperature=0.2)
-    if result.strip().upper() == "SAFETY_BLOCKED":
-        raise RuntimeError("OpenRouter safety blocked image description")
-    desc = result.strip()
+    # openrouter/free can hand this request to a different underlying model
+    # on each call, so a retry has a real chance of landing on one that
+    # actually supports vision — this loop is separate from call_openrouter's
+    # own transient-failure retries (429/timeout), it's specifically for "the
+    # call succeeded but didn't actually describe anything."
+    desc = None
+    last_bad = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        result = await call_openrouter(messages, model=DEFAULT_VISION_MODEL, max_tokens=220, temperature=0.2)
+        if result.strip().upper() == "SAFETY_BLOCKED":
+            raise RuntimeError("OpenRouter safety blocked image description")
+        candidate = result.strip()
+        if _looks_like_real_description(candidate):
+            desc = candidate
+            break
+        last_bad = candidate
+        logger.warning(
+            "OpenRouter vision call (attempt %d/%d) returned a non-description response "
+            "(likely a non-vision free-router pick): %r",
+            attempt, max_attempts, candidate,
+        )
+
+    if desc is None:
+        raise RuntimeError(
+            f"OpenRouter vision kept returning unusable responses after {max_attempts} attempts "
+            f"(last: {last_bad!r}) — likely the free router keeps landing on a non-vision model."
+        )
 
     # Store in cache (best-effort)
     try:
