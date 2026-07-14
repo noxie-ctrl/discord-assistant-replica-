@@ -23,10 +23,13 @@ Day 4 addition: build_system_prompt() takes an optional server_vibe string
 (utils/awareness.py's per-guild digest) alongside the existing news_digest,
 folded into known_facts the same way.
 
-Max Awareness, Phase 1 (this session): added INFO_TOOLS (the on-demand
-lookup_member tool — see MAX_AWARENESS_HANDOFF.md) and BOT_AWARENESS_ADDENDUM,
-folded into build_system_prompt() unconditionally. Status/activity are NOT
-part of this yet — that's Phase 0's blocker (Presence intent), still pending.
+Max Awareness, Phase 1: added INFO_TOOLS (the on-demand lookup_member tool)
+and BOT_AWARENESS_ADDENDUM, folded into build_system_prompt() unconditionally.
+
+Max Awareness, Phase 2 (this session): Presence intent is live (main.py).
+lookup_member's result can now include status/activity when Discord reports
+one — see format_member_lookup in cogs/ai_chat.py. Added describe_member_avatar
+to INFO_TOOLS too, reusing the existing OpenRouter vision pipeline on-demand.
 """
 
 import os
@@ -210,13 +213,16 @@ and catch you being wrong about.
 
 # Added after live testing surfaced a real failure mode: asked to relay a
 # lookup_member result, the model invented a plausible-looking "Status:
-# Offline" line that the tool never returned (it doesn't return status at
-# all yet — see INFO_TOOLS below), AND recited the result as a labeled
-# field list instead of a normal sentence. Both are covered in spirit by
+# Offline" line that the tool never returned (at the time, Phase 1,
+# lookup_member didn't return status at all). Both are covered in spirit by
 # the "Honesty about memory" paragraph and the "sound like a person"
 # section further down, but neither mentions tool results specifically, so
 # this closes that gap directly rather than trusting the model to
 # generalize from the closest-but-not-quite rule.
+#
+# Still applies unchanged post-Phase-2: status/activity CAN be real now,
+# but only when the tool result actually included them — the rule ("say
+# only what the result told you") doesn't care which phase added the data.
 TOOL_RESULT_HONESTY_ADDENDUM = """
 When a tool gives you a result — like looking someone up — say only what that result \
 actually told you. If it didn't include a piece of information (like whether they're online, \
@@ -626,18 +632,24 @@ CONCERN_TOOLS = [
     },
 ]
 
-# Max Awareness, Phase 1. Like CONCERN_TOOLS, this is always available
-# regardless of the requester's permission level — unlike create_role/
-# assign_role, this is public server info any member could already see by
-# clicking someone's profile, so it isn't gated the way TOOLS above is.
+# Max Awareness, Phase 1+2. Like CONCERN_TOOLS, always available regardless
+# of the requester's permission level — unlike create_role/assign_role,
+# this is public server info any member could already see by clicking
+# someone's profile, so it isn't gated the way TOOLS above is.
 #
-# Deliberately does NOT expose online/idle/dnd/offline status or current
-# activity yet. Discord gates that behind the privileged Presence intent,
-# which main.py doesn't request yet (needs a Developer Portal toggle first
-# — see MAX_AWARENESS_HANDOFF.md, Phase 0). Shipping status wording before
-# that's confirmed on would just have Lucy confidently state stale/false
-# presence info, which is worse than not answering it. Add it here once
-# Nox confirms the portal toggle + `INTENTS.presences = True` are both live.
+# Phase 2 (this session): Presence intent is now live (main.py,
+# `INTENTS.presences = True`), so lookup_member's result can include
+# online/idle/dnd/offline status and current activity when Discord
+# actually reports one — see format_member_lookup in cogs/ai_chat.py.
+# Status/activity are still deliberately absent from the result for any
+# member Discord isn't reporting a presence for (offline, invisible, or
+# just no update received yet) rather than guessed at.
+#
+# describe_member_avatar reuses the existing OpenRouter vision pipeline
+# (utils/openrouter_client.describe_images — DB-cached, $0/token via the
+# openrouter/free router) rather than adding any new dependency. On-demand
+# only, never called automatically alongside lookup_member, to keep it
+# off the free vision quota unless someone actually asks.
 INFO_TOOLS = [
     {
         "type": "function",
@@ -646,12 +658,13 @@ INFO_TOOLS = [
             "description": (
                 "Look up a specific member of this server — their roles, when they "
                 "joined, when their account was created, any notes you have on them, "
-                "and whether they're a bot account rather than a real person. Use this "
-                "when someone asks about a specific person (\"who is X\", \"what do you "
-                "know about Y\") — don't call this speculatively or for every message. "
-                "This does NOT tell you whether they're online or what they're doing "
-                "right now — it has no status/activity data at all, so don't state or "
-                "imply either when relaying this tool's result."
+                "whether they're a bot account rather than a real person, and their "
+                "current online status and activity if Discord is reporting one. Use "
+                "this when someone asks about a specific person (\"who is X\", \"what do "
+                "you know about Y\", \"is X online\") — don't call this speculatively or "
+                "for every message. Status/activity may be absent even for a real "
+                "member (offline, invisible, or Discord just hasn't sent an update yet) "
+                "— if the result doesn't mention it, you don't know it, don't guess."
             ),
             "parameters": {
                 "type": "object",
@@ -659,6 +672,29 @@ INFO_TOOLS = [
                     "member_name": {
                         "type": "string",
                         "description": "Display name or username of the member to look up.",
+                    },
+                },
+                "required": ["member_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_member_avatar",
+            "description": (
+                "Look at a specific member's current avatar/profile picture and describe "
+                "it in plain language. Only call this when someone explicitly asks what a "
+                "member looks like, describes their pfp, or similar — never automatically "
+                "alongside lookup_member. Uses a real vision API call, so treat it like "
+                "get_weather/search_fact: a real tool call, not something to fake."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "member_name": {
+                        "type": "string",
+                        "description": "Display name or username of the member whose avatar to describe.",
                     },
                 },
                 "required": ["member_name"],

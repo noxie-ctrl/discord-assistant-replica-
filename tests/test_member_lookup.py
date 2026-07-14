@@ -58,29 +58,67 @@ class MemberLookupFormatterTests(unittest.TestCase):
         self.assertIn("unknown", result)
         self.assertIn("none", result)
 
-    def test_never_mentions_status_or_activity(self):
-        # Regression-guard for a real bug caught in live testing: with no
-        # status/activity keys in the data dict at all, Lucy still recited
-        # a "Status: Offline" line back to a user — invented, not real data
-        # (lookup_member doesn't return status yet; see INFO_TOOLS). The
-        # formatter itself was never the source of that line, but this
-        # locks in that it's structurally impossible for it to be: the
-        # word "status" (or "activity"/"online"/"offline") should never
-        # appear in this formatter's output no matter what's passed in,
-        # so if it ever does, it's coming from the model paraphrasing
-        # loosely rather than this function.
+    def test_omits_status_when_not_provided(self):
+        # Max Awareness Phase 2: no status key at all (member offline,
+        # invisible, or Discord just hasn't reported yet) — formatter must
+        # say nothing about it, not "unknown". This replaces the old
+        # test_never_mentions_status_or_activity, which was a Phase 1
+        # regression-guard against status being invented from nothing; now
+        # that lookup_member can legitimately carry real status/activity,
+        # the guard is scoped to "omitted key means silence", not "the word
+        # can never appear at all".
+        result = format_member_lookup({
+            "display_name": "Ghost",
+            "is_bot": False,
+            "joined": "2024",
+            "created": "2018",
+            "roles": "none",
+        })
+        lowered = result.lower()
+        for banned in ("status", "activity", "online", "offline", "right now"):
+            self.assertNotIn(banned, lowered)
+
+    def test_includes_status_and_activity_when_provided(self):
         result = format_member_lookup({
             "display_name": "Nox",
             "username": "nox",
             "is_bot": False,
             "joined": "January 2024",
             "created": "2018",
-            "roles": "Owner, @everyone",
-            "notes": "The one who actually runs this place.",
+            "roles": "Owner",
+            "status": "online",
+            "activity": "playing Balatro",
         })
-        lowered = result.lower()
-        for banned in ("status", "activity", "online", "offline"):
-            self.assertNotIn(banned, lowered)
+        self.assertIn("online", result.lower())
+        self.assertIn("playing Balatro", result)
+
+    def test_includes_status_without_activity(self):
+        # Presence can report a status with no activity attached (just
+        # sitting idle with nothing running) — shouldn't produce a dangling
+        # comma or an empty activity clause.
+        result = format_member_lookup({
+            "display_name": "Nox",
+            "is_bot": False,
+            "joined": "2024",
+            "created": "2018",
+            "roles": "none",
+            "status": "idle",
+        })
+        self.assertIn("idle", result.lower())
+        self.assertNotIn(",.", result)
+
+    def test_bot_short_circuit_still_wins_over_status(self):
+        # Bot check must still short-circuit first even if status somehow
+        # ended up in the dict for a bot (shouldn't happen given the
+        # `if not target.bot` guard in _execute_tool_call, but the
+        # formatter itself should stay defensive regardless of caller).
+        result = format_member_lookup({
+            "display_name": "MEE6",
+            "is_bot": True,
+            "status": "online",
+        })
+        self.assertIn("bot account", result)
+        self.assertNotIn("online", result.lower())
 
 
 if __name__ == "__main__":

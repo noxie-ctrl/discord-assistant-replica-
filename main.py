@@ -47,18 +47,14 @@ if uvloop is not None:
 INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.members = True
-# INTENTS.presences is intentionally still off here even though the
-# Discord Developer Portal's "Presence Intent" toggle has been enabled
-# since the start of this project (confirmed by Nox — the earlier comment
-# here claiming it wasn't enabled yet was stale/wrong). The Portal toggle
-# only grants the *ability* to request presence data; requesting it via
-# INTENTS.presences = True is a separate, deliberate step that isn't taken
-# here because nothing in the bot consumes presence data yet (Max
-# Awareness Phase 1+ — see MAX_AWARENESS_HANDOFF.md — is what would use
-# it). Flipping this on before anything reads presence data would just add
-# gateway traffic and member-cache overhead for no benefit, so it stays
-# off until that feature actually lands.
-
+# Max Awareness, Phase 2: flipped on. lookup_member (INFO_TOOLS in
+# nim_client.py) now reads member.status / member.activities — see
+# format_member_lookup in cogs/ai_chat.py. Portal toggle was already on;
+# this is the code-side half. NERV-HQ is a small single guild, so the
+# added gateway/member-cache overhead this comment used to warn about is
+# negligible here — revisit if that guild ever grows large enough for
+# Discord's large-guild presence chunking behavior to matter.
+INTENTS.presences = True
 COGS = [
     "cogs.moderation",
     "cogs.utility",

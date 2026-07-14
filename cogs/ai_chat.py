@@ -270,17 +270,20 @@ def member_has_any_permission(permissions, *names: str) -> bool:
 
 
 def format_member_lookup(data: dict) -> str:
-    """Pure formatter for the lookup_member tool (Max Awareness, Phase 1) —
-    takes a plain dict of already-extracted fields so it's unit-testable
-    without mocking discord.Member/discord.Guild objects. The discord-object
-    extraction that builds this dict lives in _execute_tool_call, same as
-    the rest of that function (thin, not unit tested directly).
+    """Pure formatter for the lookup_member tool. Takes a plain dict of
+    already-extracted fields so it's unit-testable without mocking
+    discord.Member/discord.Guild objects. The discord-object extraction
+    that builds this dict lives in _execute_tool_call, same as the rest
+    of that function (thin, not unit tested directly).
 
     Expected keys: display_name, username, is_bot, joined, created, roles,
-    notes (all optional except display_name/is_bot).
+    notes, status, activity (all optional except display_name/is_bot).
 
-    Deliberately no status/activity fields yet — see INFO_TOOLS in
-    utils/nim_client.py for why (Presence intent not enabled yet)."""
+    Max Awareness Phase 2: status/activity are only present in the dict
+    when Presence intent actually reported something for this member —
+    omit the key entirely rather than passing None, so "unknown" never
+    gets said for status the way it legitimately does for joined/created.
+    No status key means say nothing about status, not "status: unknown"."""
     display_name = data.get("display_name") or "that member"
     username = data.get("username")
     handle = f" (@{username})" if username else ""
@@ -300,10 +303,45 @@ def format_member_lookup(data: dict) -> str:
         f"{display_name}{handle} — joined this server on {joined}, Discord "
         f"account created {created}, roles: {roles}."
     ]
+    status = data.get("status")
+    if status:
+        activity = data.get("activity")
+        parts.append(f"Right now: {status}" + (f", {activity}." if activity else "."))
     notes = data.get("notes")
     if notes:
         parts.append(f"Known notes: {notes}")
     return " ".join(parts)
+
+
+def _format_member_status(status: "discord.Status") -> str | None:
+    """Max Awareness Phase 2. Discord can't distinguish invisible from
+    offline by design — both read as offline here, since that's Discord's
+    own privacy behavior for the invisible status, not a gap in this code."""
+    return {
+        discord.Status.online: "online",
+        discord.Status.idle: "idle",
+        discord.Status.dnd: "do not disturb",
+        discord.Status.offline: "offline",
+    }.get(status)
+
+
+def _format_member_activity(activities) -> str | None:
+    """Max Awareness Phase 2. member.activities is a tuple that can mix
+    Spotify/Streaming/CustomActivity/Game objects — pick the first one
+    that actually has something sayable rather than assuming a shape."""
+    if not activities:
+        return None
+    for activity in activities:
+        if isinstance(activity, discord.Spotify):
+            return f"listening to {activity.title} by {activity.artist}"
+        if isinstance(activity, discord.Streaming):
+            return f"streaming{f' {activity.name}' if activity.name else ''}"
+        if isinstance(activity, discord.CustomActivity):
+            if activity.name:
+                return activity.name
+        elif getattr(activity, "name", None):
+            return f"playing {activity.name}"
+    return None
 
 
 class AIChat(commands.Cog):
@@ -768,7 +806,40 @@ class AIChat(commands.Cog):
                 "roles": ", ".join(r.name for r in target.roles if r.name != "@everyone") or "none",
                 "notes": notes,
             }
+            # Max Awareness Phase 2: only add status/activity when Presence
+            # intent actually gave us a real status for this member — see
+            # format_member_lookup's docstring for why we omit rather than
+            # pass None here.
+            if not target.bot:
+                status_str = _format_member_status(target.status)
+                if status_str:
+                    data["status"] = status_str
+                    data["activity"] = _format_member_activity(target.activities)
             return format_member_lookup(data)
+
+        if name == "describe_member_avatar":
+            # Max Awareness Phase 2. On-demand only (never called
+            # automatically alongside lookup_member) — reuses the existing
+            # OpenRouter vision pipeline, no new dependency, no permission
+            # gate (same public-info treatment as lookup_member).
+            member_name = (args.get("member_name") or "").strip().lower()
+            if not member_name:
+                return "Error: no member name given."
+            target = discord.utils.find(
+                lambda m: m.display_name.lower() == member_name or m.name.lower() == member_name,
+                guild.members,
+            )
+            if target is None:
+                return f"Error: no member named '{member_name}' found."
+            try:
+                description = await openrouter_client.describe_images(
+                    [target.display_avatar.url],
+                    prompt="Describe this Discord profile picture plainly and briefly.",
+                )
+            except Exception as e:
+                logger.warning("Avatar description failed for %s: %s", target.id, e)
+                return f"Error: couldn't look at {target.display_name}'s avatar right now (vision service issue)."
+            return f"{target.display_name}'s avatar: {description}"
 
         if name == "get_weather":
             location = (args.get("location") or "").strip()

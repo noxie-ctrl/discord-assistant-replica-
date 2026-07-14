@@ -186,6 +186,7 @@ class GitHub(commands.Cog):
 
     @app_commands.command(name="githubdigestnow", description="Post a GitHub recap right now (doesn't affect the weekly schedule)")
     @app_commands.describe(channel="Where to post it (defaults to the configured digest channel, or this channel)")
+    @is_admin_or_mod()
     async def githubdigestnow(self, interaction: discord.Interaction, channel: discord.TextChannel = None):
         await interaction.response.defer()
         target_channel = channel
