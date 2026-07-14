@@ -816,6 +816,7 @@ class AIChat(commands.Cog):
                 if status_str:
                     data["status"] = status_str
                     data["activity"] = _format_member_activity(target.activities)
+                    logger.info("lookup_member debug: target.status=%r, intents.presences=%r", target.status, self.bot.intents.presences)
             return format_member_lookup(data)
 
         if name == "describe_member_avatar":
