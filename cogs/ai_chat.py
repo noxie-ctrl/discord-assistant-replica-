@@ -556,6 +556,7 @@ class AIChat(commands.Cog):
         self._last_activity_at[message.channel.id] = asyncio.get_running_loop().time()
 
         settings = await db.get_guild_settings(message.guild.id)
+        will_reply = await self._should_respond(message)
         if not will_reply and settings.get("channel_redirection_enabled"):
             channel_topic = getattr(message.channel, "topic", "") or ""
             suggestion = maybe_suggest_channel_redirection(channel_topic, message.content)
