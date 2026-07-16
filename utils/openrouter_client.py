@@ -51,6 +51,9 @@ def _get_keys() -> List[str]:
     keys = [
         os.getenv("OPENROUTER_API_KEY", "").strip(),
         os.getenv("OPENROUTER_API_KEY_2", "").strip(),
+        os.getenv("OPENROUTER_API_KEY_3", "").strip(),
+        os.getenv("OPENROUTER_API_KEY_4", "").strip(),
+        os.getenv("OPENROUTER_API_KEY_5", "").strip(),
     ]
     return [k for k in keys if k]
 

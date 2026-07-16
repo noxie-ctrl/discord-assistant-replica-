@@ -35,6 +35,7 @@ to INFO_TOOLS too, reusing the existing OpenRouter vision pipeline on-demand.
 import os
 import re
 import asyncio
+import itertools
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -117,9 +118,40 @@ TIMEOUTS_BY_ATTEMPT = [15, 12, 10]
 REQUEST_TIMEOUT_SECONDS = TIMEOUTS_BY_ATTEMPT[0]  # kept for anything referencing the old constant
 
 
-def _api_key() -> str:
-    key = os.getenv("NVIDIA_API_KEY", "")
-    return key.strip()
+# Was a single NVIDIA_API_KEY. Extended to round-robin up to 3 keys, same
+# pattern as groq_client.py's _get_keys()/_next_key_order() — an eventual
+# rate limit on one key no longer takes NIM (the primary chat backend)
+# down entirely. NVIDIA_API_KEY (the original var name) keeps working
+# unchanged so this is a drop-in extension, not a breaking rename — add
+# NVIDIA_API_KEY_2 / NVIDIA_API_KEY_3 for the 2 new keys without touching
+# the original one.
+_key_cycle = None
+
+
+def _get_keys() -> list[str]:
+    keys = [
+        os.getenv("NVIDIA_API_KEY", "").strip(),
+        os.getenv("NVIDIA_API_KEY_2", "").strip(),
+        os.getenv("NVIDIA_API_KEY_3", "").strip(),
+    ]
+    return [k for k in keys if k]
+
+
+def _next_key_order() -> list[str]:
+    """Returns available keys starting from wherever the round-robin cursor
+    currently is, so load spreads across all configured keys over time."""
+    global _key_cycle
+    keys = _get_keys()
+    if not keys:
+        return []
+    if _key_cycle is None:
+        _key_cycle = itertools.cycle(range(len(keys)))
+    start = next(_key_cycle)
+    return keys[start:] + keys[:start]
+
+
+class _RateLimited(Exception):
+    pass
 
 
 OWNER_PRIORITY_ADDENDUM = """
@@ -876,6 +908,8 @@ async def _call_one_model(model: str, messages: list[dict], max_tokens: int, tem
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
     session = await http.get_session()
     async with session.post(NIM_API_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise _RateLimited(f"NVIDIA key rate-limited on {model}")
         if resp.status != 200:
             body = await resp.text()
             raise RuntimeError(f"{model} returned {resp.status}: {body[:300]}")
@@ -908,29 +942,39 @@ async def call_nim_with_tools(messages: list[dict], max_tokens: int = 700, tempe
     message dict so callers can inspect `tool_calls`. Note: only the first
     two candidates (Mistral models) reliably support tool calling — if we've
     fallen back to the third candidate, tools are dropped rather than sent
-    to a model that might mishandle them."""
-    api_key = _api_key()
-    if not api_key:
-        raise RuntimeError("NVIDIA_API_KEY is not set.")
+    to a model that might mishandle them.
+
+    For each model candidate, tries every configured NVIDIA key in
+    round-robin order before giving up on that model — a 429 on one key
+    doesn't skip straight to a worse fallback model when another key is
+    sitting there unused."""
+    keys = _next_key_order()
+    if not keys:
+        raise RuntimeError("No NVIDIA_API_KEY / NVIDIA_API_KEY_2 / NVIDIA_API_KEY_3 configured.")
 
     last_error: Exception | None = None
     for i, model in enumerate(MODEL_CANDIDATES):
         model_tools = tools if i < 2 else None  # drop tools for the non-Mistral fallback
         attempt_timeout = TIMEOUTS_BY_ATTEMPT[min(i, len(TIMEOUTS_BY_ATTEMPT) - 1)]
-        try:
-            message = await _call_one_model(
-                model, messages, max_tokens, temperature, api_key,
-                tools=model_tools, timeout_seconds=attempt_timeout,
-            )
-            if model != MODEL_CANDIDATES[0]:
-                logger.warning("Primary model unavailable, served from fallback: %s", model)
-            return message
-        except asyncio.TimeoutError:
-            logger.warning("%s timed out after %ss, trying next candidate", model, attempt_timeout)
-            last_error = TimeoutError(f"{model} timed out")
-        except Exception as e:
-            logger.warning("%s failed (%s), trying next candidate", model, e)
-            last_error = e
+        for key in keys:
+            try:
+                message = await _call_one_model(
+                    model, messages, max_tokens, temperature, key,
+                    tools=model_tools, timeout_seconds=attempt_timeout,
+                )
+                if model != MODEL_CANDIDATES[0]:
+                    logger.warning("Primary model unavailable, served from fallback: %s", model)
+                return message
+            except asyncio.TimeoutError:
+                logger.warning("%s timed out after %ss, trying next key if any", model, attempt_timeout)
+                last_error = TimeoutError(f"{model} timed out")
+            except _RateLimited as e:
+                last_error = e
+                logger.warning("NVIDIA key rate-limited on %s, trying next key if any", model)
+            except Exception as e:
+                logger.warning("%s failed (%s), trying next key if any", model, e)
+                last_error = e
+        logger.warning("All configured NVIDIA keys failed for %s, trying next model candidate", model)
 
     # Every NIM candidate failed — last resort before giving up entirely.
     # Groq doesn't get tool support here (different tool-call wire format
@@ -1050,3 +1094,7 @@ async def infer_style_signals(display_name: str, recent_messages: list[str]) -> 
             return None
 
     return persona_engine.parse_inferred_deltas(result)
+
+
+def is_configured() -> bool:
+    return bool(_get_keys())
