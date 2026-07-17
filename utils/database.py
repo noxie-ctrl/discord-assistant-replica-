@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS github_activity_log (
 CREATE INDEX IF NOT EXISTS idx_github_activity_guild_time
     ON github_activity_log (guild_id, created_at DESC);
 
-# --- after the existing github_activity_log index, still inside SCHEMA ---
+
 
 -- GitHub bot isolation (this session): project-tracking + durable cache
 -- for the newly-separated GitHub bot (github_bot.py). Same Postgres
