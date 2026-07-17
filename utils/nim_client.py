@@ -46,7 +46,8 @@ from utils import groq_client
 from utils import openrouter_client
 from utils import persona_engine
 from utils import http
-
+from utils import http
+from utils import github_tools   # add this line
 logger = logging.getLogger("lucy.nim_client")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -787,7 +788,9 @@ GROUNDING_TOOLS = [
             },
         },
     },
-    {
+] + github_tools.GITHUB_TOOL_SCHEMAS
+
+'''    {
         "type": "function",
         "function": {
             "name": "search_github_activity",
@@ -883,7 +886,7 @@ GROUNDING_TOOLS = [
         },
     },
 ]
-
+'''
 
 async def _call_one_model(model: str, messages: list[dict], max_tokens: int, temperature: float,
                             api_key: str, tools: list[dict] | None = None, timeout_seconds: int = 15) -> dict:

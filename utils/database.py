@@ -185,7 +185,44 @@ CREATE TABLE IF NOT EXISTS github_activity_log (
 
 CREATE INDEX IF NOT EXISTS idx_github_activity_guild_time
     ON github_activity_log (guild_id, created_at DESC);
+
+# --- after the existing github_activity_log index, still inside SCHEMA ---
+
+-- GitHub bot isolation (this session): project-tracking + durable cache
+-- for the newly-separated GitHub bot (github_bot.py). Same Postgres
+-- instance — no second database, just clearly-prefixed tables.
+
+-- Which repo (if any) a channel/thread is "about" — explicit-set via
+-- /projectlink, not passively inferred.
+CREATE TABLE IF NOT EXISTS ghbot_projects (
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT NOT NULL,
+    repo TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    linked_by BIGINT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (guild_id, channel_id)
+);
+
+-- Durable backstop under cachetools' in-memory cache — survives a Render
+-- free-tier restart, which wipes memory but not Postgres.
+CREATE TABLE IF NOT EXISTS ghbot_repo_cache (
+    cache_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    fetched_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- The bot's own role/config. Setter command deliberately deferred — the
+-- default in code covers the MVP; a /botscope command is a small
+-- follow-up once this is live.
+CREATE TABLE IF NOT EXISTS ghbot_scope (
+    guild_id BIGINT PRIMARY KEY,
+    role_description TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT now()
+);
 """
+
+
 
 # Tables above only get created if they don't exist — they already exist in
 # production from the previous deploy, so new columns need explicit ALTERs.
@@ -212,8 +249,13 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
 
 
 async def init_pool():
-    """Call once on bot startup."""
+    """Called once explicitly in main.py before either bot starts (this
+    session, multi-bot support) — idempotent, so Lucy.setup_hook()'s
+    existing call to this is now just a harmless no-op instead of racing
+    to create a second pool."""
     global _pool
+    if _pool is not None:
+        return _pool
     dsn = os.getenv("DATABASE_URL") or os.getenv("DATABASE_PUBLIC_URL")
     if not dsn:
         raise RuntimeError(
@@ -242,6 +284,83 @@ async def init_pool():
         await conn.execute(MIGRATIONS)
     logger.info("Database pool initialized, schema ensured, migrations applied.")
     return _pool
+
+DEFAULT_GHBOT_ROLE = (
+    "You are a focused GitHub/project-tracking assistant for a team working on "
+    "shared coding projects in this Discord server. You help with repo status, "
+    "code questions, and what's happening on a given project. You are not Lucy "
+    "and don't share her persona — keep responses plain, technical, and brief."
+)
+
+
+async def set_project_link(guild_id: int, channel_id: int, repo: str, description: str, linked_by: int):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ghbot_projects (guild_id, channel_id, repo, description, linked_by)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (guild_id, channel_id) DO UPDATE
+                SET repo = EXCLUDED.repo, description = EXCLUDED.description, linked_by = EXCLUDED.linked_by
+            """,
+            guild_id, channel_id, repo, description, linked_by,
+        )
+
+
+async def get_project_link(guild_id: int, channel_id: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM ghbot_projects WHERE guild_id = $1 AND channel_id = $2",
+            guild_id, channel_id,
+        )
+        return dict(row) if row else None
+
+
+async def remove_project_link(guild_id: int, channel_id: int) -> bool:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM ghbot_projects WHERE guild_id = $1 AND channel_id = $2",
+            guild_id, channel_id,
+        )
+        return result.endswith(" 1")
+
+
+async def get_repo_cache(cache_key: str, max_age_seconds: int) -> str | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT payload, fetched_at FROM ghbot_repo_cache WHERE cache_key = $1", cache_key
+        )
+    if row is None:
+        return None
+    age = (datetime.now(timezone.utc) - row["fetched_at"]).total_seconds()
+    if age > max_age_seconds:
+        return None
+    return row["payload"]
+
+
+async def set_repo_cache(cache_key: str, payload: str):
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ghbot_repo_cache (cache_key, payload, fetched_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (cache_key) DO UPDATE SET payload = EXCLUDED.payload, fetched_at = now()
+            """,
+            cache_key, payload,
+        )
+
+
+async def get_ghbot_scope(guild_id: int) -> str:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT role_description FROM ghbot_scope WHERE guild_id = $1", guild_id
+        )
+    return row["role_description"] if row and row["role_description"] else DEFAULT_GHBOT_ROLE
 
 
 async def close_pool():

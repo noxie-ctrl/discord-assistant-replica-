@@ -51,7 +51,7 @@ from utils import groq_client
 from utils import awareness
 from utils import openrouter_client
 from utils import facts
-from utils import github_client
+from utils import github_tools
 from utils import persona_engine
 
 from utils.rate_limiter import is_chat_rate_limited
@@ -855,29 +855,19 @@ class AIChat(commands.Cog):
                 return "Error: no query given."
             return await facts.search_fact(query)
 
-        if name == "search_github_activity":
-            repo = (args.get("repo") or "").strip().lower() or None
-            days = args.get("days") or 7
-            try:
-                days = max(1, min(int(days), 30))
-            except (TypeError, ValueError):
-                days = 7
-            activity = await db.get_recent_github_activity(guild.id, repo=repo, days=days)
-            if not activity:
-                scope = f"'{repo}'" if repo else "any linked repo"
-                return f"No GitHub activity found for {scope} in the last {days} day(s)."
-            lines = []
-            for item in activity:
-                if item["kind"] == "commits":
-                    lines.append(f"[{item['repo']}] Commits: {item['title']}")
-                else:
-                    lines.append(f"[{item['repo']}] PR #{item['ref']} \"{item['title']}\" — {item['detail'] or 'no summary'}")
-            return "\n".join(lines)
+        # before (the search_github_activity block, the "if name in (...)" line,
+# and the entire _resolve_linked_repo + _execute_github_repo_tool methods
+# that followed) — replace ALL of that with just:
 
-        if name in ("get_repo_overview", "search_repo_code", "read_repo_file"):
-            return await self._execute_github_repo_tool(name, args, guild)
+        if name in ("search_github_activity", "get_repo_overview", "search_repo_code", "read_repo_file"):
+            # Extracted to utils/github_tools.py (this session) — shared
+            # with the new isolated GitHub bot (cogs/github_chat.py) so
+            # the same repo-question logic isn't duplicated across two
+            # bots. Same behavior as before, just relocated.
+            return await github_tools.dispatch(name, args, guild)
 
         return f"Error: unknown tool '{name}'."
+    
 
     async def _resolve_linked_repo(self, guild: discord.Guild, repo_arg: str | None) -> tuple[dict | None, str]:
         """Matches a (possibly omitted) repo argument against this guild's
