@@ -34,5 +34,6 @@ class GuildSettingFieldWhitelistTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(known_call_site_fields.issubset(db.VALID_GUILD_SETTING_FIELDS))
 
 
+
 if __name__ == "__main__":
     unittest.main()
