@@ -87,3 +87,52 @@ async def call_gemini(messages: list[dict], model: str = MODEL_CANDIDATES[0], ma
 
 def is_configured() -> bool:
     return bool(_api_key())
+
+
+# ---------------------------------------------------------------------------
+# Embeddings — used by utils/aysa_knowledge.py (book/PDF library ingestion
+# + retrieval, stored in Postgres/pgvector). Same OpenAI-compatibility
+# layer as call_gemini above, just the /embeddings path instead of
+# /chat/completions, so auth/session/error-shape all match.
+#
+# UNVERIFIED against a live key at write time (same caveat as the model
+# list above) — confirm text-embedding-004 is still free/available before
+# relying on it, and that EMBEDDING_DIMENSIONS (768) matches what it
+# actually returns. If Google ever changes the default output size, update
+# EMBEDDING_DIMENSIONS *and* the VECTOR(768) column in utils/database.py's
+# AYSA_VECTOR_SCHEMA together — a mismatch will fail every insert.
+# ---------------------------------------------------------------------------
+
+GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+EMBEDDING_MODEL = "text-embedding-004"
+EMBEDDING_DIMENSIONS = 768
+
+
+async def embed_text(text: str, timeout_seconds: int = 15) -> list[float]:
+    """Returns a single embedding vector for `text`. Raises RuntimeError on
+    any failure — callers (ingestion + retrieval) should treat that as
+    'knowledge library temporarily unavailable' rather than crashing the
+    whole chat pipeline; see utils/aysa_knowledge.py."""
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    payload = {"model": EMBEDDING_MODEL, "input": text}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    session = await http.get_session()
+    async with session.post(GEMINI_EMBEDDING_URL, json=payload, headers=headers, timeout=timeout) as resp:
+        if resp.status == 429:
+            raise RuntimeError("Gemini embeddings rate-limited (per-project limit).")
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"Gemini embeddings returned {resp.status}: {body[:300]}")
+        data = await resp.json()
+
+    try:
+        return data["data"][0]["embedding"]
+    except (KeyError, IndexError) as e:
+        raise RuntimeError("Gemini embeddings returned an unexpected response shape") from e

@@ -1054,6 +1054,54 @@ async def summarize_user_notes(display_name: str, recent_messages: list[str], ex
     return result.strip()
 
 
+async def summarize_mentee_notes(display_name: str, recent_messages: list[str], existing_notes: str = "") -> str:
+    """Aysa's version of summarize_user_notes above — same technique
+    (condense recent turns into a short running memory), different
+    extraction target: continuity context for a mentoring relationship
+    (topics explored, goals mentioned, what's helped/hasn't, course
+    progress) rather than generic user facts. Deliberately NOT a place to
+    accumulate a clinical picture — no diagnostic language, no labeling,
+    just what the person themselves has said they're working on."""
+    convo = "\n".join(recent_messages[-20:])
+    system = (
+        "You extract short, durable continuity notes for a psychology-education mentor bot, "
+        "from a mentee's recent messages. This is memory for a supportive conversation, NOT a "
+        "clinical record: never assign a diagnosis or clinical label, never speculate about "
+        "conditions the person hasn't named themselves. Output 2-4 concise bullet points — "
+        "topics they're working through, goals they've mentioned, what approaches they've said "
+        "help or don't, course/lesson progress. No preamble, no markdown headers — plain "
+        "'- note' lines only. If nothing new and durable is worth keeping, output exactly: NONE."
+    )
+    user_content = (
+        f"Mentee: {display_name}\n"
+        f"Existing notes:\n{existing_notes or '(none yet)'}\n\n"
+        f"Recent messages from this person:\n{convo}\n\n"
+        "Update the notes (merge with existing, drop stale/resolved items, keep it short)."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    result = None
+    if groq_client.is_configured():
+        try:
+            result = await groq_client.call_groq(messages, model=groq_client.MODEL_FAST, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("Groq summarize_mentee_notes failed, falling back to NIM: %s", e)
+
+    if result is None:
+        try:
+            result = await call_nim(messages, max_tokens=200, temperature=0.3)
+        except Exception as e:
+            logger.warning("summarize_mentee_notes failed, keeping old notes: %s", e)
+            return existing_notes
+
+    if result.strip().upper() == "NONE":
+        return existing_notes
+    return result.strip()
+
+
 async def infer_style_signals(display_name: str, recent_messages: list[str]) -> dict[str, float] | None:
     """Small, cheap read on this user's communication-style axes (see
     utils/persona_engine.py) from a batch of their recent messages. Same

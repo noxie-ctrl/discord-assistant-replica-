@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from utils import database as db
 from utils import http
 from github_bot import build as build_github_bot
+from aysa_bot import build as build_aysa_bot
 
 load_dotenv()
 
@@ -181,13 +182,16 @@ from aiohttp import web
 
 async def _health_handler(request: web.Request) -> web.Response:
     """Lightweight health check: gateway(s) connected + DB reachable.
-    Widened (this session) so a silent GitHub-bot disconnect also trips
-    Render's probe, not just Lucy's."""
+    Widened (this session) so a silent GitHub-bot or Aysa disconnect also
+    trips Render's probe, not just Lucy's."""
     bot: Lucy = request.app["bot"]
     gh_bot = request.app.get("github_bot")
+    aysa_bot = request.app.get("aysa_bot")
     status = {"lucy_gateway": "connected" if bot.is_ready() else "connecting"}
     if gh_bot is not None:
         status["github_bot_gateway"] = "connected" if gh_bot.is_ready() else "connecting"
+    if aysa_bot is not None:
+        status["aysa_bot_gateway"] = "connected" if aysa_bot.is_ready() else "connecting"
 
     try:
         pool = db._require_pool()
@@ -201,11 +205,12 @@ async def _health_handler(request: web.Request) -> web.Response:
     return web.json_response(status, status=http_status)
 
 
-async def _start_health_server(bot: Lucy, github_bot=None) -> web.AppRunner:
+async def _start_health_server(bot: Lucy, github_bot=None, aysa_bot=None) -> web.AppRunner:
     port = int(os.getenv("PORT", "8080"))
     app = web.Application()
     app["bot"] = bot
     app["github_bot"] = github_bot
+    app["aysa_bot"] = aysa_bot
     app.router.add_get("/health", _health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -225,10 +230,11 @@ async def main():
 
     bot = Lucy()
     github_bot = build_github_bot()  # None if GITHUB_BOT_TOKEN isn't set
+    aysa_bot = build_aysa_bot()      # None if AYSA_BOT_TOKEN isn't set
 
     runner = None
     try:
-        runner = await _start_health_server(bot, github_bot)
+        runner = await _start_health_server(bot, github_bot, aysa_bot)
 
         tasks = [_run_lucy(bot, token)]
         if github_bot is not None:
@@ -236,6 +242,11 @@ async def main():
             logger.info("GitHub bot enabled — starting alongside Lucy.")
         else:
             logger.info("GITHUB_BOT_TOKEN not set — running Lucy only.")
+        if aysa_bot is not None:
+            tasks.append(_run_aysa_bot(aysa_bot, os.getenv("AYSA_BOT_TOKEN", "").strip()))
+            logger.info("Aysa enabled — starting alongside Lucy.")
+        else:
+            logger.info("AYSA_BOT_TOKEN not set — running without Aysa.")
 
         await asyncio.gather(*tasks)
     finally:
@@ -252,6 +263,11 @@ async def _run_lucy(bot: Lucy, token: str):
 async def _run_github_bot(github_bot, token: str):
     async with github_bot:
         await github_bot.start(token)
+
+
+async def _run_aysa_bot(aysa_bot, token: str):
+    async with aysa_bot:
+        await aysa_bot.start(token)
 
 
 if __name__ == "__main__":

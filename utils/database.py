@@ -248,6 +248,143 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ;
 """
 
 
+# ---------------------------------------------------------------------------
+# Aysa (psychology mentor bot) — isolated tables, aysa_ prefix, same "one
+# shared Postgres, clearly-prefixed tables" convention as the GitHub bot's
+# ghbot_* tables. Split into two pieces below (core / vector) so a missing
+# pgvector extension on the host only disables the knowledge library, not
+# the whole bot — see init_pool().
+# ---------------------------------------------------------------------------
+
+AYSA_SCHEMA = """
+-- One row per person Aysa has ever talked to. `notes` is her rolling,
+-- AI-summarized long-term memory of this person (concerns, goals,
+-- recurring themes) — same idea as Lucy's user_profiles.notes, kept in
+-- Aysa's own table since the two bots deliberately don't share a memory
+-- space or a persona.
+CREATE TABLE IF NOT EXISTS aysa_students (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    display_name TEXT,
+    message_count INT DEFAULT 0,
+    notes TEXT DEFAULT '',
+    first_seen TIMESTAMPTZ DEFAULT now(),
+    last_seen TIMESTAMPTZ DEFAULT now()
+);
+
+-- Full mentoring conversation log, per user rather than per guild/channel —
+-- Aysa's relationship is with the person, whether they reach her in a DM
+-- or an @mention in a server channel. Kept to a rolling window in code
+-- (see add_conversation_message), with aysa_students.notes carrying
+-- continuity across the cap, same split as Lucy's chat_memory + notes.
+CREATE TABLE IF NOT EXISTS aysa_conversations (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    role TEXT NOT NULL,             -- 'user' or 'assistant'
+    content TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_aysa_conversations_user_time
+    ON aysa_conversations (user_id, created_at DESC);
+
+-- A course is a named curriculum; lessons belong to it in order.
+CREATE TABLE IF NOT EXISTS aysa_courses (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_by BIGINT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- video_url/paper_url are real sourced links (utils/aysa_content.py
+-- searches YouTube + Semantic Scholar when a lesson is added); summary and
+-- comprehension_questions are Aysa's own AI-generated material built from
+-- those sources — what she actually teaches from, day to day.
+CREATE TABLE IF NOT EXISTS aysa_lessons (
+    id SERIAL PRIMARY KEY,
+    course_id INT NOT NULL REFERENCES aysa_courses(id) ON DELETE CASCADE,
+    order_index INT NOT NULL,
+    topic TEXT NOT NULL,
+    video_url TEXT,
+    video_title TEXT,
+    paper_url TEXT,
+    paper_title TEXT,
+    summary TEXT,
+    comprehension_questions TEXT,   -- JSON-encoded list[str]
+    created_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (course_id, order_index)
+);
+
+-- One row per (student, course). current_lesson_index is the lesson
+-- they're currently ON — only advances once that lesson's comprehension
+-- discussion is marked done (see aysa_lesson_progress + cogs/aysa_courses.py).
+CREATE TABLE IF NOT EXISTS aysa_enrollments (
+    user_id BIGINT NOT NULL,
+    course_id INT NOT NULL REFERENCES aysa_courses(id) ON DELETE CASCADE,
+    current_lesson_index INT NOT NULL DEFAULT 1,
+    status TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'completed' | 'paused'
+    enrolled_at TIMESTAMPTZ DEFAULT now(),
+    last_activity_at TIMESTAMPTZ DEFAULT now(),
+    last_nudged_at TIMESTAMPTZ,
+    PRIMARY KEY (user_id, course_id)
+);
+
+-- Per-lesson progress: when a student marked it watched, and whether
+-- Aysa's follow-up comprehension chat (her "how'd it land, what did you
+-- think" check) has happened yet.
+CREATE TABLE IF NOT EXISTS aysa_lesson_progress (
+    user_id BIGINT NOT NULL,
+    course_id INT NOT NULL,
+    lesson_index INT NOT NULL,
+    watched_at TIMESTAMPTZ,
+    discussed_at TIMESTAMPTZ,
+    comprehension_notes TEXT DEFAULT '',
+    PRIMARY KEY (user_id, course_id, lesson_index)
+);
+"""
+
+AYSA_MIGRATIONS = """
+ALTER TABLE aysa_enrollments ADD COLUMN IF NOT EXISTS last_nudged_at TIMESTAMPTZ;
+ALTER TABLE aysa_lesson_progress ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+"""
+
+# Split out from AYSA_SCHEMA: requires the pgvector extension, which isn't
+# guaranteed to be available/permitted on every Postgres host. Executed
+# separately in init_pool() inside a try/except — on failure the knowledge
+# library (book/PDF search) just stays disabled, same "additive, not a hard
+# dependency" pattern as GITHUB_BOT_TOKEN being unset.
+AYSA_VECTOR_SCHEMA = """
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Books/papers/PDFs an admin has fed Aysa for her general knowledge
+-- library (distinct from a course's per-lesson sources above).
+CREATE TABLE IF NOT EXISTS aysa_knowledge_sources (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    added_by BIGINT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- 768 dims matches Gemini's text-embedding-004 (see
+-- utils/gemini_client.embed_text) — change both together if the embedding
+-- model ever changes.
+CREATE TABLE IF NOT EXISTS aysa_knowledge_chunks (
+    id SERIAL PRIMARY KEY,
+    source_id INT NOT NULL REFERENCES aysa_knowledge_sources(id) ON DELETE CASCADE,
+    chunk_index INT NOT NULL,
+    content TEXT NOT NULL,
+    embedding VECTOR(768),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+"""
+
+# Set at the end of init_pool() — cogs/aysa_chat.py checks this before
+# registering the knowledge-search tool at all, so the model never even
+# sees a tool that would just error every time.
+KNOWLEDGE_LIBRARY_AVAILABLE = False
+
+
 async def init_pool():
     """Called once explicitly in main.py before either bot starts (this
     session, multi-bot support) — idempotent, so Lucy.setup_hook()'s
@@ -282,6 +419,20 @@ async def init_pool():
     async with _pool.acquire() as conn:
         await conn.execute(SCHEMA)
         await conn.execute(MIGRATIONS)
+        await conn.execute(AYSA_SCHEMA)
+        await conn.execute(AYSA_MIGRATIONS)
+
+        global KNOWLEDGE_LIBRARY_AVAILABLE
+        try:
+            await conn.execute(AYSA_VECTOR_SCHEMA)
+            KNOWLEDGE_LIBRARY_AVAILABLE = True
+        except Exception:
+            logger.warning(
+                "pgvector unavailable on this Postgres host — Aysa's book/PDF "
+                "knowledge library will stay disabled. Everything else (chat, "
+                "memory, courses) is unaffected.", exc_info=True,
+            )
+            KNOWLEDGE_LIBRARY_AVAILABLE = False
     logger.info("Database pool initialized, schema ensured, migrations applied.")
     return _pool
 
@@ -1140,3 +1291,419 @@ async def get_guilds_due_for_digest() -> list[dict]:
 
 async def mark_digest_sent(guild_id: int) -> None:
     await update_guild_setting(guild_id, github_last_digest_at=datetime.now(timezone.utc))
+
+
+# ---------------------------------------------------------------------------
+# Aysa (psychology mentor bot) — students & rolling memory
+# ---------------------------------------------------------------------------
+
+AYSA_CONVERSATION_WINDOW = 60  # rows kept per user in aysa_conversations
+
+
+async def touch_student(user_id: int, username: str, display_name: str) -> dict:
+    """Upsert a student row, bump message_count + last_seen. Same shape as
+    Lucy's touch_profile, minus relationship_score/guild scoping — Aysa
+    isn't guild-scoped, and 'warming up' isn't the framing here."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO aysa_students (user_id, username, display_name, message_count, last_seen)
+            VALUES ($1, $2, $3, 1, now())
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = $2,
+                display_name = $3,
+                message_count = aysa_students.message_count + 1,
+                last_seen = now()
+            RETURNING *
+            """,
+            user_id, username, display_name,
+        )
+        return dict(row)
+
+
+async def get_student(user_id: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM aysa_students WHERE user_id = $1", user_id)
+        return dict(row) if row else None
+
+
+async def update_student_notes(user_id: int, notes: str) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE aysa_students SET notes = $2 WHERE user_id = $1", user_id, notes
+        )
+
+
+async def add_conversation_message(user_id: int, role: str, content: str) -> None:
+    """Logs one turn and prunes to AYSA_CONVERSATION_WINDOW rows for this
+    user — same rolling-window + offset-delete pattern as Lucy's
+    add_chat_message, just keyed on user_id instead of guild/channel since
+    this is a 1:1 relationship regardless of where the message came in."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO aysa_conversations (user_id, role, content) VALUES ($1, $2, $3)",
+            user_id, role, content,
+        )
+        await conn.execute(
+            """
+            DELETE FROM aysa_conversations
+            WHERE id IN (
+                SELECT id FROM aysa_conversations
+                WHERE user_id = $1
+                ORDER BY created_at DESC
+                OFFSET $2
+            )
+            """,
+            user_id, AYSA_CONVERSATION_WINDOW,
+        )
+
+
+async def get_conversation_history(user_id: int, limit: int = AYSA_CONVERSATION_WINDOW) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM aysa_conversations WHERE user_id = $1 ORDER BY created_at ASC LIMIT $2",
+            user_id, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def clear_conversation(user_id: int) -> None:
+    """Backs a /aysaforget-style privacy command — wipes the transcript AND
+    the rolling notes summary, a full reset rather than a partial one."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM aysa_conversations WHERE user_id = $1", user_id)
+        await conn.execute("UPDATE aysa_students SET notes = '' WHERE user_id = $1", user_id)
+
+
+# ---------------------------------------------------------------------------
+# Aysa — courses & lessons
+# ---------------------------------------------------------------------------
+
+async def create_course(title: str, description: str, created_by: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO aysa_courses (title, description, created_by) VALUES ($1, $2, $3) RETURNING *",
+            title, description, created_by,
+        )
+        return dict(row)
+
+
+async def list_courses() -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM aysa_courses ORDER BY title")
+        return [dict(r) for r in rows]
+
+
+async def get_course(course_id: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM aysa_courses WHERE id = $1", course_id)
+        return dict(row) if row else None
+
+
+async def find_course_by_title(title: str) -> dict | None:
+    """Case-insensitive lookup so /aysaenroll works with however the user
+    capitalized the course name."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM aysa_courses WHERE lower(title) = lower($1)", title
+        )
+        return dict(row) if row else None
+
+
+async def add_lesson(course_id: int, order_index: int, topic: str, *, video_url: str | None = None,
+                       video_title: str | None = None, paper_url: str | None = None,
+                       paper_title: str | None = None, summary: str | None = None,
+                       comprehension_questions: str | None = None) -> dict:
+    """comprehension_questions is a JSON-encoded list[str] — see
+    utils/aysa_content.py, which builds summary + comprehension_questions
+    together from the sourced video/paper."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO aysa_lessons
+                (course_id, order_index, topic, video_url, video_title, paper_url, paper_title,
+                 summary, comprehension_questions)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (course_id, order_index) DO UPDATE
+            SET topic = $3, video_url = $4, video_title = $5, paper_url = $6, paper_title = $7,
+                summary = $8, comprehension_questions = $9
+            RETURNING *
+            """,
+            course_id, order_index, topic, video_url, video_title, paper_url, paper_title,
+            summary, comprehension_questions,
+        )
+        return dict(row)
+
+
+async def get_lesson(course_id: int, order_index: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM aysa_lessons WHERE course_id = $1 AND order_index = $2",
+            course_id, order_index,
+        )
+        return dict(row) if row else None
+
+
+async def get_lessons_for_course(course_id: int) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM aysa_lessons WHERE course_id = $1 ORDER BY order_index", course_id
+        )
+        return [dict(r) for r in rows]
+
+
+async def count_lessons(course_id: int) -> int:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT count(*) FROM aysa_lessons WHERE course_id = $1", course_id
+        )
+
+
+# ---------------------------------------------------------------------------
+# Aysa — enrollments & progress
+# ---------------------------------------------------------------------------
+
+async def enroll_student(user_id: int, course_id: int) -> dict:
+    """Idempotent — re-running /aysaenroll on an existing enrollment just
+    returns it unchanged rather than resetting progress."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO aysa_enrollments (user_id, course_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, course_id) DO NOTHING
+            """,
+            user_id, course_id,
+        )
+        row = await conn.fetchrow(
+            "SELECT * FROM aysa_enrollments WHERE user_id = $1 AND course_id = $2",
+            user_id, course_id,
+        )
+        return dict(row)
+
+
+async def get_enrollment(user_id: int, course_id: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM aysa_enrollments WHERE user_id = $1 AND course_id = $2",
+            user_id, course_id,
+        )
+        return dict(row) if row else None
+
+
+async def get_active_enrollments_for_user(user_id: int) -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT e.*, c.title AS course_title FROM aysa_enrollments e
+            JOIN aysa_courses c ON c.id = e.course_id
+            WHERE e.user_id = $1 AND e.status = 'active'
+            ORDER BY e.enrolled_at
+            """,
+            user_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def list_all_active_enrollments() -> list[dict]:
+    """Used by the hybrid-nudge background loop in cogs/aysa_courses.py."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM aysa_enrollments WHERE status = 'active'")
+        return [dict(r) for r in rows]
+
+
+async def touch_enrollment_activity(user_id: int, course_id: int) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE aysa_enrollments SET last_activity_at = now() WHERE user_id = $1 AND course_id = $2",
+            user_id, course_id,
+        )
+
+
+async def mark_enrollment_nudged(user_id: int, course_id: int) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE aysa_enrollments SET last_nudged_at = now() WHERE user_id = $1 AND course_id = $2",
+            user_id, course_id,
+        )
+
+
+async def advance_enrollment(user_id: int, course_id: int, new_lesson_index: int) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE aysa_enrollments
+            SET current_lesson_index = $3, last_activity_at = now(), last_nudged_at = NULL
+            WHERE user_id = $1 AND course_id = $2
+            """,
+            user_id, course_id, new_lesson_index,
+        )
+
+
+async def complete_enrollment(user_id: int, course_id: int) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE aysa_enrollments SET status = 'completed' WHERE user_id = $1 AND course_id = $2",
+            user_id, course_id,
+        )
+
+
+async def mark_lesson_delivered(user_id: int, course_id: int, lesson_index: int) -> dict:
+    """Called the moment a lesson's content is actually sent to a student
+    (enrollment, /aysanext, or the deliver_next_lesson chat tool) — creates
+    the progress row a step before watched_at/discussed_at get set, so the
+    nudge loop and chat tools can tell 'sent but not yet watched' apart
+    from 'not sent yet' (no row at all)."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO aysa_lesson_progress (user_id, course_id, lesson_index, delivered_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (user_id, course_id, lesson_index) DO UPDATE
+            SET delivered_at = COALESCE(aysa_lesson_progress.delivered_at, now())
+            RETURNING *
+            """,
+            user_id, course_id, lesson_index,
+        )
+        return dict(row)
+
+
+async def mark_lesson_watched(user_id: int, course_id: int, lesson_index: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO aysa_lesson_progress (user_id, course_id, lesson_index, watched_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (user_id, course_id, lesson_index) DO UPDATE
+            SET watched_at = now()
+            RETURNING *
+            """,
+            user_id, course_id, lesson_index,
+        )
+        return dict(row)
+
+
+async def get_lesson_progress(user_id: int, course_id: int, lesson_index: int) -> dict | None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM aysa_lesson_progress
+            WHERE user_id = $1 AND course_id = $2 AND lesson_index = $3
+            """,
+            user_id, course_id, lesson_index,
+        )
+        return dict(row) if row else None
+
+
+async def mark_lesson_discussed(user_id: int, course_id: int, lesson_index: int, comprehension_notes: str) -> None:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO aysa_lesson_progress (user_id, course_id, lesson_index, discussed_at, comprehension_notes)
+            VALUES ($1, $2, $3, now(), $4)
+            ON CONFLICT (user_id, course_id, lesson_index) DO UPDATE
+            SET discussed_at = now(), comprehension_notes = $4
+            """,
+            user_id, course_id, lesson_index, comprehension_notes,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Aysa — knowledge library (books/papers/PDFs, pgvector search)
+# ---------------------------------------------------------------------------
+# Every function here is only called when db.KNOWLEDGE_LIBRARY_AVAILABLE is
+# True (checked by the caller) — no extra guarding needed within these.
+
+async def add_knowledge_source(title: str, added_by: int) -> dict:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO aysa_knowledge_sources (title, added_by) VALUES ($1, $2) RETURNING *",
+            title, added_by,
+        )
+        return dict(row)
+
+
+async def add_knowledge_chunk(source_id: int, chunk_index: int, content: str, embedding_literal: str) -> None:
+    """embedding_literal is a pgvector text literal, e.g. '[0.01,-0.02,...]'
+    — built by utils/aysa_knowledge.py from the raw float list. Passed as a
+    plain string parameter and cast with ::vector in SQL since asyncpg has
+    no built-in vector codec; no server-side codec registration needed."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO aysa_knowledge_chunks (source_id, chunk_index, content, embedding)
+            VALUES ($1, $2, $3, $4::vector)
+            """,
+            source_id, chunk_index, content, embedding_literal,
+        )
+
+
+async def search_knowledge_chunks(query_embedding_literal: str, top_k: int = 5) -> list[dict]:
+    """Cosine-distance nearest-neighbor search (pgvector's <=> operator).
+    No ivfflat index — fine at the scale a hand-curated book library
+    reaches; add one later if this ever grows into the tens of thousands
+    of chunks."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT k.content, k.chunk_index, s.title AS source_title,
+                   k.embedding <=> $1::vector AS distance
+            FROM aysa_knowledge_chunks k
+            JOIN aysa_knowledge_sources s ON s.id = k.source_id
+            ORDER BY k.embedding <=> $1::vector
+            LIMIT $2
+            """,
+            query_embedding_literal, top_k,
+        )
+        return [dict(r) for r in rows]
+
+
+async def list_knowledge_sources() -> list[dict]:
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.*, count(k.id) AS chunk_count
+            FROM aysa_knowledge_sources s
+            LEFT JOIN aysa_knowledge_chunks k ON k.source_id = s.id
+            GROUP BY s.id ORDER BY s.created_at DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
+
+async def delete_knowledge_source(source_id: int) -> bool:
+    """Cascades to aysa_knowledge_chunks via ON DELETE CASCADE."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute("DELETE FROM aysa_knowledge_sources WHERE id = $1", source_id)
+        return result.endswith(" 1")

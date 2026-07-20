@@ -96,8 +96,50 @@ hub for a group project rather than just a notification feed:
   GitHub's search API rejects unauthenticated requests — everything else works without
   one, just at the lower public rate limit.
 
-Testing the vision feature locally
----------------------------------
+Optional Aysa (psychology mentor/education bot — separate Discord app, same process):
+```
+AYSA_BOT_TOKEN=...          # required to enable Aysa at all — see "Create the Discord bot" above, make a 2nd app
+AYSA_GUILD_ID=...           # the one server Aysa's role-gate checks against
+AYSA_ROLE_ID=...            # the one role allowed to talk to her (DM or @mention)
+GEMINI_API_KEY=...          # required for the knowledge library (embeddings) — same key as OpenRouter-style vision, see Gemini's AI Studio
+YOUTUBE_API_KEY=...         # optional — lets /aysaaddlesson attach a real sourced video (free tier: ~100 searches/day)
+SEMANTIC_SCHOLAR_API_KEY=...# optional — raises the free Semantic Scholar rate limit for paper sourcing
+AYSA_NUDGE_CHECK_INTERVAL_HOURS=6   # optional, how often the idle-student check runs
+AYSA_NUDGE_IDLE_HOURS=48            # optional, how long someone must be quiet before a nudge
+AYSA_NUDGE_COOLDOWN_HOURS=72        # optional, minimum gap between nudges for the same enrollment
+```
+Like the GitHub bot, this needs its own Discord application + bot token (repeat step 1 above for
+a second app) invited to your server with the same permissions. **Access is role-gated**:
+`is_aysa_authorized` (`utils/permissions.py`) fails closed if `AYSA_GUILD_ID`/`AYSA_ROLE_ID`
+aren't set — nobody gets through until you configure both.
+
+What she does:
+- **1:1 mentoring chat**, in DMs or by @mention in `AYSA_GUILD_ID`, with real persistent memory
+  (full conversation history + a rolling AI-summarized "what I know about this person," same
+  technique as Lucy's long-term memory, kept in Aysa's own tables). `/aysaforget` lets anyone
+  wipe their own history.
+- **A non-negotiable safety net**: alongside the persona's own crisis-handling instructions, a
+  deterministic keyword check (`cogs/aysa_chat.py`) always appends real crisis-resource text to
+  any reply that looks like it needs it, and DMs the bot owner a heads-up — this doesn't depend
+  on the model reliably following the prompt every time.
+- **A knowledge library**: `/aysaaddbook` (admin, attach a PDF/.txt/.md) chunks and embeds source
+  material into Postgres via `pgvector`, searchable during chat. Requires `GEMINI_API_KEY` and a
+  Postgres host that supports the `vector` extension — if it doesn't, Aysa's `init_pool()` catches
+  that and just disables the knowledge-search tool rather than failing to start. `/aysaknowledge`
+  lists sources, `/aysaremovebook <id>` removes one.
+- **Structured courses**: admins build a curriculum with `/aysacreatecourse` and
+  `/aysaaddlesson <course> <topic>` — the latter actually searches YouTube + Semantic Scholar for
+  a real video/paper on the topic and has the AI write the lesson summary + comprehension
+  questions from that real source (falls back to general knowledge if nothing's found; video
+  sourcing itself is skipped without `YOUTUBE_API_KEY`). Students browse/join with `/aysacourses`
+  and `/aysaenroll`, and lessons are delivered by DM. Delivery is **hybrid**: a background pass
+  nudges anyone who's gone quiet, but the student always triggers the next step — saying
+  "I watched it" (or running `/aysadone`) marks it done and gets them comprehension questions to
+  discuss with Aysa; once that discussion actually happens (judged by Aysa mid-conversation, not
+  a fixed rule), `/aysanext` (or just asking) sends the next lesson. `/aysaprogress` shows where
+  someone's at across every course they're in.
+
+
 If you set `OPENROUTER_API_KEY` (and optionally `OPENROUTER_API_KEY_2`), you can test
 the image description path with the `/describeimage` admin command (works even if the
 bot isn't set to auto-describe attachments). Example:
