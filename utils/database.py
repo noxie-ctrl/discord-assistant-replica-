@@ -347,6 +347,8 @@ CREATE TABLE IF NOT EXISTS aysa_lesson_progress (
 AYSA_MIGRATIONS = """
 ALTER TABLE aysa_enrollments ADD COLUMN IF NOT EXISTS last_nudged_at TIMESTAMPTZ;
 ALTER TABLE aysa_lesson_progress ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;
+ALTER TABLE aysa_enrollments ADD COLUMN IF NOT EXISTS intro_completed_at TIMESTAMPTZ;
+ALTER TABLE aysa_enrollments ADD COLUMN IF NOT EXISTS intro_notes TEXT DEFAULT '';
 """
 
 # Split out from AYSA_SCHEMA: requires the pgvector extension, which isn't
@@ -1505,6 +1507,28 @@ async def get_enrollment(user_id: int, course_id: int) -> dict | None:
             user_id, course_id,
         )
         return dict(row) if row else None
+
+
+async def complete_enrollment_intro(user_id: int, course_id: int, intro_notes: str) -> None:
+    """Marks the pre-lesson-1 'getting to know you' phase done for one
+    enrollment (see cogs/aysa_courses.py's lesson_state — a fresh
+    enrollment has intro_completed_at = NULL, which is what gates lesson 1
+    from being delivered until this runs). intro_notes is Aysa's own
+    AI-written read of the student's starting knowledge level, how they
+    think/reason, and what they're hoping to get out of the course —
+    folded into her system prompt going forward so lesson delivery and
+    comprehension questions are pitched at this specific person rather
+    than a generic student."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE aysa_enrollments
+            SET intro_completed_at = now(), intro_notes = $3, last_activity_at = now()
+            WHERE user_id = $1 AND course_id = $2
+            """,
+            user_id, course_id, intro_notes,
+        )
 
 
 async def get_active_enrollments_for_user(user_id: int) -> list[dict]:

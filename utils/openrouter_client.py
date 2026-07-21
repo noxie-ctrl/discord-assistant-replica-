@@ -269,6 +269,91 @@ async def describe_images(image_urls: List[str], prompt: str = "Describe the ima
     return desc
 
 
+# ---------------------------------------------------------------------------
+# Page OCR — used by utils/aysa_knowledge.py when a PDF page has no
+# extractable text layer (a photographed/scanned page). Same free vision
+# router as describe_images above, just a transcription prompt instead of a
+# description one, and a much bigger max_tokens since a full book page of
+# text is nowhere near a 220-token image caption. Deliberately a separate
+# function rather than reusing describe_images: different prompt, different
+# output-validity shape (a real transcription can legitimately be short —
+# a title page — where a 15-char-minimum description check would wrongly
+# reject it), and no DB caching (every page is unique, nothing to cache).
+# ---------------------------------------------------------------------------
+
+_NO_TEXT_SENTINEL = "NO_TEXT_FOUND"
+
+_OCR_SYSTEM_PROMPT = (
+    "You transcribe photographed/scanned book pages for a Discord bot's knowledge library. "
+    "Reply with ONLY the page's text, transcribed as accurately as possible — preserve "
+    "paragraph breaks, fix obvious OCR-unambiguous line-wrap hyphenation, but don't summarize, "
+    "comment on, or add anything not on the page. Ignore page numbers, running headers/footers, "
+    "and pure decoration. If the page is blank, is a cover/divider with no body text, or the "
+    f"image has no legible text at all, reply with exactly: {_NO_TEXT_SENTINEL}. If the content "
+    "is safety-flagged, reply with exactly: SAFETY_BLOCKED"
+)
+
+
+def _looks_like_real_transcription(text: str) -> bool:
+    """Looser than _looks_like_real_description above — a genuine page can
+    legitimately transcribe to something short (a chapter title page), so
+    this only screens for the non-vision-model failure shapes actually
+    observed, not a minimum length."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return not any(pattern.match(stripped) for pattern in _NON_DESCRIPTION_PATTERNS)
+
+
+async def ocr_page_text(image_data_uri: str, max_attempts: int = 3) -> str:
+    """Transcribes one page image (a `data:image/png;base64,...` URI —
+    OpenRouter's OpenAI-compatible endpoint accepts base64 data URLs the
+    same as remote image URLs, so no image hosting is needed for a
+    locally-rendered PDF page). Returns "" for a legitimately blank/text-
+    free page (see _NO_TEXT_SENTINEL above) — that's a normal outcome, not
+    an error. Raises RuntimeError if OpenRouter isn't configured, the page
+    is safety-blocked, or every retry lands on a non-vision model — callers
+    (utils/aysa_knowledge.py) catch this per-page and treat it as 'couldn't
+    OCR this one', not a reason to abort the whole book."""
+    if not is_configured():
+        raise RuntimeError("No OPENROUTER_API_KEY configured — OCR fallback is unavailable.")
+
+    messages = [
+        {"role": "system", "content": _OCR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe this page."},
+                {"type": "image_url", "image_url": {"url": image_data_uri}},
+            ],
+        },
+    ]
+
+    last_bad = None
+    for attempt in range(1, max_attempts + 1):
+        result = await call_openrouter(
+            messages, model=DEFAULT_VISION_MODEL, max_tokens=2000, temperature=0.0, timeout_seconds=25,
+        )
+        candidate = result.strip()
+        if candidate.upper() == "SAFETY_BLOCKED":
+            raise RuntimeError("OpenRouter safety blocked page OCR")
+        if candidate.upper() == _NO_TEXT_SENTINEL:
+            return ""
+        if _looks_like_real_transcription(candidate):
+            return candidate
+        last_bad = candidate
+        logger.warning(
+            "OpenRouter OCR call (attempt %d/%d) returned a non-transcription response "
+            "(likely a non-vision free-router pick): %r",
+            attempt, max_attempts, candidate,
+        )
+
+    raise RuntimeError(
+        f"OpenRouter OCR kept returning unusable responses after {max_attempts} attempts "
+        f"(last: {last_bad!r}) — likely the free router keeps landing on a non-vision model."
+    )
+
+
 def is_configured() -> bool:
     """Return True if any OpenRouter key is configured."""
     return bool(_get_keys())

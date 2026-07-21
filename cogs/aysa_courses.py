@@ -30,6 +30,7 @@ relationship, not a public-channel activity feed.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import logging
@@ -49,6 +50,34 @@ NUDGE_CHECK_INTERVAL_HOURS = int(os.getenv("AYSA_NUDGE_CHECK_INTERVAL_HOURS", "6
 NUDGE_IDLE_HOURS = int(os.getenv("AYSA_NUDGE_IDLE_HOURS", "48"))
 NUDGE_COOLDOWN_HOURS = int(os.getenv("AYSA_NUDGE_COOLDOWN_HOURS", "72"))
 
+# The flagship "basic must-take" course, seeded in one pass by
+# /aysaseedintrocourse — deliberately fixed rather than admin-typed, so it's
+# a consistent single-semester-intro scope every time (roughly the shape of
+# a standard Psych 101 syllabus / OpenStax Psychology 2e's chapter order).
+# Each string is handed to utils/aysa_content.source_lesson(), which finds a
+# real video + paper on it and has the AI write the actual lecture content —
+# same pipeline /aysaaddlesson already uses for one topic at a time.
+BASIC_PSYCHOLOGY_COURSE_TITLE = "Basic Psychology"
+BASIC_PSYCHOLOGY_COURSE_DESCRIPTION = (
+    "A foundational, no-prerequisites tour of psychology — the one course to start with if "
+    "you're curious about the field. Covers how the mind and brain work, why people think, feel, "
+    "and act the way they do, and how psychologists actually study it."
+)
+BASIC_PSYCHOLOGY_CURRICULUM = [
+    "What Psychology Is and How Psychologists Study the Mind",
+    "The Brain and Nervous System: The Biology Behind Behavior",
+    "Sensation and Perception: How We Experience the World",
+    "Learning: Classical and Operant Conditioning",
+    "Memory: How We Encode, Store, and Retrieve",
+    "Human Development Across the Lifespan",
+    "Personality: Major Theories and Perspectives",
+    "Social Psychology: How Others Shape What We Do",
+    "Motivation and Emotion",
+    "Stress, Coping, and Resilience",
+    "Understanding Psychological Disorders (Without Self-Diagnosing)",
+    "How Therapy Works: An Overview of Treatment Approaches",
+]
+
 
 # ---------------------------------------------------------------------------
 # Shared state helpers — used by this cog's commands, by cogs/aysa_chat.py's
@@ -58,8 +87,17 @@ NUDGE_COOLDOWN_HOURS = int(os.getenv("AYSA_NUDGE_COOLDOWN_HOURS", "72"))
 async def lesson_state(user_id: int, enrollment: dict) -> tuple[str, dict | None]:
     """Where a student is on their CURRENT lesson for one enrollment.
     Returns (state, progress_row_or_None) — state is one of
-    'course_complete', 'ready_for_delivery', 'awaiting_watch',
-    'awaiting_discussion'."""
+    'awaiting_intro', 'course_complete', 'ready_for_delivery',
+    'awaiting_watch', 'awaiting_discussion'.
+
+    Every fresh enrollment starts in 'awaiting_intro' (intro_completed_at
+    is NULL until cogs/aysa_chat.py's complete_intro_assessment tool runs)
+    — lesson 1 is deliberately withheld until Aysa has had an actual
+    getting-to-know-you conversation with the student, so her first real
+    comprehension questions land pitched at where this specific person is
+    at rather than a generic default."""
+    if enrollment.get("intro_completed_at") is None:
+        return "awaiting_intro", None
     total = await db.count_lessons(enrollment["course_id"])
     if enrollment["current_lesson_index"] > total:
         return "course_complete", None
@@ -214,6 +252,70 @@ class AysaCourses(commands.Cog):
         parts.append(f"📄 Paper: {lesson['paper_title']}" if lesson.get("paper_url") else "📄 No paper found.")
         await interaction.followup.send("\n".join(parts))
 
+    @app_commands.command(
+        name="aysaseedintrocourse",
+        description="[admin] Build the flagship 'Basic Psychology' course in one pass",
+    )
+    @is_admin_or_mod()
+    async def aysaseedintrocourse(self, interaction: discord.Interaction):
+        course_row = await db.find_course_by_title(BASIC_PSYCHOLOGY_COURSE_TITLE)
+        if course_row is None:
+            course_row = await db.create_course(
+                BASIC_PSYCHOLOGY_COURSE_TITLE, BASIC_PSYCHOLOGY_COURSE_DESCRIPTION, interaction.user.id
+            )
+        existing_count = await db.count_lessons(course_row["id"])
+        if existing_count >= len(BASIC_PSYCHOLOGY_CURRICULUM):
+            await interaction.response.send_message(
+                f"**{BASIC_PSYCHOLOGY_COURSE_TITLE}** already has all {existing_count} lessons — nothing to do. "
+                "Delete lessons directly in the DB first if you want to rebuild it.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Building **{BASIC_PSYCHOLOGY_COURSE_TITLE}** — {len(BASIC_PSYCHOLOGY_CURRICULUM) - existing_count} "
+            f"lesson(s) to source (video + paper search, then AI-written lecture content per lesson). "
+            "This runs in the background since sourcing all of them can take a few minutes — I'll post here as each one lands."
+        )
+        asyncio.create_task(self._run_seed_intro_course(interaction.channel, course_row, existing_count))
+
+    async def _run_seed_intro_course(self, channel, course_row: dict, start_index: int) -> None:
+        """Background worker for /aysaseedintrocourse — see that command's
+        docstring-equivalent comment above for why this doesn't run inline
+        against the interaction (a 12-lesson sourcing pass can run past
+        Discord's ~15-minute interaction/followup window, especially if an
+        AI provider is having a slow day)."""
+        added = 0
+        failed = []
+        for i, topic in enumerate(BASIC_PSYCHOLOGY_CURRICULUM):
+            order_index = i + 1
+            if order_index <= start_index:
+                continue  # already has this lesson from a prior partial run
+            try:
+                material = await aysa_content.source_lesson(topic)
+                lesson = await db.add_lesson(course_row["id"], order_index, topic, **material)
+                added += 1
+                has_video = "🎥" if lesson.get("video_url") else "—"
+                has_paper = "📄" if lesson.get("paper_url") else "—"
+                try:
+                    await channel.send(
+                        f"✅ Lesson {order_index}/{len(BASIC_PSYCHOLOGY_CURRICULUM)}: **{topic}** "
+                        f"({has_video} video, {has_paper} paper)"
+                    )
+                except discord.HTTPException:
+                    pass
+            except Exception:
+                logger.exception("Failed to source lesson %d ('%s') for Basic Psychology", order_index, topic)
+                failed.append(topic)
+
+        summary = f"**{BASIC_PSYCHOLOGY_COURSE_TITLE}** build finished — {added} lesson(s) added."
+        if failed:
+            summary += f" {len(failed)} failed and can be retried individually with `/aysaaddlesson`: " + ", ".join(failed)
+        try:
+            await channel.send(summary)
+        except discord.HTTPException:
+            pass
+
     # -----------------------------------------------------------------
     # Student-facing
     # -----------------------------------------------------------------
@@ -248,11 +350,24 @@ class AysaCourses(commands.Cog):
             return
 
         enrollment = await db.enroll_student(interaction.user.id, course_row["id"])
-        await interaction.response.send_message(f"🎉 Enrolled in **{course_row['title']}**! Sending lesson 1 to your DMs now.")
-
         state, _ = await lesson_state(interaction.user.id, enrollment)
+
+        if state == "awaiting_intro":
+            await interaction.response.send_message(
+                f"🎉 Enrolled in **{course_row['title']}**! Before lesson 1, DM me (or just start "
+                "talking here) so I can get a sense of where you're starting from — no test, no "
+                "pressure, just a normal conversation. Once we've talked a bit I'll send your "
+                "first lesson."
+            )
+            return
         if state != "ready_for_delivery":
+            await interaction.response.send_message(
+                f"You're already enrolled in **{course_row['title']}** and past the intro — "
+                "no new lesson to send right now."
+            )
             return  # already enrolled + past lesson 1 (re-running the command) — nothing new to send
+
+        await interaction.response.send_message(f"🎉 Enrolled in **{course_row['title']}**! Sending lesson 1 to your DMs now.")
         lesson = await db.get_lesson(course_row["id"], enrollment["current_lesson_index"])
         sent = await deliver_lesson(self.bot, interaction.user.id, course_row, lesson)
         if not sent:
@@ -353,6 +468,7 @@ class AysaCourses(commands.Cog):
 
         lines = []
         state_labels = {
+            "awaiting_intro": "getting-to-know-you chat, before lesson 1",
             "ready_for_delivery": "waiting on the next lesson to be sent",
             "awaiting_watch": "lesson sent, waiting on you",
             "awaiting_discussion": "waiting to talk it through",
@@ -412,6 +528,12 @@ class AysaCourses(commands.Cog):
     def _nudge_message(self, state: str, enrollment: dict) -> str | None:
         course_title = enrollment.get("course_title", "your course")
         idx = enrollment["current_lesson_index"]
+        if state == "awaiting_intro":
+            return (
+                f"Hey — whenever you've got a minute, I'd love to chat so I can get a sense of "
+                f"where you're starting from before **{course_title}**'s lesson 1. No pressure, "
+                "just talk to me whenever."
+            )
         if state == "ready_for_delivery":
             return f"Hey — whenever you're ready, lesson {idx} of **{course_title}** is waiting. Just say the word, or run `/aysanext`."
         if state == "awaiting_watch":

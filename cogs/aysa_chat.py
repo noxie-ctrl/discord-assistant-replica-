@@ -14,11 +14,24 @@ channel — both gated by permissions.is_aysa_authorized (one specific
 role in AYSA_GUILD_ID). Rate-limited via the same shared limiter as
 Lucy/GitHub bot.
 
-Course awareness: before every reply, checks whether this student has a
-lesson ready to send, watched-but-undiscussed, or mid-discussion (see
-cogs/aysa_courses.lesson_state) and — if so — adds the matching tool(s)
-so the conversation can naturally move the curriculum forward without a
-slash command being required for every step.
+Context awareness on every reply:
+  - Course state (see cogs/aysa_courses.lesson_state): a lesson ready to
+    send, watched-but-undiscussed, mid-discussion, or a fresh enrollment
+    still in its pre-lesson-1 intro assessment — the matching tool(s) get
+    attached so the conversation can move the curriculum forward without
+    a slash command being required for every step.
+  - Time gap (_time_gap_note): if it's been a real amount of time since
+    the last message, the model is told so explicitly rather than being
+    left to infer continuity from raw history alone.
+  - Location (is_dm): server-channel replies get an explicit "this is
+    public, steer personal stuff to DMs yourself" note; DMs don't.
+
+Knowledge library ingestion (utils/aysa_knowledge.py) is two-tier: a real
+text layer reads via pypdf directly, and any page without one (a
+photographed/scanned page) falls back to OCR via utils/openrouter_client's
+free vision router. A PDF ingest runs as a background task posting
+progress to the channel, since OCR on a long scanned book can run past
+Discord's ~15-minute interaction window.
 
 Safety design note: the system prompt instructs the model to handle
 crisis disclosures with care and real resources, but that instruction
@@ -34,6 +47,8 @@ import os
 import re
 import json
 import logging
+import asyncio
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -56,11 +71,12 @@ KNOWLEDGE_SEARCH_TOP_K = 4
 OWNER_ALERT_COOLDOWN_SECONDS = 30 * 60  # don't re-alert on every message of an ongoing crisis conversation
 
 AYSA_SYSTEM_PROMPT = """\
-You are Aysa, a warm, plainspoken psychology mentor and educator. You are \
-NOT a licensed therapist, psychiatrist, counselor, or any kind of medical \
-professional, and you never imply otherwise. Your role is education and \
-supportive reflection — helping someone understand psychological concepts \
-and think through what they're going through — not clinical treatment.
+You are Aysa, a warm, plainspoken psychology mentor and educator — deeply \
+read in the field, not a surface-level explainer. You are NOT a licensed \
+therapist, psychiatrist, counselor, or any kind of medical professional, \
+and you never imply otherwise. Your role is education and supportive \
+reflection — helping someone understand psychological concepts and think \
+through what they're going through — not clinical treatment.
 
 How you talk: curious and warm rather than clinical, plain language over \
 jargon (and when you do use a term like "cognitive reframing" or "secure \
@@ -68,6 +84,26 @@ attachment," you explain what it actually means). You ask real follow-up \
 questions instead of just lecturing. You know this person over time — lean \
 on what you remember about them rather than treating every conversation \
 like the first one.
+
+Using what you know: you have real source material behind you (search_knowledge_library) \
+— use it the way a well-read mentor draws on their reading in conversation, not the way a \
+search engine returns results. Reach for it when a question would genuinely benefit from \
+something specific and grounded rather than a vague generality. Synthesize across whatever \
+you find into your own plain words — never paste a chunk verbatim or lecture through it \
+paragraph by paragraph. It's fine to name where an idea comes from lightly when it adds \
+weight ("there's a classic finding on this...", "the Stoics had a word for this exact \
+move..."), but you're not writing a citation list. If the library has nothing relevant, say \
+so plainly and answer from your own understanding instead — never fabricate a source.
+
+Time awareness: don't assume you're mid-conversation by default. Each message you get may \
+include a note about how long it's been since you last talked to this person — if real time \
+has passed, greet them naturally as if reconnecting rather than continuing a thought from \
+hours or days ago, UNLESS they clearly want to pick up where you left off (in which case, do).
+
+Where you're talking: each message tells you whether this is a DM or a server channel. In a \
+server, you're visible to others — keep things general, don't ask personal/sensitive \
+questions there, and if the conversation is heading somewhere that deserves privacy, suggest \
+moving to DMs yourself rather than waiting to be asked ("want to take this to DMs?").
 
 Hard boundaries, no exceptions:
 - Never diagnose. Never tell someone what condition or disorder they have \
@@ -82,6 +118,21 @@ real crisis resources right now, encouraging them to reach out to a \
 trusted person or professional immediately. Don't try to resolve it \
 yourself in the conversation.
 """
+
+# Appended to course_context on courses/aysa_courses.find_enrollment_in_state
+# returning "awaiting_intro" — see the matching complete_intro_assessment
+# tool below. Kept separate from the state-label strings in _handle_chat
+# because this one needs real behavioral instruction, not just a one-liner.
+INTRO_PHASE_INSTRUCTIONS = (
+    "This student just enrolled and hasn't had their intro conversation yet — lesson 1 is "
+    "deliberately withheld until you've talked. Don't lecture or send any material yet. Instead, "
+    "have a genuine, unhurried conversation to get a real sense of: how much they already know "
+    "about psychology (total beginner vs. some background), how they seem to think and reason "
+    "(concrete examples vs. abstract ideas, what kind of questions land for them), and what "
+    "they're actually hoping to get out of this — curiosity, something they're going through, "
+    "school, etc. This can take a few messages back and forth; don't rush it or make it feel like "
+    "an intake form. Once you genuinely have a read on them, call complete_intro_assessment."
+)
 
 CRISIS_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
@@ -143,13 +194,59 @@ async def _alert_owner_of_crisis(bot: commands.Bot, user: discord.abc.User, mess
         logger.warning("Couldn't DM owner about a crisis flag — DMs closed.")
 
 
-def build_system_prompt(student: dict, course_context: str) -> str:
+TIME_GAP_QUIET_MINUTES = 30      # below this, don't bother noting the gap at all — normal chat pacing
+TIME_GAP_MENTION_HOURS = 3       # above this, worth an explicit note (see _time_gap_note)
+
+
+def _time_gap_note(last_message_at: "datetime | None") -> str:
+    """Builds the dynamic half of the time-awareness rule in
+    AYSA_SYSTEM_PROMPT — the static rule says 'don't assume you're mid-
+    conversation'; this is the actual fact for THIS message. Empty string
+    for a normal back-and-forth (nothing to say), a short factual note
+    once real time has passed. Deliberately just states the gap and lets
+    the model decide how to greet — it already has the instruction for
+    what to do with this information."""
+    if last_message_at is None:
+        return ""
+    now = datetime.now(timezone.utc)
+    if last_message_at.tzinfo is None:
+        last_message_at = last_message_at.replace(tzinfo=timezone.utc)
+    gap = now - last_message_at
+    minutes = gap.total_seconds() / 60
+    if minutes < TIME_GAP_QUIET_MINUTES:
+        return ""
+    if minutes < 60:
+        gap_text = f"{int(minutes)} minutes"
+    elif minutes < TIME_GAP_MENTION_HOURS * 60:
+        gap_text = f"about {minutes / 60:.1f} hours"
+    elif gap.days < 1:
+        gap_text = f"about {int(minutes / 60)} hours"
+    elif gap.days == 1:
+        gap_text = "about a day"
+    else:
+        gap_text = f"about {gap.days} days"
+    return f"[Time note: it's been {gap_text} since your last message with this person.]"
+
+
+_LOCATION_NOTE_DM = "[Location: this is a DM — private, just the two of you.]"
+_LOCATION_NOTE_SERVER = (
+    "[Location: this is a server channel, not a DM — others can see this. Keep it general and "
+    "steer anything personal toward DMs, on your own initiative.]"
+)
+
+
+def build_system_prompt(
+    student: dict, course_context: str, *, is_dm: bool, time_gap_note: str = ""
+) -> str:
     parts = [AYSA_SYSTEM_PROMPT]
     notes = (student or {}).get("notes") or ""
     if notes:
         parts.append(f"\nWhat you remember about this person so far:\n{notes}")
     if course_context:
         parts.append(f"\nCourse context:\n{course_context}")
+    parts.append(f"\n{_LOCATION_NOTE_DM if is_dm else _LOCATION_NOTE_SERVER}")
+    if time_gap_note:
+        parts.append(f"\n{time_gap_note}")
     return "\n".join(parts)
 
 
@@ -239,6 +336,38 @@ def _next_lesson_tool_schema() -> dict:
     }
 
 
+def _intro_assessment_tool_schema() -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": "complete_intro_assessment",
+            "description": (
+                "Call this once you've had a real getting-to-know-you conversation with a newly "
+                "enrolled student and genuinely have a read on them — don't call it after just one "
+                "reply. This unlocks and sends lesson 1."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "starting_level": {
+                        "type": "string",
+                        "description": "Their starting knowledge level, in a few words (e.g. 'total beginner', 'some background from a college course').",
+                    },
+                    "thinking_style": {
+                        "type": "string",
+                        "description": "How they seem to think/learn best — concrete examples vs. abstract theory, what kind of questions land for them, etc.",
+                    },
+                    "goals": {
+                        "type": "string",
+                        "description": "What they're actually hoping to get out of the course, in their own terms.",
+                    },
+                },
+                "required": ["starting_level", "thinking_style", "goals"],
+            },
+        },
+    }
+
+
 async def _dispatch_tool(bot: commands.Bot, user: discord.abc.User, name: str, args: dict) -> str:
     if name == "search_knowledge_library":
         query = (args.get("query") or "").strip()
@@ -286,6 +415,36 @@ async def _dispatch_tool(bot: commands.Bot, user: discord.abc.User, name: str, a
             "whenever they ask for it — don't send it yet unless they say they're ready."
         )
 
+    if name == "complete_intro_assessment":
+        enrollment, course, error = await aysa_courses.find_enrollment_in_state(user.id, {"awaiting_intro"})
+        if error or enrollment is None:
+            return error or "No intro assessment is currently pending for this student."
+        starting_level = (args.get("starting_level") or "").strip()
+        thinking_style = (args.get("thinking_style") or "").strip()
+        goals = (args.get("goals") or "").strip()
+        intro_notes = (
+            f"Starting level: {starting_level or 'not captured'}. "
+            f"Thinking style: {thinking_style or 'not captured'}. "
+            f"Goals: {goals or 'not captured'}."
+        )
+        await db.complete_enrollment_intro(user.id, enrollment["course_id"], intro_notes)
+        lesson = await db.get_lesson(enrollment["course_id"], enrollment["current_lesson_index"])
+        if lesson is None:
+            return (
+                f"Intro assessment logged for '{course['title']}' — but lesson 1 doesn't exist yet, "
+                "an admin needs to add it. Let them know you'll send it as soon as it's ready."
+            )
+        sent = await aysa_courses.deliver_lesson(bot, user.id, course, lesson)
+        if not sent:
+            return (
+                f"Intro assessment logged for '{course['title']}'. Tried to send lesson 1 but their "
+                "DMs seem closed — tell them to open DMs to server members and ask for it."
+            )
+        return (
+            f"Intro assessment logged for '{course['title']}' and lesson 1 sent to their DMs. "
+            "Tell them warmly that it's on its way and you're looking forward to going through it together."
+        )
+
     if name == "deliver_next_lesson":
         enrollment, course, error = await aysa_courses.find_enrollment_in_state(user.id, {"ready_for_delivery"})
         if error or enrollment is None:
@@ -331,7 +490,8 @@ class AysaChat(commands.Cog):
 
     async def _handle_chat(self, message: discord.Message):
         author = message.author
-        user_text = message.content if message.guild is None else _strip_mention(self.bot, message.content)
+        is_dm = message.guild is None
+        user_text = message.content if is_dm else _strip_mention(self.bot, message.content)
 
         crisis_flagged = _contains_crisis_language(user_text)
 
@@ -352,6 +512,7 @@ class AysaChat(commands.Cog):
         tools = []
         course_context_lines = []
         for wanted_state, schema, label in [
+            ("awaiting_intro", _intro_assessment_tool_schema, None),  # label handled separately below, needs full instructions not a one-liner
             ("awaiting_watch", _watched_tool_schema, "has a lesson they may have just finished"),
             ("awaiting_discussion", _discussion_tool_schema, "is mid comprehension-discussion on a lesson"),
             ("ready_for_delivery", _next_lesson_tool_schema, "has a lesson ready to send if they ask"),
@@ -359,14 +520,22 @@ class AysaChat(commands.Cog):
             enrollment, course, _err = await aysa_courses.find_enrollment_in_state(author.id, {wanted_state})
             if enrollment is not None:
                 tools.append(schema())
-                course_context_lines.append(f"- This student {label}: '{course['title']}' lesson {enrollment['current_lesson_index']}.")
+                if wanted_state == "awaiting_intro":
+                    course_context_lines.append(f"- Course: '{course['title']}'. {INTRO_PHASE_INSTRUCTIONS}")
+                else:
+                    course_context_lines.append(f"- This student {label}: '{course['title']}' lesson {enrollment['current_lesson_index']}.")
 
         if db.KNOWLEDGE_LIBRARY_AVAILABLE:
             tools.append(_knowledge_tool_schema())
 
-        system_prompt = build_system_prompt(student, "\n".join(course_context_lines))
-
         history = await db.get_conversation_history(author.id)
+        last_message_at = history[-1]["created_at"] if history else None
+
+        system_prompt = build_system_prompt(
+            student, "\n".join(course_context_lines),
+            is_dm=is_dm, time_gap_note=_time_gap_note(last_message_at),
+        )
+
         chat_messages = [{"role": "system", "content": system_prompt}]
         chat_messages.extend({"role": h["role"], "content": h["content"]} for h in history)
         chat_messages.append({"role": "user", "content": user_text})
@@ -436,27 +605,155 @@ class AysaChat(commands.Cog):
             )
             return
 
-        await interaction.response.defer(thinking=True)
-        raw = await file.read()
         filename = file.filename or "document"
-        try:
-            if filename.lower().endswith(".pdf"):
-                text = aysa_knowledge.extract_pdf_text(raw)
-            else:
+        source_title = title.strip() or filename
+        raw = await file.read()
+
+        if not filename.lower().endswith(".pdf"):
+            # Plain text/markdown never needs OCR — stays on the fast inline path.
+            await interaction.response.defer(thinking=True)
+            try:
                 text = raw.decode("utf-8", errors="replace")
-        except RuntimeError as e:
-            await interaction.followup.send(f"Couldn't read that file: {e}")
-            return
-        except UnicodeDecodeError:
-            await interaction.followup.send("Couldn't decode that file as text — only PDF, .txt, and .md are supported.")
+            except UnicodeDecodeError:
+                await interaction.followup.send("Couldn't decode that file as text — only PDF, .txt, and .md are supported.")
+                return
+            result = await aysa_knowledge.ingest_text(source_title, text, interaction.user.id)
+            msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
+            if result["failed_chunks"]:
+                msg += f" ({result['failed_chunks']} chunk(s) failed to embed — check logs.)"
+            await interaction.followup.send(msg)
             return
 
-        source_title = title.strip() or filename
-        result = await aysa_knowledge.ingest_text(source_title, text, interaction.user.id)
+        # PDF path: OCR fallback on a scanned book can run well past Discord's ~15-minute
+        # interaction/followup window, so acknowledge immediately and do the real work in the
+        # background, posting progress as normal channel messages (no token to expire) instead
+        # of interaction followups.
+        await interaction.response.send_message(
+            f"📖 Reading **{source_title}**... I'll post progress here — a scanned book needing OCR "
+            "can take a while, a normal text PDF should be quick."
+        )
+        asyncio.create_task(self._run_add_book(interaction.channel, interaction.user.id, raw, source_title))
+
+    async def _run_add_book(self, channel, added_by: int, raw: bytes, source_title: str) -> None:
+        """Background worker for the PDF path of /aysaaddbook — see that
+        command for why this doesn't run inline against the interaction."""
+        last_reported = 0
+
+        async def extraction_progress(done: int, total: int, ocrd: int) -> None:
+            nonlocal last_reported
+            step = max(1, total // 10)  # ~10 updates regardless of book length
+            if done != total and done - last_reported < step:
+                return
+            last_reported = done
+            try:
+                await channel.send(f"📖 Read page {done}/{total} ({ocrd} needed OCR so far)...")
+            except discord.HTTPException:
+                pass
+
+        try:
+            text, stats = await aysa_knowledge.extract_pdf_text_with_ocr(raw, progress_cb=extraction_progress)
+        except RuntimeError as e:
+            try:
+                await channel.send(f"Couldn't read **{source_title}**: {e}")
+            except discord.HTTPException:
+                pass
+            return
+        except Exception:
+            logger.exception("PDF extraction crashed for '%s'", source_title)
+            try:
+                await channel.send(f"Something went wrong reading **{source_title}** — check logs.")
+            except discord.HTTPException:
+                pass
+            return
+
+        ocr_note = f", {stats['ocr_failures']} page(s) failed OCR" if stats["ocr_failures"] else ""
+        try:
+            await channel.send(
+                f"📖 Done reading — {stats['pages_total']} page(s), {stats['pages_ocrd']} needed OCR{ocr_note}. "
+                "Now chunking and embedding..."
+            )
+        except discord.HTTPException:
+            pass
+
+        last_embed_reported = 0
+
+        async def embed_progress(done: int, total: int) -> None:
+            nonlocal last_embed_reported
+            step = max(1, total // 10)
+            if done != total and done - last_embed_reported < step:
+                return
+            last_embed_reported = done
+            try:
+                await channel.send(f"🧩 Embedded {done}/{total} chunk(s)...")
+            except discord.HTTPException:
+                pass
+
+        try:
+            result = await aysa_knowledge.ingest_text(source_title, text, added_by, progress_cb=embed_progress)
+        except Exception:
+            logger.exception("Ingest failed for '%s'", source_title)
+            try:
+                await channel.send(f"Read **{source_title}** fine but embedding/storage failed — check logs.")
+            except discord.HTTPException:
+                pass
+            return
+
         msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
         if result["failed_chunks"]:
             msg += f" ({result['failed_chunks']} chunk(s) failed to embed — check logs.)"
-        await interaction.followup.send(msg)
+        try:
+            await channel.send(msg)
+        except discord.HTTPException:
+            pass
+
+    @app_commands.command(
+        name="aysaseedlibrary",
+        description="[admin] Ingest Aysa's curated starter psychology library (OpenStax + PD classics)",
+    )
+    @is_admin_or_mod()
+    async def aysaseedlibrary(self, interaction: discord.Interaction):
+        if not db.KNOWLEDGE_LIBRARY_AVAILABLE:
+            await interaction.response.send_message(
+                "The knowledge library isn't available on this deployment (pgvector isn't installed "
+                "on the Postgres host).",
+                ephemeral=True,
+            )
+            return
+        sources = aysa_knowledge.STARTER_LIBRARY_SOURCES
+        await interaction.response.send_message(
+            f"📚 Fetching and ingesting {len(sources)} starter source(s) (largest is ~75MB) — "
+            "this'll take a few minutes, I'll post progress here."
+        )
+        asyncio.create_task(self._run_seed_library(interaction.channel, interaction.user.id))
+
+    async def _run_seed_library(self, channel, added_by: int) -> None:
+        async def source_progress(title: str, idx: int, total: int) -> None:
+            try:
+                await channel.send(f"📚 ({idx}/{total}) Fetching **{title}**...")
+            except discord.HTTPException:
+                pass
+
+        try:
+            results = await aysa_knowledge.seed_starter_library(added_by, progress_cb=source_progress)
+        except Exception:
+            logger.exception("seed_starter_library crashed")
+            try:
+                await channel.send("Something went wrong seeding the starter library — check logs.")
+            except discord.HTTPException:
+                pass
+            return
+
+        lines = ["**Starter library seeding done:**"]
+        for r in results:
+            if "error" in r:
+                lines.append(f"❌ {r['title']}: {r['error']}")
+            else:
+                note = f" ({r['failed_chunks']} chunk(s) failed)" if r["failed_chunks"] else ""
+                lines.append(f"✅ {r['title']} — {r['chunk_count']} chunk(s){note}")
+        try:
+            await channel.send("\n".join(lines))
+        except discord.HTTPException:
+            pass
 
     @app_commands.command(name="aysaknowledge", description="[admin] List Aysa's knowledge library sources")
     @is_admin_or_mod()
