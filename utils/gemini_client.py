@@ -95,17 +95,50 @@ def is_configured() -> bool:
 # layer as call_gemini above, just the /embeddings path instead of
 # /chat/completions, so auth/session/error-shape all match.
 #
-# UNVERIFIED against a live key at write time (same caveat as the model
-# list above) — confirm text-embedding-004 is still free/available before
-# relying on it, and that EMBEDDING_DIMENSIONS (768) matches what it
-# actually returns. If Google ever changes the default output size, update
-# EMBEDDING_DIMENSIONS *and* the VECTOR(768) column in utils/database.py's
-# AYSA_VECTOR_SCHEMA together — a mismatch will fail every insert.
+# text-embedding-004 (this file's original model) was fully shut down by
+# Google on January 14, 2026 — every call started failing with "models/
+# text-embedding-004 is not found for API version v1beta, or is not
+# supported for embedContent." This is what caused /aysaseedlibrary to
+# report 0 chunks stored / all chunks failed on every source: not a rate
+# limit (utils/aysa_knowledge.py's retry-with-backoff correctly didn't
+# retry a hard 404-style error), the model itself was gone.
+#
+# Replacement is gemini-embedding-001, Google's current stable text
+# embedding model. Its NATIVE default output is 3072 dimensions, but it
+# supports Matryoshka truncation via an explicit dimensions request —
+# Google's own docs list 768/1536/3072 as all being good-quality choices,
+# so we ask for 768 specifically to keep VECTOR(768) in
+# utils/database.py's AYSA_VECTOR_SCHEMA unchanged (no schema migration,
+# no re-embedding anything — there was nothing stored yet to re-embed
+# anyway, since every prior ingest attempt failed at this exact step).
+# Google's docs note that anything short of the full 3072-dim output isn't
+# pre-normalized to unit length — cosine distance (what
+# db.search_knowledge_chunks' pgvector `<=>` operator computes) is
+# scale-invariant so this wouldn't break ranking either way, but we
+# normalize explicitly below anyway since it's cheap and it's what Google
+# recommends for best quality at a truncated dimension.
+#
+# If you ever want to move the whole library to 3072-dim for higher
+# retrieval quality, that DOES require updating VECTOR(768) to VECTOR(3072)
+# in AYSA_VECTOR_SCHEMA and re-ingesting every existing source (the schema
+# stores a fixed-width vector column) — not done here to keep this a
+# same-day unblock rather than a migration project.
 # ---------------------------------------------------------------------------
 
 GEMINI_EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
-EMBEDDING_MODEL = "text-embedding-004"
+EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIMENSIONS = 768
+
+
+def _normalize(vector: list[float]) -> list[float]:
+    """L2-normalizes an embedding to unit length — see the module comment
+    above on why this matters specifically for a truncated (non-3072)
+    gemini-embedding-001 output. A no-op (within floating-point noise) on
+    an already-normalized vector, so safe to always apply."""
+    norm = sum(v * v for v in vector) ** 0.5
+    if norm == 0:
+        return vector
+    return [v / norm for v in vector]
 
 
 async def embed_text(text: str, timeout_seconds: int = 15) -> list[float]:
@@ -117,7 +150,7 @@ async def embed_text(text: str, timeout_seconds: int = 15) -> list[float]:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set.")
 
-    payload = {"model": EMBEDDING_MODEL, "input": text}
+    payload = {"model": EMBEDDING_MODEL, "input": text, "dimensions": EMBEDDING_DIMENSIONS}
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -133,6 +166,13 @@ async def embed_text(text: str, timeout_seconds: int = 15) -> list[float]:
         data = await resp.json()
 
     try:
-        return data["data"][0]["embedding"]
+        vector = data["data"][0]["embedding"]
     except (KeyError, IndexError) as e:
         raise RuntimeError("Gemini embeddings returned an unexpected response shape") from e
+    if len(vector) != EMBEDDING_DIMENSIONS:
+        raise RuntimeError(
+            f"Gemini embeddings returned {len(vector)} dimensions, expected {EMBEDDING_DIMENSIONS} — "
+            "the model may have changed its default output shape again; check EMBEDDING_DIMENSIONS "
+            "and AYSA_VECTOR_SCHEMA's VECTOR(768) column together before this silently corrupts search."
+        )
+    return _normalize(vector)

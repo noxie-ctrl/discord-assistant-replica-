@@ -368,6 +368,20 @@ def _intro_assessment_tool_schema() -> dict:
     }
 
 
+def _format_ingest_result(result: dict) -> str:
+    """Shared by /aysaaddbook (both paths) and /aysaseedlibrary — surfaces
+    the actual first error, not just a bare failure count, so a systematic
+    failure (deprecated model, bad API key) is diagnosable straight from
+    Discord instead of needing server-log access."""
+    msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
+    if result["failed_chunks"]:
+        msg += f" ({result['failed_chunks']} chunk(s) failed"
+        if result.get("first_error"):
+            msg += f" — first error: {result['first_error'][:200]}"
+        msg += ".)"
+    return msg
+
+
 async def _dispatch_tool(bot: commands.Bot, user: discord.abc.User, name: str, args: dict) -> str:
     if name == "search_knowledge_library":
         query = (args.get("query") or "").strip()
@@ -618,10 +632,7 @@ class AysaChat(commands.Cog):
                 await interaction.followup.send("Couldn't decode that file as text — only PDF, .txt, and .md are supported.")
                 return
             result = await aysa_knowledge.ingest_text(source_title, text, interaction.user.id)
-            msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
-            if result["failed_chunks"]:
-                msg += f" ({result['failed_chunks']} chunk(s) failed to embed — check logs.)"
-            await interaction.followup.send(msg)
+            await interaction.followup.send(_format_ingest_result(result))
             return
 
         # PDF path: OCR fallback on a scanned book can run well past Discord's ~15-minute
@@ -698,9 +709,7 @@ class AysaChat(commands.Cog):
                 pass
             return
 
-        msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
-        if result["failed_chunks"]:
-            msg += f" ({result['failed_chunks']} chunk(s) failed to embed — check logs.)"
+        msg = _format_ingest_result(result)
         try:
             await channel.send(msg)
         except discord.HTTPException:
@@ -748,7 +757,12 @@ class AysaChat(commands.Cog):
             if "error" in r:
                 lines.append(f"❌ {r['title']}: {r['error']}")
             else:
-                note = f" ({r['failed_chunks']} chunk(s) failed)" if r["failed_chunks"] else ""
+                note = ""
+                if r["failed_chunks"]:
+                    note = f" ({r['failed_chunks']} chunk(s) failed"
+                    if r.get("first_error"):
+                        note += f" — {r['first_error'][:150]}"
+                    note += ")"
                 lines.append(f"✅ {r['title']} — {r['chunk_count']} chunk(s){note}")
         try:
             await channel.send("\n".join(lines))

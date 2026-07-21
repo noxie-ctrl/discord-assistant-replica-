@@ -112,9 +112,11 @@ async def ingest_text(
 ) -> dict:
     """Chunks `text`, embeds each chunk, and stores it under a new
     knowledge source. Returns {"source_id", "title", "chunk_count",
-    "failed_chunks"} — partial success is reported rather than hidden, so
-    an admin running /aysaaddbook can see if e.g. a rate limit cut it
-    short partway through a long book.
+    "failed_chunks", "first_error"} — partial success is reported rather
+    than hidden, and first_error carries the actual exception text from
+    the first failure (e.g. a deprecated/renamed model, a bad API key) so
+    an admin running /aysaaddbook or /aysaseedlibrary can see WHY it
+    failed straight from Discord instead of needing to check server logs.
 
     progress_cb(chunks_done, chunks_total), if given, is awaited after
     every chunk — used by /aysaaddbook and /aysaseedlibrary to post
@@ -134,21 +136,27 @@ async def ingest_text(
     source = await db.add_knowledge_source(title, added_by)
     stored = 0
     failed = 0
+    first_error: str | None = None
     for i, chunk in enumerate(chunks):
         try:
             embedding = await _embed_with_retry(chunk)
             await db.add_knowledge_chunk(source["id"], i, chunk, _vector_literal(embedding))
             stored += 1
-        except Exception:
+        except Exception as e:
             logger.exception("Failed to embed/store chunk %d of '%s'", i, title)
             failed += 1
+            if first_error is None:
+                first_error = str(e)
         if progress_cb is not None:
             try:
                 await progress_cb(i + 1, len(chunks))
             except Exception:
                 logger.exception("progress_cb raised during embedding — continuing ingest anyway.")
 
-    return {"source_id": source["id"], "title": title, "chunk_count": stored, "failed_chunks": failed}
+    return {
+        "source_id": source["id"], "title": title, "chunk_count": stored,
+        "failed_chunks": failed, "first_error": first_error,
+    }
 
 
 async def search_knowledge(query: str, top_k: int = 4) -> list[dict]:
