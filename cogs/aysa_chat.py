@@ -371,14 +371,22 @@ def _intro_assessment_tool_schema() -> dict:
 def _format_ingest_result(result: dict) -> str:
     """Shared by /aysaaddbook (both paths) and /aysaseedlibrary — surfaces
     the actual first error, not just a bare failure count, so a systematic
-    failure (deprecated model, bad API key) is diagnosable straight from
-    Discord instead of needing server-log access."""
-    msg = f"✅ Added **{result['title']}** — {result['chunk_count']} chunk(s) indexed."
+    failure (deprecated model, bad API key, sustained rate limit) is
+    diagnosable straight from Discord instead of needing server-log
+    access. Also flags aborted_early explicitly: ingest_text stopped
+    itself early rather than grinding through guaranteed failures, and
+    it's resumable — re-running the same command with the same title
+    picks up exactly where this left off."""
+    verb = "Stopped early on" if result.get("aborted_early") else "Added"
+    icon = "⏸️" if result.get("aborted_early") else "✅"
+    msg = f"{icon} {verb} **{result['title']}** — {result['chunk_count']} chunk(s) indexed so far."
     if result["failed_chunks"]:
         msg += f" ({result['failed_chunks']} chunk(s) failed"
         if result.get("first_error"):
-            msg += f" — first error: {result['first_error'][:200]}"
+            msg += f" — {result['first_error'][:200]}"
         msg += ".)"
+    if result.get("aborted_early"):
+        msg += " Sustained rate limiting — just re-run the same command later, it'll resume from here."
     return msg
 
 
@@ -730,8 +738,10 @@ class AysaChat(commands.Cog):
             return
         sources = aysa_knowledge.STARTER_LIBRARY_SOURCES
         await interaction.response.send_message(
-            f"📚 Fetching and ingesting {len(sources)} starter source(s) (largest is ~75MB) — "
-            "this'll take a few minutes, I'll post progress here."
+            f"📚 Fetching and ingesting {len(sources)} starter source(s) (largest is ~75MB) — this paces "
+            "itself deliberately to stay under the free embedding quota, so a full run can take a while. "
+            "It's safe to re-run this command any time (including if it stops itself early on rate "
+            "limiting) — it resumes from wherever it left off instead of starting over."
         )
         asyncio.create_task(self._run_seed_library(interaction.channel, interaction.user.id))
 
@@ -757,13 +767,7 @@ class AysaChat(commands.Cog):
             if "error" in r:
                 lines.append(f"❌ {r['title']}: {r['error']}")
             else:
-                note = ""
-                if r["failed_chunks"]:
-                    note = f" ({r['failed_chunks']} chunk(s) failed"
-                    if r.get("first_error"):
-                        note += f" — {r['first_error'][:150]}"
-                    note += ")"
-                lines.append(f"✅ {r['title']} — {r['chunk_count']} chunk(s){note}")
+                lines.append(_format_ingest_result(r))
         try:
             await channel.send("\n".join(lines))
         except discord.HTTPException:

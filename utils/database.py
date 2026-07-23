@@ -1674,6 +1674,29 @@ async def add_knowledge_source(title: str, added_by: int) -> dict:
         return dict(row)
 
 
+async def find_knowledge_source_by_title(title: str) -> dict | None:
+    """Used by utils/aysa_knowledge.ingest_text to make ingestion resumable
+    — free-tier Gemini embedding quota is small enough that a single big
+    book can span multiple runs (see that module's comment on why), so a
+    second run against the same title continues the existing source
+    instead of creating a duplicate and starting from zero."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM aysa_knowledge_sources WHERE title = $1", title)
+        return dict(row) if row else None
+
+
+async def get_embedded_chunk_indices(source_id: int) -> set[int]:
+    """Which chunk_index values already have an embedding stored for this
+    source — lets ingest_text skip chunks a prior (rate-limited) run
+    already finished, rather than re-embedding them and burning more of a
+    scarce daily/per-minute quota for no reason."""
+    pool = _require_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT chunk_index FROM aysa_knowledge_chunks WHERE source_id = $1", source_id)
+        return {r["chunk_index"] for r in rows}
+
+
 async def add_knowledge_chunk(source_id: int, chunk_index: int, content: str, embedding_literal: str) -> None:
     """embedding_literal is a pgvector text literal, e.g. '[0.01,-0.02,...]'
     — built by utils/aysa_knowledge.py from the raw float list. Passed as a

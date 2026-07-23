@@ -26,6 +26,7 @@ import asyncio
 import base64
 import io
 import re
+import time
 import logging
 from typing import Awaitable, Callable
 
@@ -38,15 +39,42 @@ from utils import openrouter_client
 
 logger = logging.getLogger("lucy.aysa_knowledge")
 
-CHUNK_TARGET_CHARS = 1800   # ~450 tokens — comfortably inside embedding + prompt budgets
+CHUNK_TARGET_CHARS = 1800   # ~450 tokens — see note below on why this is NOT being bumped up despite the volume problem
 CHUNK_OVERLAP_CHARS = 200   # only used when hard-splitting an oversized paragraph
 
 OCR_MIN_CHARS = 40          # pypdf text shorter than this on a page is treated as "no real text layer"
 OCR_RENDER_DPI = 150        # legible for a vision model without producing huge base64 payloads
 MAX_OCR_PAGES = 600         # sanity cap — a mis-sized upload can't run forever against a free-tier router
 
+# Gemini's free-tier embedding quota turned out to be the real bottleneck, not code correctness —
+# a first live run against OpenStax + 3 PD classics (~1800 chunks at this chunk size) took ~100
+# minutes and still only got ~55% of chunks through, with later sources getting hit hardest (a
+# rolling per-minute cap, not a hard daily wall — throughput held fairly steady around ~10/minute
+# the whole time, so pacing calls to roughly match that, rather than firing them back-to-back and
+# retrying after the fact, converts most of those failures into successes instead of just burning
+# an hour on guaranteed 429s).
+#
+# CHUNK_TARGET_CHARS is deliberately NOT being made bigger to cut total request volume, even though
+# that's the obvious lever — resumability below matches chunks by POSITIONAL INDEX against what's
+# already stored (see ingest_text), and ~1002 chunks are already sitting in Postgres from tonight's
+# run under this exact chunk size. Changing it would silently desync every index against that
+# existing data on the very next run. If you want fewer/bigger chunks going forward, do it as its
+# own deliberate step: clear the existing partial sources first (/aysaremovebook), THEN change this
+# constant, THEN re-run — not both at once.
+#
+# Two changes address the actual bottleneck instead:
+#   1. EMBED_MIN_CALL_INTERVAL_SECONDS proactively paces every call to roughly this rate BEFORE
+#      hitting a 429, instead of firing as fast as possible and only backing off after failing.
+#   2. ingest_text is now resumable by title — a second run (today, tomorrow, whenever) against a
+#      partially-ingested source picks up exactly where it left off instead of starting over, and
+#      stops itself early (RATE_LIMIT_CIRCUIT_BREAKER) after a run of consecutive rate-limited
+#      chunks instead of grinding through the entire remaining list at a near-100% failure rate.
 EMBED_MAX_RETRIES = 3
-EMBED_RETRY_BASE_SECONDS = 2.0
+EMBED_RETRY_BASE_SECONDS = 8.0            # backoff after a 429 on one chunk: 8s, then 16s
+EMBED_MIN_CALL_INTERVAL_SECONDS = 4.5     # ~13/minute — matched to what last night's run actually sustained
+RATE_LIMIT_CIRCUIT_BREAKER = 6            # consecutive rate-limited chunks before giving up on the rest of THIS run
+
+_last_embed_call_at = 0.0  # module-level pacing clock — good enough for a single-process bot
 
 
 def _chunk_text(text: str) -> list[str]:
@@ -87,14 +115,29 @@ async def _embed_with_retry(chunk: str) -> list[float]:
     """Gemini embeddings are single-key/single-project — no round-robin
     fallback like Groq/Cerebras/OpenRouter (see gemini_client's module
     docstring) — so a book-length ingest is exactly the kind of bursty
-    load that can trip its per-project rate limit partway through. A short
-    backoff-and-retry here is the difference between 'one transient 429
-    cost us one chunk' and 'it cost us the back half of the book.' Only
-    retries what looks like a rate limit; a hard error (bad key, malformed
-    request) fails immediately since retrying wouldn't change the outcome.
-    """
+    load that trips its rate limit. Two layers here, not one:
+
+    1. Proactive pacing (EMBED_MIN_CALL_INTERVAL_SECONDS) — wait out the
+       minimum interval since the LAST call, win or lose, before every
+       attempt. A live run showed throughput holding fairly steady around
+       ~10/minute for 100 minutes rather than a hard day-long wall, which
+       means most of the failures were us firing faster than the limit
+       recovers, not the limit being exhausted for the day. Pacing to
+       roughly match it converts a lot of those into successes instead of
+       429s, rather than just retrying failures after the fact.
+    2. Reactive backoff on an actual 429 (EMBED_RETRY_BASE_SECONDS) — for
+       whatever pacing alone doesn't catch.
+
+    Only retries what looks like a rate limit; a hard error (bad key,
+    malformed request, deprecated model) fails immediately since retrying
+    wouldn't change the outcome."""
+    global _last_embed_call_at
     last_error: Exception | None = None
     for attempt in range(EMBED_MAX_RETRIES):
+        elapsed = time.monotonic() - _last_embed_call_at
+        if elapsed < EMBED_MIN_CALL_INTERVAL_SECONDS:
+            await asyncio.sleep(EMBED_MIN_CALL_INTERVAL_SECONDS - elapsed)
+        _last_embed_call_at = time.monotonic()
         try:
             return await gemini_client.embed_text(chunk)
         except Exception as e:
@@ -110,17 +153,33 @@ async def ingest_text(
     title: str, text: str, added_by: int,
     *, progress_cb: "Callable[[int, int], Awaitable[None]] | None" = None,
 ) -> dict:
-    """Chunks `text`, embeds each chunk, and stores it under a new
-    knowledge source. Returns {"source_id", "title", "chunk_count",
-    "failed_chunks", "first_error"} — partial success is reported rather
-    than hidden, and first_error carries the actual exception text from
-    the first failure (e.g. a deprecated/renamed model, a bad API key) so
-    an admin running /aysaaddbook or /aysaseedlibrary can see WHY it
-    failed straight from Discord instead of needing to check server logs.
+    """Chunks `text`, embeds each chunk, and stores it under a knowledge
+    source. Returns {"source_id", "title", "chunk_count", "failed_chunks",
+    "first_error", "aborted_early"}. first_error carries the actual
+    exception text from the first failure (e.g. a deprecated/renamed
+    model, a bad API key, a rate limit) so an admin can see WHY straight
+    from Discord instead of needing to check server logs.
+
+    Resumable by title: if a source with this exact title already exists
+    (e.g. a prior run got partway through before the rate limit forced it
+    to stop), this continues it — chunk indices already embedded are
+    skipped, not redone — rather than creating a duplicate source and
+    burning quota re-embedding chunks that already succeeded. Chunking is
+    deterministic given the same text and CHUNK_TARGET_CHARS/
+    CHUNK_OVERLAP_CHARS, so the same input reliably produces the same
+    chunk-index-to-content mapping across runs.
+
+    aborted_early is True if RATE_LIMIT_CIRCUIT_BREAKER consecutive chunks
+    got rate-limited — at that point continuing through the rest of the
+    list would almost certainly just be more of the same, so this stops
+    and reports how far it got rather than grinding for an hour at a
+    near-100% failure rate. Just re-run it later (same title) to pick up
+    the remainder.
 
     progress_cb(chunks_done, chunks_total), if given, is awaited after
-    every chunk — used by /aysaaddbook and /aysaseedlibrary to post
-    progress on a job that can run long.
+    every chunk attempted (including skipped/already-done ones) — used by
+    /aysaaddbook and /aysaseedlibrary to post progress on a job that can
+    run long.
 
     Raises RuntimeError if the knowledge library isn't available at all
     (no pgvector) — callers should check db.KNOWLEDGE_LIBRARY_AVAILABLE
@@ -133,20 +192,46 @@ async def ingest_text(
     if not chunks:
         raise RuntimeError("No extractable text found to ingest.")
 
-    source = await db.add_knowledge_source(title, added_by)
-    stored = 0
+    existing_source = await db.find_knowledge_source_by_title(title)
+    if existing_source is not None:
+        source = existing_source
+        already_done = await db.get_embedded_chunk_indices(source["id"])
+        logger.info("Resuming ingest of '%s' — %d/%d chunk(s) already embedded.", title, len(already_done), len(chunks))
+    else:
+        source = await db.add_knowledge_source(title, added_by)
+        already_done = set()
+
+    stored = len(already_done)
     failed = 0
     first_error: str | None = None
+    consecutive_rate_limited = 0
+    aborted_early = False
+
     for i, chunk in enumerate(chunks):
-        try:
-            embedding = await _embed_with_retry(chunk)
-            await db.add_knowledge_chunk(source["id"], i, chunk, _vector_literal(embedding))
-            stored += 1
-        except Exception as e:
-            logger.exception("Failed to embed/store chunk %d of '%s'", i, title)
-            failed += 1
-            if first_error is None:
-                first_error = str(e)
+        if i not in already_done:
+            try:
+                embedding = await _embed_with_retry(chunk)
+                await db.add_knowledge_chunk(source["id"], i, chunk, _vector_literal(embedding))
+                stored += 1
+                consecutive_rate_limited = 0
+            except Exception as e:
+                logger.exception("Failed to embed/store chunk %d of '%s'", i, title)
+                failed += 1
+                if first_error is None:
+                    first_error = str(e)
+                if "rate-limited" in str(e).lower() or "429" in str(e):
+                    consecutive_rate_limited += 1
+                    if consecutive_rate_limited >= RATE_LIMIT_CIRCUIT_BREAKER:
+                        logger.warning(
+                            "'%s' rate-limited %d times in a row — stopping at chunk %d/%d instead of "
+                            "grinding through the rest at a near-certain failure rate. Re-run later to resume.",
+                            title, consecutive_rate_limited, i + 1, len(chunks),
+                        )
+                        aborted_early = True
+                        failed += len(chunks) - i - 1  # count the untried remainder honestly, not as silent success
+                        break
+                else:
+                    consecutive_rate_limited = 0
         if progress_cb is not None:
             try:
                 await progress_cb(i + 1, len(chunks))
@@ -155,7 +240,7 @@ async def ingest_text(
 
     return {
         "source_id": source["id"], "title": title, "chunk_count": stored,
-        "failed_chunks": failed, "first_error": first_error,
+        "failed_chunks": failed, "first_error": first_error, "aborted_early": aborted_early,
     }
 
 
@@ -349,14 +434,31 @@ async def seed_starter_library(
     ingest_text. progress_cb(source_title, index, total) is awaited before
     each source starts, so a caller can post "fetching 2/4: ..." to Discord.
 
+    If one source's ingest_text comes back aborted_early (sustained rate
+    limiting — see that function), remaining sources are skipped rather
+    than each independently re-discovering the same limit: a fresh source
+    still needs RATE_LIMIT_CIRCUIT_BREAKER consecutive failures before ITS
+    circuit breaker trips, which would otherwise cost a few wasted minutes
+    per remaining source confirming what we already know this run. Just
+    re-run this command later — every source (including the skipped ones)
+    resumes via ingest_text's title-based matching rather than starting over.
+
     Returns a list of per-source result dicts: ingest_text's normal shape
-    on success, or {"title", "error"} for one that failed outright.
+    on success, or {"title", "error"} for one that failed outright or was
+    skipped.
     """
     if not db.KNOWLEDGE_LIBRARY_AVAILABLE:
         raise RuntimeError("Knowledge library is not available on this deployment (pgvector not installed).")
 
     results = []
+    rate_limited_stop = False
     for idx, source in enumerate(STARTER_LIBRARY_SOURCES, start=1):
+        if rate_limited_stop:
+            results.append({
+                "title": source["title"],
+                "error": "Skipped — an earlier source hit a sustained rate limit this run. Re-run this command later to pick up here.",
+            })
+            continue
         if progress_cb is not None:
             try:
                 await progress_cb(source["title"], idx, len(STARTER_LIBRARY_SOURCES))
@@ -370,6 +472,8 @@ async def seed_starter_library(
                 text = raw.decode("utf-8", errors="replace")
             result = await ingest_text(source["title"], text, added_by)
             results.append(result)
+            if result.get("aborted_early"):
+                rate_limited_stop = True
         except Exception as e:
             logger.exception("Failed to seed starter source '%s'", source["title"])
             results.append({"title": source["title"], "error": str(e)})
